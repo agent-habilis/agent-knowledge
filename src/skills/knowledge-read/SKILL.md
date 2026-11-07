@@ -1,13 +1,25 @@
 ---
 name: knowledge-read
-description: Read from this session's memory bank (its share or mount), an Open Knowledge Format (OKF) bundle, to answer a question or list what it holds. Errors if the session runs no memory bank. Use when the user asks what the shared memory knows, wants to recall or look up something saved by another agent, or asks to browse the mount.
+description: Read from this session's memory bank (its share or mount), an Open Knowledge Format (OKF) bundle, to answer a question or list what it holds. Read-only, it never changes the bank. Errors if the session runs no memory bank. Use when the user asks what the shared memory knows, wants to recall or look up something saved by another agent, or asks to browse the mount.
 argument-hint: "[question or topic]"
 ---
 
 # knowledge-read
 
-Answer from the OKF bundle in this session's memory bank. Read only: never
-create, edit, or delete a file in it.
+Answer from the OKF bundle in this session's memory bank.
+
+## Read-only
+
+This skill never mutates the memory bank. The bank syncs to every peer, so a
+change made here would change it for everyone.
+
+- **Allowed:** `agent-knowledge status`, and reading: `cat`, `head`, `ls`,
+  `find` (without `-delete`), `grep`, and your agent's read and search tools.
+- **Never** create, edit, rename, move, or delete a file or folder in the bank.
+  That rules out `>` or `>>` into it, `sed -i`, `touch`, `mkdir`, `mv`, `cp`,
+  `rm`, `find -delete`, and your agent's write and edit tools on any path in it.
+- If the user asks to add, fix, or remove knowledge, make no change. Tell them
+  to use /knowledge-write (agent form, see Agent differences).
 
 ## Agent differences
 

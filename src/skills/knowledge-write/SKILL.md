@@ -1,13 +1,24 @@
 ---
 name: knowledge-write
-description: Write knowledge into this session's memory bank (its share or mount) as an Open Knowledge Format (OKF v0.2) concept, then update the bundle index and log. Errors if the session runs no memory bank. Use when the user wants to save, remember, record, or share a fact, decision, guide, or note with the other agents on the mount.
+description: Write, update, rename, or delete knowledge in this session's memory bank (its share or mount) as Open Knowledge Format (OKF v0.2) concepts, then update the bundle index and log. The only skill that changes the bank. Errors if the session runs no memory bank. Use when the user wants to save, remember, record, correct, or remove a fact, decision, guide, or note shared with the other agents.
 argument-hint: <what to write>
 ---
 
 # knowledge-write
 
-Save knowledge as an OKF concept file in this session's memory bank. The mount
-syncs the file to every peer within a few seconds.
+Save knowledge as OKF concept files in this session's memory bank. The bank
+syncs every change to every peer within a few seconds.
+
+## Mutations
+
+This is the one skill that changes the memory bank. /knowledge-read never does.
+
+- **May:** create a concept, update one, rename or move one, delete one, and
+  edit `index.md` and `log.md` to match.
+- **Only inside the bank, and only `.md` files.** Never touch hidden files or
+  anything outside it.
+- **Delete or rename only when the user asks**, and name the concept. Confirm
+  first: the file disappears from every peer's copy, and a peer may rely on it.
 
 ## Agent differences
 
@@ -41,15 +52,20 @@ agent-knowledge status
 
 Confirm `<bank>` is a directory.
 
-## 2. Decide what to write
+## 2. Decide what to change
 
-Use the arguments (see Agent differences) and the conversation. If there is nothing to write, ask.
-Never write secrets, tokens, passwords, or private keys: every peer receives
-the file.
+Use the arguments (see Agent differences) and the conversation. If there is
+nothing to change, ask. Never write secrets, tokens, passwords, or private
+keys: every peer receives the file.
 
 Read `<bank>/index.md` and the matching subdirectory `index.md`, if present.
-If a concept on the same subject exists, **update it** rather than creating a
-duplicate.
+Then pick one action:
+
+- **Create** a new concept (step 3).
+- **Update** an existing one. If a concept on the same subject exists, update
+  it rather than creating a duplicate (step 3).
+- **Rename or move** a concept (step 3a).
+- **Delete** a concept (step 3b).
 
 ## 3. Write the concept
 
@@ -108,22 +124,40 @@ Rules:
 - When updating a concept, keep its existing keys and `verified` entries,
   change the content, and set `generated.at` to now.
 
+## 3a. Rename or move a concept
+
+Write the concept at its new path with the same content, then delete the old
+file. Find links to the old path with
+`grep -rl '/<group>/<concept-id>.md' <bank> --include='*.md'` and point them at
+the new path.
+
+## 3b. Delete a concept
+
+Find links to it with the same `grep`. If other concepts link to it, or it may
+still matter to a peer, offer `status: deprecated` instead: the file stays for
+links and history, marked as no longer current. Delete only if the user still
+wants it gone, then tell them which links now point nowhere (OKF allows broken
+links).
+
 ## 4. Update the index and log
 
 Re-read each file just before writing it: a peer may have changed it.
 
 - `<bank>/<group>/index.md`: add or update the line
-  `* [<title>](<concept-id>.md) - <description>`. No frontmatter.
+  `* [<title>](<concept-id>.md) - <description>`. No frontmatter. On a delete,
+  remove the line; on a rename or move, fix it in the old and new folder.
 - `<bank>/index.md`: create it if missing, with frontmatter
   `okf_version: "0.2"` and nothing else. Make sure it lists the group:
   `* [<Group>](<group>/) - <what it holds>`.
 - `<bank>/log.md`: under a `## YYYY-MM-DD` heading for today (newest first,
   create the file with `# Directory Update Log` if missing), add
-  `* **Creation**: Added [<title>](/<group>/<concept-id>.md).` or
-  `* **Update**: ...`.
+  `* **Creation**: Added [<title>](/<group>/<concept-id>.md).`,
+  `* **Update**: ...`, `* **Rename**: Moved <title> from ... to ...`, or
+  `* **Deletion**: Removed <title> (<old path>).`
 
 ## 5. Check and report
 
-Check that the frontmatter parses as YAML and has a non-empty `type`. Then
-tell the user the path written, whether it was created or updated, and that
-peers receive it within a few seconds.
+Check that each file written has frontmatter that parses as YAML with a
+non-empty `type`. Then tell the user each path changed and how (created,
+updated, renamed, deleted), and that peers receive the change within a few
+seconds.
