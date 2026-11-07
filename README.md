@@ -9,7 +9,20 @@ agent-knowledge mount <hash> <target>   # keeps <target> in sync with <folder>
 agent-knowledge plug                    # installs the skills into Claude Code and Codex
 ```
 
-`plug` writes the `knowledge-share` and `knowledge-mount` skills to
+### Skills
+
+| Skill | What it does |
+|---|---|
+| `/knowledge-share <folder>` | Runs `share` in the background and prints the hash. |
+| `/knowledge-mount <hash> <target>` | Runs `mount` in the background. The target is the memory bank. |
+| `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the mounted memory bank. Errors if none is mounted. |
+| `/knowledge-read [question]` | Answers from the mounted memory bank. Errors if none is mounted. |
+
+`/knowledge-write` and `/knowledge-read` find the memory bank from the running
+`agent-knowledge mount` process.
+
+`plug` writes the `knowledge-share`, `knowledge-mount`, `knowledge-write`, and
+`knowledge-read` skills to
 `~/.claude/skills` and `~/.codex/skills` (or `$CLAUDE_CONFIG_DIR/skills` and
 `$CODEX_HOME/skills`), replacing older copies. Use `--agent claude` or
 `--agent codex` to pick one. Restart the agent to load them.
