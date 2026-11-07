@@ -6,13 +6,21 @@ Share a folder with live two-way sync over
 ```bash
 agent-knowledge share <folder>          # prints a hash
 agent-knowledge mount <hash> <target>   # keeps <target> in sync with <folder>
-agent-knowledge plug                    # installs the skills into Claude Code and Codex
+agent-knowledge plug                    # installs the skills into Claude Code, Codex, and Pi
 ```
 
-`plug` writes the `knowledge-share` and `knowledge-mount` skills to
-`~/.claude/skills` and `~/.codex/skills` (or `$CLAUDE_CONFIG_DIR/skills` and
-`$CODEX_HOME/skills`), replacing older copies. Use `--agent claude` or
-`--agent codex` to pick one. Restart the agent to load them.
+`plug` writes the `knowledge-share` and `knowledge-mount` skills into each
+agent that it finds on this machine, and replaces older copies:
+
+| Agent | Skills folder | Override | Skill command |
+|---|---|---|---|
+| Claude Code | `~/.claude/skills` | `$CLAUDE_CONFIG_DIR/skills` | `/knowledge-share` |
+| Codex | `~/.codex/skills` | `$CODEX_HOME/skills` | `$knowledge-share` |
+| Pi | `~/.pi/agent/skills` | `$PI_CODING_AGENT_DIR/skills` | `/skill:knowledge-share` |
+
+`plug` finds an agent by its config folder (for example `~/.pi/agent`). To
+pick agents, use `--agent claude-code`, `--agent codex`, or `--agent pi`, one
+or more times. Restart the agent to load the skills.
 
 ## Install
 
@@ -26,7 +34,7 @@ cargo install --path .
 # Without a clone
 cargo install --git https://github.com/caiogondim/agent-knowledge
 
-# Then plug the skills and restart Claude Code or Codex
+# Then plug the skills and restart Claude Code, Codex, or Pi
 agent-knowledge plug
 ```
 
@@ -74,7 +82,7 @@ cargo clippy
 ```
 
 - `src/scan.rs` has the unit tests.
-- `tests/plug.rs` checks the embedded skills, the skills folder of each agent, and the install.
+- `tests/plug.rs` checks the embedded skills, the skills folder and the detection of each agent, and the install.
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
 
 ### Code map

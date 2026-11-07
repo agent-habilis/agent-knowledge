@@ -19,19 +19,26 @@ enum Command {
     Mount { hash: String, target: PathBuf },
     /// Copy the knowledge-share and knowledge-mount skills into each agent's skills folder.
     Plug {
-        /// Agent to plug into. Repeat for more than one. Default: every agent.
+        /// Agent to plug into. Repeat for more than one. Default: every detected agent.
         #[arg(long = "agent", value_enum)]
         agents: Vec<Agent>,
     },
 }
 
-fn run_plug(agents: Vec<Agent>) -> anyhow::Result<()> {
-    let agents = if agents.is_empty() { Agent::ALL.to_vec() } else { agents };
+fn run_plug(explicit: Vec<Agent>) -> anyhow::Result<()> {
+    let env = |key: &str| std::env::var(key).ok();
+    let agents = plug::selected(&explicit, |agent| plug::detected(agent, env));
+    if agents.is_empty() {
+        println!("no agent detected · use --agent claude-code|codex|pi");
+    }
     for agent in agents {
-        let root = plug::skills_dir(agent, |key| std::env::var(key).ok())?;
-        for path in plug::install(&root)? {
-            println!("{}", path.display());
+        if !plug::detected(agent, env) {
+            println!("skipped\t{}\tnot detected", agent.label());
+            continue;
         }
+        let root = plug::skills_dir(agent, env)?;
+        plug::install(&root)?;
+        println!("installed\t{}\t{}", agent.label(), root.display());
     }
     Ok(())
 }
