@@ -72,7 +72,7 @@ type: Decision
 title: Retry policy for peer requests
 description: "One sentence that says what this concept holds."
 tags: [networking, reliability]
-generated: { by: <agent>/<model>, at: 2026-11-07T19:14:23Z }
+generated: { by: <agent>/<model>, at: "2026-11-07T19:14:23Z" }
 status: draft
 sources:
   - id: pr-42
@@ -99,8 +99,10 @@ Rules:
 - **Always double-quote `description`.** An unquoted `: ` inside it breaks the
   YAML.
 - `generated.by` is the writer in OKF actor form: `claude-code/<model-id>` or
-  `codex/<model-id>`; `human:<name>` only when the user dictated the content.
+  `codex/<model-id>` or `pi/<model-id>`; `human:<name>` only when the user dictated the content.
   `generated.at` is the current UTC time from `date -u +%Y-%m-%dT%H:%M:%SZ`.
+  **Always double-quote `generated.at`.** Inside the `{ }` flow map, the `:`
+  in the time breaks strict YAML parsers.
 - `status: draft` unless a person has reviewed it.
 - Add a `sources` entry for each source the content came from, and cite it
   with a footnote whose label is the source `id`. Omit `sources` for knowledge

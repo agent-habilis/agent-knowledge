@@ -85,3 +85,12 @@ fn skills_name_every_agent_command_form() {
         }
     }
 }
+
+/// A time in a YAML flow map holds `:`, and strict parsers (Ruby's Psych) reject it unquoted.
+#[test]
+fn knowledge_write_template_quotes_the_time() {
+    let write = plug::SKILLS.iter().find(|s| s.name == "knowledge-write").unwrap();
+    let line = write.body.lines().find(|l| l.starts_with("generated: {")).expect("a generated line");
+
+    assert!(line.contains("at: \""), "unquoted time in {line:?}");
+}
