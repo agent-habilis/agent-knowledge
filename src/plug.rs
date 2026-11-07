@@ -14,6 +14,8 @@ pub struct Skill {
 pub const SKILLS: &[Skill] = &[
     Skill { name: "knowledge-share", body: include_str!("skills/knowledge-share/SKILL.md") },
     Skill { name: "knowledge-mount", body: include_str!("skills/knowledge-mount/SKILL.md") },
+    Skill { name: "knowledge-write", body: include_str!("skills/knowledge-write/SKILL.md") },
+    Skill { name: "knowledge-read", body: include_str!("skills/knowledge-read/SKILL.md") },
 ];
 
 /// A coding agent that loads `SKILL.md` skills from a user-level folder.

@@ -8,10 +8,10 @@ fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 }
 
 #[test]
-fn embeds_both_skills_with_frontmatter() {
+fn embeds_every_skill_with_frontmatter() {
     let names: Vec<&str> = plug::SKILLS.iter().map(|s| s.name).collect();
 
-    assert_eq!(names, ["knowledge-share", "knowledge-mount"]);
+    assert_eq!(names, ["knowledge-share", "knowledge-mount", "knowledge-write", "knowledge-read"]);
     for skill in plug::SKILLS {
         assert!(skill.body.starts_with(&format!("---\nname: {}\n", skill.name)), "{} frontmatter", skill.name);
     }

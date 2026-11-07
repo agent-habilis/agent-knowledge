@@ -9,8 +9,23 @@ agent-knowledge mount <hash> <target>   # keeps <target> in sync with <folder>
 agent-knowledge plug                    # installs the skills into Claude Code, Codex, and Pi
 ```
 
-`plug` writes the `knowledge-share` and `knowledge-mount` skills into each
-agent that it finds on this machine, and replaces older copies:
+### Skills
+
+| Skill | What it does |
+|---|---|
+| `/knowledge-share <folder>` | Runs `share` in the background and prints the hash. |
+| `/knowledge-mount <hash> <target>` | Runs `mount` in the background. The target is the memory bank. |
+| `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the mounted memory bank. Errors if none is mounted. |
+| `/knowledge-read [question]` | Answers from the mounted memory bank. Errors if none is mounted. |
+
+`/knowledge-write` and `/knowledge-read` find the memory bank from the running
+`agent-knowledge mount` process.
+
+The table uses the Claude Code form. In Codex, a skill command starts with `$`
+(`$knowledge-share`). In Pi, it starts with `/skill:` (`/skill:knowledge-share`).
+
+`plug` writes the 4 skills into each agent that it finds on this machine, and
+replaces older copies:
 
 | Agent | Skills folder | Override | Skill command |
 |---|---|---|---|
