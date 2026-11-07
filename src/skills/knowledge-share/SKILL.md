@@ -53,6 +53,10 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
    mesh is up. Read the background task's output until that line appears. If
    the process exits instead, show the error output and stop.
 
+   If it exits with `this session already runs a ... memory`, report that
+   error: a session runs one memory at a time. Name the running memory from
+   the message and say to stop it before starting another.
+
 6. **Report.** Tell the user:
    - the hash, in a code block so it is easy to copy,
    - the command a peer runs, in the peer's agent form: `/knowledge-mount <hash> <target>`

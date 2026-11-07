@@ -7,6 +7,7 @@ Share a folder with live two-way sync over
 agent-knowledge share <folder>          # prints a hash
 agent-knowledge mount <hash> <target>   # keeps <target> in sync with <folder>
 agent-knowledge plug                    # installs the skills into Claude Code, Codex, and Pi
+agent-knowledge status                  # prints this session's memory bank folder
 ```
 
 ### Skills
@@ -15,11 +16,21 @@ agent-knowledge plug                    # installs the skills into Claude Code, 
 |---|---|
 | `/knowledge-share <folder>` | Runs `share` in the background and prints the hash. |
 | `/knowledge-mount <hash> <target>` | Runs `mount` in the background. The target is the memory bank. |
-| `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the mounted memory bank. Errors if none is mounted. |
-| `/knowledge-read [question]` | Answers from the mounted memory bank. Errors if none is mounted. |
+| `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the session's memory bank. Errors if there is none. |
+| `/knowledge-read [question]` | Answers from the session's memory bank. Errors if there is none. |
 
-`/knowledge-write` and `/knowledge-read` find the memory bank from the running
-`agent-knowledge mount` process.
+### One memory per session
+
+Each agent session runs at most one memory: one `share` or one `mount`. A
+second one in the same session fails with `this session already runs a ...
+memory`. `status` prints the folder of the running one, and
+`/knowledge-write` and `/knowledge-read` use it.
+
+The session is `$CLAUDE_CODE_SESSION_ID` in Claude Code, `$CODEX_THREAD_ID` in
+Codex, or `$AGENT_KNOWLEDGE_SESSION`. Without any of them (Pi, a plain
+terminal), everything shares the session `default`. Each session's memory is
+recorded in `~/.agent-knowledge/sessions/<session>.json` (or under
+`$AGENT_KNOWLEDGE_HOME`); an entry whose process died is ignored.
 
 The table uses the Claude Code form. In Codex, a skill command starts with `$`
 (`$knowledge-share`). In Pi, it starts with `/skill:` (`/skill:knowledge-share`).
@@ -97,12 +108,14 @@ cargo clippy
 ```
 
 - `src/scan.rs` has the unit tests.
+- `tests/memory.rs` checks the session id, the registry, and the one-memory rule.
 - `tests/plug.rs` checks the embedded skills, the skills folder and the detection of each agent, and the install.
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
 
 ### Code map
 
 - `src/main.rs`: the CLI, with the `share`, `mount`, and `plug` commands.
+- `src/memory.rs`: the one-memory-per-session registry behind `share`, `mount`, and `status`.
 - `src/plug.rs`: embeds `src/skills/*/SKILL.md` in the binary and writes them to an agent's skills folder.
 - `src/skills/`: the skills that `plug` installs. Edit them here, then rebuild.
 - `src/sync.rs`: the sync loop. Both commands run it.
