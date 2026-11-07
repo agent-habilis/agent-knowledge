@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Same rev as agent-share's `chore-migrate-habilis-network`. Do not declare `iroh`:
+# habilis-network owns which iroh fork is in the graph.
+habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "fc36a80639a6f2f69d5f7f623e2417ffbc61cc7a", features = ["blob"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+notify = "8"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
