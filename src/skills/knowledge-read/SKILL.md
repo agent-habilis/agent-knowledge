@@ -1,12 +1,12 @@
 ---
 name: knowledge-read
-description: Read from the currently mounted memory bank, an Open Knowledge Format (OKF) bundle, to answer a question or list what it holds. Errors if no memory bank is mounted. Use when the user asks what the shared memory knows, wants to recall or look up something saved by another agent, or asks to browse the mount.
+description: Read from this session's memory bank (its share or mount), an Open Knowledge Format (OKF) bundle, to answer a question or list what it holds. Errors if the session runs no memory bank. Use when the user asks what the shared memory knows, wants to recall or look up something saved by another agent, or asks to browse the mount.
 argument-hint: "[question or topic]"
 ---
 
 # knowledge-read
 
-Answer from the OKF bundle in the mounted memory bank. Read only: never
+Answer from the OKF bundle in this session's memory bank. Read only: never
 create, edit, or delete a file in it.
 
 ## Agent differences
@@ -24,24 +24,22 @@ vendor.
 When a step names the other skill, use the same form: `/knowledge-mount` in
 Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 
-## 1. Find the mounted memory bank
+## 1. Find this session's memory bank
 
-A memory bank is mounted while an `agent-knowledge mount <hash> <target>`
-process runs. List them:
+Each agent session runs at most one memory: a share or a mount. Ask for it:
 
 ```bash
-ps -axo pid=,args= | grep '[a]gent-knowledge mount '
+agent-knowledge status
 ```
 
-- **No match:** stop with this error:
-  `No mounted memory bank. Run /knowledge-mount <hash> <target> first.`
-  Use the agent form of the command (see Agent differences).
-- **One match:** the target is the text after the hash. If it is a relative
-  path, resolve it against the process's working directory
-  (`lsof -a -p <pid> -d cwd -Fn` on macOS, `readlink /proc/<pid>/cwd` on Linux).
-- **More than one match:** list the targets and ask which one to read.
+- **Exit 0:** stdout is the memory bank folder. Call it `<bank>` below.
+- **Non-zero exit:** stop and show this error:
+  `No memory bank in this session. Run /knowledge-mount <hash> <target> or /knowledge-share <folder> first.`
+  Use the agent form of the commands (see Agent differences).
+- **`agent-knowledge` not found:** stop and tell the user to install it:
+  `cargo install --git https://github.com/caiogondim/agent-knowledge`.
 
-Confirm the target is a directory. Call it `<bank>` below. If it holds no
+Confirm `<bank>` is a directory. If it holds no
 `.md` files, say the memory bank is empty. A mount that just started may
 still be receiving files, so say that too.
 

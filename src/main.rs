@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
 /// Share a folder with live two-way sync over habilis-network.
@@ -23,6 +25,28 @@ enum Command {
         #[arg(long = "agent", value_enum)]
         agents: Vec<Agent>,
     },
+    /// Print the folder of this agent session's memory, or fail if it runs none.
+    Status,
+}
+
+fn env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// Claim `folder` as this session's one memory. Fails if the session already runs one.
+fn claim(kind: Kind, folder: &Path) -> anyhow::Result<Claim> {
+    let folder = std::path::absolute(folder).with_context(|| format!("bad folder {}", folder.display()))?;
+    let entry = Memory { pid: std::process::id(), kind, folder };
+    Claim::acquire(&memory::registry_dir(env)?, &memory::session_id(env)?, entry)
+}
+
+fn status() -> anyhow::Result<()> {
+    let session = memory::session_id(env)?;
+    let Some(running) = memory::current(&memory::registry_dir(env)?, &session)? else {
+        bail!("no memory bank in this session ({session}); start one with knowledge-share or knowledge-mount");
+    };
+    println!("{}", running.folder.display());
+    Ok(())
 }
 
 fn run_plug(explicit: Vec<Agent>) -> anyhow::Result<()> {
@@ -56,14 +80,17 @@ async fn main() -> anyhow::Result<()> {
     };
     match Cli::parse().command {
         Command::Share { folder } => {
+            let _claim = claim(Kind::Share, &folder)?;
             let print_hash = |hash: &str| println!("{hash}");
             agent_knowledge::sync::run(folder, None, print_hash, shutdown).await
         }
         Command::Mount { hash, target } => {
+            let _claim = claim(Kind::Mount, &target)?;
             std::fs::create_dir_all(&target)?;
             let announce = |_: &str| eprintln!("mounted at {}", target.display());
             agent_knowledge::sync::run(target.clone(), Some(hash), announce, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),
+        Command::Status => status(),
     }
 }
