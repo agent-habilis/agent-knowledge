@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
 use habilis_network::net::direct::PayloadPath;
 use habilis_network::ops::blob::{self, BlobServer, BlobTicket, ContentId};
-use habilis_network::protocol::{Lookup, LookupOpts};
+use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -40,7 +40,10 @@ pub async fn run(
     let options = JoinOptions::default()
         .mesh(mesh)
         .name(Some(MESH_NAME.to_owned()))
-        .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay]);
+        .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
+        // The engine default plus `Relay`. Without it, 2 peers whose hole punch fails find each
+        // other through the relay but never link, because the relay is kept for lookup alone.
+        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     on_ready(&wait_ready(&mut events).await?);
 
