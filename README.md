@@ -6,7 +6,32 @@ Share a folder with live two-way sync over
 ```bash
 agent-knowledge share <folder>          # prints a hash
 agent-knowledge mount <hash> <target>   # keeps <target> in sync with <folder>
+agent-knowledge plug                    # installs the skills into Claude Code and Codex
 ```
+
+`plug` writes the `knowledge-share` and `knowledge-mount` skills to
+`~/.claude/skills` and `~/.codex/skills` (or `$CLAUDE_CONFIG_DIR/skills` and
+`$CODEX_HOME/skills`), replacing older copies. Use `--agent claude` or
+`--agent codex` to pick one. Restart the agent to load them.
+
+## Install
+
+The skills call `agent-knowledge` from `PATH`, so install the binary before
+you plug the skills:
+
+```bash
+# From a clone
+cargo install --path .
+
+# Without a clone
+cargo install --git https://github.com/caiogondim/agent-knowledge
+
+# Then plug the skills and restart Claude Code or Codex
+agent-knowledge plug
+```
+
+`cargo install` puts the binary in `~/.cargo/bin`. If the shell cannot find
+`agent-knowledge`, run `source ~/.cargo/env` or open a new terminal.
 
 ## Development
 
@@ -49,11 +74,14 @@ cargo clippy
 ```
 
 - `src/scan.rs` has the unit tests.
+- `tests/plug.rs` checks the embedded skills, the skills folder of each agent, and the install.
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
 
 ### Code map
 
-- `src/main.rs`: the CLI, with the `share` and `mount` commands.
+- `src/main.rs`: the CLI, with the `share`, `mount`, and `plug` commands.
+- `src/plug.rs`: embeds `src/skills/*/SKILL.md` in the binary and writes them to an agent's skills folder.
+- `src/skills/`: the skills that `plug` installs. Edit them here, then rebuild.
 - `src/sync.rs`: the sync loop. Both commands run it.
 - `src/scan.rs`: walks a folder and hashes each file. It also rejects unsafe paths from a peer.
 - `src/watch.rs`: the file watcher. It sends 1 tick after 300ms with no changes.
