@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use agent_knowledge::plug::{self, Agent};
 use clap::{Parser, Subcommand};
 
 /// Share a folder with live two-way sync over habilis-network.
@@ -16,6 +17,23 @@ enum Command {
     Share { folder: PathBuf },
     /// Sync <target> with the folder that `share` printed <hash> for, until Ctrl-C.
     Mount { hash: String, target: PathBuf },
+    /// Copy the knowledge-share and knowledge-mount skills into each agent's skills folder.
+    Plug {
+        /// Agent to plug into. Repeat for more than one. Default: every agent.
+        #[arg(long = "agent", value_enum)]
+        agents: Vec<Agent>,
+    },
+}
+
+fn run_plug(agents: Vec<Agent>) -> anyhow::Result<()> {
+    let agents = if agents.is_empty() { Agent::ALL.to_vec() } else { agents };
+    for agent in agents {
+        let root = plug::skills_dir(agent, |key| std::env::var(key).ok())?;
+        for path in plug::install(&root)? {
+            println!("{}", path.display());
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -39,5 +57,6 @@ async fn main() -> anyhow::Result<()> {
             let announce = |_: &str| eprintln!("mounted at {}", target.display());
             agent_knowledge::sync::run(target.clone(), Some(hash), announce, shutdown).await
         }
+        Command::Plug { agents } => run_plug(agents),
     }
 }

@@ -20,18 +20,17 @@ user the hash it prints. The process keeps syncing until it is stopped.
    is the user's home directory, a whole project root, or holds secrets
    (`.env`, keys), ask for confirmation first.
 
-3. **Pick the command.** The repo root is the folder that holds this skill's
-   `.claude/` directory.
-   - If `agent-knowledge` is on `PATH`, use `agent-knowledge`.
-   - Otherwise build first in the foreground so errors show up now:
-     `cargo build --release --manifest-path <repo-root>/Cargo.toml`.
-     Then use `<repo-root>/target/release/agent-knowledge`.
+3. **Check the binary.** Run `command -v agent-knowledge`. If it is not on
+   `PATH`, stop and tell the user to install it:
+   `cargo install --git https://github.com/caiogondim/agent-knowledge`.
 
-4. **Run it in the background.** Call Bash with `run_in_background: true`:
-
-   ```bash
-   <command> share "<absolute-folder>"
-   ```
+4. **Run it in the background.** It runs until stopped, so never wait on it
+   in the foreground.
+   - Claude Code: call Bash with `run_in_background: true` and run
+     `agent-knowledge share "<absolute-folder>"`.
+   - Other agents: run
+     `nohup agent-knowledge share "<absolute-folder>" > /tmp/agent-knowledge-share.log 2>&1 &`,
+     note the PID from `$!`, and read the log file in the next step.
 
 5. **Read the hash.** The hash is the first line on stdout, printed once the
    mesh is up. Read the background task's output until that line appears. If
@@ -41,7 +40,7 @@ user the hash it prints. The process keeps syncing until it is stopped.
    - the hash, in a code block so it is easy to copy,
    - the command a peer runs: `/knowledge-mount <hash> <target>`,
    - that the share keeps running in the background, and how to stop it (stop
-     the background task, or ask Claude to stop the share).
+     the background task, or `kill <pid>`).
 
 ## Notes
 
