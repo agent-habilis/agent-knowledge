@@ -14,6 +14,25 @@ agent-knowledge plug                    # installs the skills into Claude Code a
 `$CODEX_HOME/skills`), replacing older copies. Use `--agent claude` or
 `--agent codex` to pick one. Restart the agent to load them.
 
+## Install
+
+The skills call `agent-knowledge` from `PATH`, so install the binary before
+you plug the skills:
+
+```bash
+# From a clone
+cargo install --path .
+
+# Without a clone
+cargo install --git https://github.com/caiogondim/agent-knowledge
+
+# Then plug the skills and restart Claude Code or Codex
+agent-knowledge plug
+```
+
+`cargo install` puts the binary in `~/.cargo/bin`. If the shell cannot find
+`agent-knowledge`, run `source ~/.cargo/env` or open a new terminal.
+
 ## Development
 
 ### Requirements
