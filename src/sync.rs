@@ -119,7 +119,6 @@ impl Drop for CancelOnDrop {
 /// A path whose write failed, and when its download may run again.
 struct LocalRetry {
     sha: String,
-    ticket: String,
     at: tokio::time::Instant,
     attempts: u32,
 }
@@ -173,7 +172,7 @@ impl Downloads {
     {
         for (path, sha, ticket) in entries {
             self.gate.set_wanted(path, sha, ticket);
-            if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) || self.waiting_to_retry(path, sha, ticket) {
+            if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) || self.waiting_to_retry(path, sha) {
                 continue;
             }
             let key = (path.clone(), ticket.clone());
@@ -255,7 +254,7 @@ impl Downloads {
             Err(Failure::LocalWrite(_)) => {
                 let attempts = self.local_retry.get(&done.path).map_or(0, |retry| retry.attempts + 1);
                 let at = tokio::time::Instant::now() + local_backoff(attempts);
-                let retry = LocalRetry { sha: done.sha.clone(), ticket: done.ticket.clone(), at, attempts };
+                let retry = LocalRetry { sha: done.sha.clone(), at, attempts };
                 self.local_retry.insert(done.path.clone(), retry);
             }
             _ => {
@@ -267,9 +266,9 @@ impl Downloads {
     }
 
     /// Whether the write for this entry failed, and its wait is not over yet.
-    fn waiting_to_retry(&self, path: &str, sha: &str, ticket: &str) -> bool {
+    fn waiting_to_retry(&self, path: &str, sha: &str) -> bool {
         self.local_retry.get(path).is_some_and(|retry| {
-            retry.sha == sha && retry.ticket == ticket && tokio::time::Instant::now() < retry.at
+            retry.sha == sha && tokio::time::Instant::now() < retry.at
         })
     }
 
@@ -1236,6 +1235,39 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(60)).await;
 
         assert!(!dir.path().join("start.md").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_ticket_for_the_same_sha_does_not_skip_the_write_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        // A folder where the file goes makes the write fail.
+        std::fs::create_dir(&local).unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+            }
+        };
+        let first: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "t1".to_owned())];
+        let second: Vec<Entry> = vec![("start.md".to_owned(), sha, "t2".to_owned())];
+
+        downloads.reconcile(&first, &HashMap::new(), fetch.clone());
+        let failed = finished.recv().await.unwrap();
+        downloads.settle(&failed);
+        downloads.reconcile(&second, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
