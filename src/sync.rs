@@ -98,6 +98,8 @@ type Entry = (String, String, String);
 enum Failure {
     Transient(anyhow::Error),
     Permanent(anyhow::Error),
+    /// A write to the folder failed, such as a full disk. It is retried after a long, growing wait.
+    LocalWrite(anyhow::Error),
 }
 
 /// At most this many blob fetches run at once.
@@ -114,12 +116,27 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// A path whose write failed, and when its download may run again.
+struct LocalRetry {
+    sha: String,
+    ticket: String,
+    at: tokio::time::Instant,
+    attempts: u32,
+}
+
+/// The wait after a failed write: 1 min, doubling up to 30 min.
+fn local_backoff(attempts: u32) -> Duration {
+    Duration::from_secs(60).saturating_mul(2u32.saturating_pow(attempts)).min(Duration::from_secs(30 * 60))
+}
+
 /// The downloads of one folder. The loop owns it. Each download runs in its own task.
 struct Downloads {
     root: PathBuf,
     gate: Gate,
     /// The sha and ticket of each entry whose download failed for good.
     failed: HashMap<String, (String, String)>,
+    /// When a path whose write failed may be tried again.
+    local_retry: HashMap<String, LocalRetry>,
     /// The sha of each download in flight, and the handle that cancels it.
     running: HashMap<String, (String, String, AbortHandle)>,
     slots: Arc<Semaphore>,
@@ -140,6 +157,7 @@ impl Downloads {
             root,
             gate: Gate::default(),
             failed: HashMap::new(),
+            local_retry: HashMap::new(),
             running: HashMap::new(),
             slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
             done,
@@ -155,7 +173,7 @@ impl Downloads {
     {
         for (path, sha, ticket) in entries {
             self.gate.set_wanted(path, sha);
-            if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) {
+            if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) || self.waiting_to_retry(path, sha, ticket) {
                 continue;
             }
             match self.running.get(path) {
@@ -215,17 +233,32 @@ impl Downloads {
             Err(Failure::Permanent(_)) => {
                 self.failed.insert(done.path.clone(), (done.sha.clone(), done.ticket.clone()));
             }
+            Err(Failure::LocalWrite(_)) => {
+                let attempts = self.local_retry.get(&done.path).map_or(0, |retry| retry.attempts + 1);
+                let at = tokio::time::Instant::now() + local_backoff(attempts);
+                let retry = LocalRetry { sha: done.sha.clone(), ticket: done.ticket.clone(), at, attempts };
+                self.local_retry.insert(done.path.clone(), retry);
+            }
             _ => {
                 self.failed.remove(&done.path);
+                self.local_retry.remove(&done.path);
             }
         }
         true
+    }
+
+    /// Whether the write for this entry failed, and its wait is not over yet.
+    fn waiting_to_retry(&self, path: &str, sha: &str, ticket: &str) -> bool {
+        self.local_retry.get(path).is_some_and(|retry| {
+            retry.sha == sha && retry.ticket == ticket && tokio::time::Instant::now() < retry.at
+        })
     }
 
     /// Stop everything for a path that the document no longer names.
     fn forget(&mut self, path: &str) {
         self.gate.unwant(path);
         self.failed.remove(path);
+        self.local_retry.remove(path);
         if let Some((_, _, handle)) = self.running.remove(path) {
             handle.abort();
         }
@@ -338,7 +371,7 @@ impl Folder {
         let published = match result {
             // Serve the file too, so a peer can still get it after its author left.
             Ok(()) => self.publish(&path, &sha).await,
-            Err(Failure::Transient(error) | Failure::Permanent(error)) => Err(error),
+            Err(Failure::Transient(error) | Failure::Permanent(error) | Failure::LocalWrite(error)) => Err(error),
         };
         mark_landed(&mut self.known, path, sha, published);
     }
@@ -395,7 +428,7 @@ where
         return Err(Failure::Permanent(anyhow!("content does not match its sha256")));
     }
     // A local write error, such as a full disk or a folder where the file goes, repeats until the entry changes.
-    if !gate.write(local, path, sha, bytes).await.map_err(Failure::Permanent)? {
+    if !gate.write(local, path, sha, bytes).await.map_err(Failure::LocalWrite)? {
         return Err(Failure::Transient(anyhow!("{path} was replaced before its write")));
     }
     Ok(())
@@ -832,7 +865,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(outcome, Ok(Err(Failure::Permanent(_)))), "{outcome:?}");
+        assert!(matches!(outcome, Ok(Err(Failure::LocalWrite(_)))), "{outcome:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1052,6 +1085,30 @@ mod tests {
         });
 
         assert!(!current);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_write_error_is_retried_after_a_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        // A folder where the file goes makes the write fail, until the folder is removed.
+        std::fs::create_dir(&local).unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let fetch = |_: String| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        let first = finished.recv().await.unwrap();
+        downloads.settle(&first);
+        std::fs::remove_dir(&local).unwrap();
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(std::fs::read(&local).ok(), Some(bytes.to_vec()));
     }
 
     #[tokio::test]
