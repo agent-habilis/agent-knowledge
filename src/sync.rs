@@ -113,7 +113,7 @@ struct Downloads {
     /// The sha and ticket of each entry whose download failed for good.
     failed: HashMap<String, (String, String)>,
     /// The sha of each download in flight, and the handle that cancels it.
-    running: HashMap<String, (String, AbortHandle)>,
+    running: HashMap<String, (String, String, AbortHandle)>,
     slots: Arc<Semaphore>,
     done: mpsc::UnboundedSender<Finished>,
 }
@@ -151,8 +151,8 @@ impl Downloads {
                 continue;
             }
             match self.running.get(path) {
-                Some((running_sha, _)) if running_sha == sha => continue,
-                Some((_, handle)) => {
+                Some((running_sha, running_ticket, _)) if running_sha == sha && running_ticket == ticket => continue,
+                Some((_, _, handle)) => {
                     handle.abort();
                     self.running.remove(path);
                 }
@@ -180,13 +180,13 @@ impl Downloads {
                 let result = download_file(&local, &sha_owned, &ticket_owned, attempt).await;
                 let _ = done.send(Finished { path: path_owned, sha: sha_owned, ticket: ticket_owned, result });
             });
-            self.running.insert(path.clone(), (sha.clone(), task.abort_handle()));
+            self.running.insert(path.clone(), (sha.clone(), ticket.clone(), task.abort_handle()));
         }
     }
 
     /// Record how a download ended, so a permanent failure is not started again.
     fn settle(&mut self, done: &Finished) {
-        if self.running.get(&done.path).is_some_and(|(sha, _)| sha == &done.sha) {
+        if self.running.get(&done.path).is_some_and(|(sha, ticket, _)| sha == &done.sha && ticket == &done.ticket) {
             self.running.remove(&done.path);
         }
         match &done.result {
@@ -203,14 +203,14 @@ impl Downloads {
     fn forget(&mut self, path: &str) {
         self.wanted.remove(path);
         self.failed.remove(path);
-        if let Some((_, handle)) = self.running.remove(path) {
+        if let Some((_, _, handle)) = self.running.remove(path) {
             handle.abort();
         }
     }
 
     /// Stop every download in flight, on shutdown.
     fn abort_all(&mut self) {
-        for (_, (_, handle)) in self.running.drain() {
+        for (_, (_, _, handle)) in self.running.drain() {
             handle.abort();
         }
     }
@@ -684,6 +684,30 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(3600), download_file(&local, &sha, "not a ticket", fetch_blob)).await;
 
         assert!(matches!(outcome, Ok(Err(Failure::Permanent(_)))), "{outcome:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_ticket_for_the_same_sha_replaces_the_one_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let fetch = move |ticket: String| async move {
+            if ticket == "dead" {
+                std::future::pending::<()>().await;
+            }
+            Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+        };
+        let dead: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "dead".to_owned())];
+        let live: Vec<Entry> = vec![("start.md".to_owned(), sha, "live".to_owned())];
+
+        downloads.reconcile(&dead, &HashMap::new(), fetch.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        downloads.reconcile(&live, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(bytes.to_vec()));
     }
 
     #[tokio::test]
