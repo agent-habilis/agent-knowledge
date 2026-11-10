@@ -208,6 +208,7 @@ impl Downloads {
         }
     }
 
+    /// Stop every download in flight, on shutdown.
     fn abort_all(&mut self) {
         for (_, (_, handle)) in self.running.drain() {
             handle.abort();
@@ -285,9 +286,13 @@ impl Folder {
             })
             .collect();
         self.downloads.reconcile(&entries, &self.known, fetch_blob);
+        // Every path the document named at some point, and no longer names, stops downloading.
+        let removed: Vec<String> = self.downloads.wanted.keys().filter(|path| !files.contains_key(*path)).cloned().collect();
+        for path in removed {
+            self.downloads.forget(&path);
+        }
         let gone: Vec<String> = self.known.keys().filter(|path| !files.contains_key(*path)).cloned().collect();
         for path in gone {
-            self.downloads.forget(&path);
             let synced = self.known.remove(&path);
             let Some(local) = resolve(&self.root, &path) else { continue };
             // Keep a local edit that no peer has seen yet; the next tick publishes it again.
@@ -591,6 +596,69 @@ mod tests {
 
         assert!(matches!(first.result, Ok(true)));
         assert!(matches!(second.result, Ok(true)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_download_is_reported_while_another_is_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![
+            ("stuck.md".to_owned(), sha.clone(), "stuck".to_owned()),
+            ("start.md".to_owned(), sha.clone(), "start".to_owned()),
+        ];
+        let fetch = move |ticket: String| async move {
+            if ticket == "stuck" {
+                std::future::pending::<()>().await;
+            }
+            Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        let first = tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.expect("a result").expect("open");
+
+        assert_eq!(first.path, "start.md");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abort_all_stops_a_retrying_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "dead".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<Vec<u8>, anyhow::Error>(anyhow!("dead source"))
+                }
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        downloads.abort_all();
+        let at_shutdown = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), at_shutdown);
+    }
+
+    #[test]
+    fn forget_drops_what_the_document_named() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.wanted.insert("start.md".to_owned(), "0".repeat(64));
+
+        downloads.forget("start.md");
+
+        assert!(downloads.wanted.is_empty());
     }
 
     #[tokio::test]
