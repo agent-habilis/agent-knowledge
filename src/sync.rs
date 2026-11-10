@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -117,8 +117,7 @@ impl Drop for CancelOnDrop {
 /// The downloads of one folder. The loop owns it. Each download runs in its own task.
 struct Downloads {
     root: PathBuf,
-    /// The sha that the document named for each path when `reconcile` last read it.
-    wanted: HashMap<String, String>,
+    gate: Gate,
     /// The sha and ticket of each entry whose download failed for good.
     failed: HashMap<String, (String, String)>,
     /// The sha of each download in flight, and the handle that cancels it.
@@ -127,19 +126,19 @@ struct Downloads {
     done: mpsc::UnboundedSender<Finished>,
 }
 
-/// How one download ended. `result` is `Ok(true)` when the caller must publish the file.
+/// How one download ended. On `Ok` the file is on disk, and the caller must publish it.
 struct Finished {
     path: String,
     sha: String,
     ticket: String,
-    result: Result<bool, Failure>,
+    result: Result<(), Failure>,
 }
 
 impl Downloads {
     fn new(root: PathBuf, done: mpsc::UnboundedSender<Finished>) -> Self {
         Self {
             root,
-            wanted: HashMap::new(),
+            gate: Gate::default(),
             failed: HashMap::new(),
             running: HashMap::new(),
             slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
@@ -155,7 +154,7 @@ impl Downloads {
         Fut: Future<Output = Result<Vec<u8>>> + Send,
     {
         for (path, sha, ticket) in entries {
-            self.wanted.insert(path.clone(), sha.clone());
+            self.gate.set_wanted(path, sha);
             if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) {
                 continue;
             }
@@ -185,10 +184,13 @@ impl Downloads {
             };
             let done = self.done.clone();
             let (path_owned, sha_owned, ticket_owned) = (path.clone(), sha.clone(), ticket.clone());
-            let (sha_for_fetch, ticket_for_fetch) = (sha_owned.clone(), ticket_owned.clone());
+            let (path_for_fetch, sha_for_fetch, ticket_for_fetch) = (path.clone(), sha_owned.clone(), ticket_owned.clone());
+            let gate = self.gate.clone();
             let task = tokio::spawn(async move {
                 // The download runs in an inner task, so a panic in it still reports back as a failure.
-                let inner = tokio::spawn(async move { download_file(&local, &sha_for_fetch, &ticket_for_fetch, attempt).await });
+                let inner = tokio::spawn(async move {
+                    download_file(&local, &path_for_fetch, &sha_for_fetch, &ticket_for_fetch, &gate, attempt).await
+                });
                 let _cancel = CancelOnDrop(inner.abort_handle());
                 let result = match inner.await {
                     Ok(result) => result,
@@ -220,7 +222,7 @@ impl Downloads {
 
     /// Stop everything for a path that the document no longer names.
     fn forget(&mut self, path: &str) {
-        self.wanted.remove(path);
+        self.gate.unwant(path);
         self.failed.remove(path);
         if let Some((_, _, handle)) = self.running.remove(path) {
             handle.abort();
@@ -306,11 +308,11 @@ impl Folder {
             .collect();
         self.downloads.reconcile(&entries, &self.known, fetch_blob);
         // Every path the document named at some point, and no longer names, stops downloading.
-        let removed: Vec<String> = self.downloads.wanted.keys().filter(|path| !files.contains_key(*path)).cloned().collect();
+        let removed = unnamed(self.downloads.gate.wanted_paths(), files);
         for path in removed {
             self.downloads.forget(&path);
         }
-        let gone: Vec<String> = self.known.keys().filter(|path| !files.contains_key(*path)).cloned().collect();
+        let gone = unnamed(self.known.keys().cloned().collect(), files);
         for path in gone {
             let synced = self.known.remove(&path);
             let Some(local) = resolve(&self.root, &path) else { continue };
@@ -326,22 +328,32 @@ impl Folder {
     async fn finish(&mut self, done: Finished) {
         self.downloads.settle(&done);
         let Finished { path, sha, result, .. } = done;
-        if self.downloads.wanted.get(&path) != Some(&sha) {
+        if self.downloads.gate.wanted_sha(&path).as_deref() != Some(sha.as_str()) {
             return;
         }
-        let result = match result {
+        let published = match result {
             // Serve the file too, so a peer can still get it after its author left.
-            Ok(true) => self.publish(&path, &sha).await,
-            Ok(false) => Ok(()),
+            Ok(()) => self.publish(&path, &sha).await,
             Err(Failure::Transient(error) | Failure::Permanent(error)) => Err(error),
         };
-        match result {
-            Ok(()) => {
-                eprintln!("↓ {path}");
-                self.known.insert(path, sha);
-            }
-            Err(error) => eprintln!("download {path} failed: {error:#}"),
+        mark_landed(&mut self.known, path, sha, published);
+    }
+}
+
+/// The paths in `tracked` that the document does not name.
+fn unnamed(tracked: Vec<String>, files: &serde_json::Map<String, Value>) -> Vec<String> {
+    tracked.into_iter().filter(|path| !files.contains_key(path)).collect()
+}
+
+/// Record a landed file in `known`, so the next reconcile does not fetch it again.
+/// A file that failed to publish is not recorded, so the next reconcile tries again.
+fn mark_landed(known: &mut HashMap<String, String>, path: String, sha: String, published: Result<()>) {
+    match published {
+        Ok(()) => {
+            eprintln!("↓ {path}");
+            known.insert(path, sha);
         }
+        Err(error) => eprintln!("download {path} failed: {error:#}"),
     }
 }
 
@@ -350,15 +362,17 @@ impl Folder {
 /// a peer that gets the file from its author would otherwise never serve it.
 async fn download_file<Fut>(
     local: &Path,
+    path: &str,
     sha: &str,
     ticket: &str,
+    gate: &Gate,
     mut fetch: impl FnMut(String) -> Fut,
-) -> Result<bool, Failure>
+) -> Result<(), Failure>
 where
     Fut: Future<Output = Result<Vec<u8>>>,
 {
     if file_sha(local).as_deref() == Some(sha) {
-        return Ok(true);
+        return Ok(());
     }
     let mut attempt = 0;
     let bytes = loop {
@@ -376,12 +390,11 @@ where
     if sha256_bytes(&bytes) != sha {
         return Err(Failure::Permanent(anyhow!("content does not match its sha256")));
     }
-    if let Some(parent) = local.parent() {
-        // A local write error, such as a full disk or a folder where the file goes, repeats until the entry changes.
-        tokio::fs::create_dir_all(parent).await.map_err(|error| Failure::Permanent(error.into()))?;
+    // A local write error, such as a full disk or a folder where the file goes, repeats until the entry changes.
+    if !gate.write(local, path, sha, bytes).await.map_err(Failure::Permanent)? {
+        return Err(Failure::Transient(anyhow!("{path} was replaced before its write")));
     }
-    write_atomic(local, &bytes).await.map_err(Failure::Permanent)?;
-    Ok(true)
+    Ok(())
 }
 
 /// The wait before retry `attempt`: 2 s, doubling up to 60 s, plus up to half of that as jitter.
@@ -411,13 +424,63 @@ async fn fetch_blob(ticket: String) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Write through a hidden sibling and rename it, so an editor never sees half a file.
+/// The writes of one folder, and the sha that the document names for each path.
+/// Writes run one at a time, and each re-checks its sha under the lock, so the newest entry writes last.
+#[derive(Clone, Default)]
+struct Gate {
+    turn: Arc<Mutex<()>>,
+    wanted: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl Gate {
+    fn set_wanted(&self, path: &str, sha: &str) {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), sha.to_owned());
+    }
+
+    fn unwant(&self, path: &str) {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
+    }
+
+    fn wanted_sha(&self, path: &str) -> Option<String> {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).get(path).cloned()
+    }
+
+    fn wanted_paths(&self) -> Vec<String> {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).keys().cloned().collect()
+    }
+
+    /// Write `bytes` to `local`, unless the document no longer names `sha` for `path`.
+    /// The write runs on a blocking thread, so an aborted download cannot stop it halfway.
+    async fn write(&self, local: &Path, path: &str, sha: &str, bytes: Vec<u8>) -> Result<bool> {
+        let gate = self.clone();
+        let (local, path, sha) = (local.to_path_buf(), path.to_owned(), sha.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let _turn = gate.turn.lock().unwrap_or_else(PoisonError::into_inner);
+            if gate.wanted_sha(&path).as_deref() != Some(sha.as_str()) {
+                return Ok(false);
+            }
+            write_file(&local, &bytes)?;
+            Ok(true)
+        })
+        .await
+        .context("write task ended")?
+    }
+}
+
+/// Write through a hidden sibling with its own name, then rename it, so an editor never sees half a file.
 /// The scanner skips hidden names, so the temp file never gets published.
-async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let name = path.file_name().context("no file name")?.to_string_lossy();
-    let temp = path.with_file_name(format!(".{name}.agent-knowledge"));
-    tokio::fs::write(&temp, bytes).await?;
-    tokio::fs::rename(&temp, path).await?;
+    let temp = path.with_file_name(format!(".{name}.{}.agent-knowledge", NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&temp, bytes)?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -461,8 +524,10 @@ mod tests {
 
         let result = download_file(
             &local,
+            "start.md",
             &sha,
             "ticket",
+            &gate_wanting("start.md", &sha),
             |_| async {
                 tokio::time::sleep(Duration::from_secs(40)).await;
                 Ok(bytes.to_vec())
@@ -629,8 +694,8 @@ mod tests {
         downloads.reconcile(&entries, &HashMap::new(), fetch);
         let second = finished.recv().await.unwrap();
 
-        assert!(matches!(first.result, Ok(true)));
-        assert!(matches!(second.result, Ok(true)));
+        assert!(first.result.is_ok());
+        assert!(second.result.is_ok());
     }
 
     #[tokio::test(start_paused = true)]
@@ -689,11 +754,11 @@ mod tests {
     fn forget_drops_what_the_document_named() {
         let (done, _finished) = mpsc::unbounded_channel();
         let mut downloads = Downloads::new(PathBuf::from("."), done);
-        downloads.wanted.insert("start.md".to_owned(), "0".repeat(64));
+        downloads.gate.set_wanted("start.md", &"0".repeat(64));
 
         downloads.forget("start.md");
 
-        assert!(downloads.wanted.is_empty());
+        assert!(downloads.gate.wanted_paths().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -703,7 +768,7 @@ mod tests {
         let sha = sha256_bytes(b"from author");
 
         let outcome =
-            tokio::time::timeout(Duration::from_secs(3600), download_file(&local, &sha, "not a ticket", fetch_blob)).await;
+            tokio::time::timeout(Duration::from_secs(3600), download_file(&local, "start.md", &sha, "not a ticket", &gate_wanting("start.md", &sha), fetch_blob)).await;
 
         assert!(matches!(outcome, Ok(Err(Failure::Permanent(_)))), "{outcome:?}");
     }
@@ -742,7 +807,7 @@ mod tests {
             path: "start.md".to_owned(),
             sha: "same".to_owned(),
             ticket: "t1".to_owned(),
-            result: Ok(false),
+            result: Ok(()),
         });
 
         assert!(downloads.failed.contains_key("start.md"));
@@ -759,7 +824,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(3600),
-            download_file(&local, &sha, "ticket", |_| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) }),
+            download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) }),
         )
         .await;
 
@@ -844,6 +909,25 @@ mod tests {
         }
     }
 
+    /// A gate in which the document names `sha` for `path`, as a download expects.
+    fn gate_wanting(path: &str, sha: &str) -> Gate {
+        let gate = Gate::default();
+        gate.set_wanted(path, sha);
+        gate
+    }
+
+    #[tokio::test]
+    async fn a_write_for_a_replaced_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        let gate = gate_wanting("start.md", &sha256_bytes(b"new bytes"));
+
+        let wrote = gate.write(&local, "start.md", &sha256_bytes(b"old bytes"), b"old bytes".to_vec()).await;
+
+        assert!(matches!(wrote, Ok(false)), "{wrote:?}");
+        assert!(!local.exists());
+    }
+
     /// Install a subscriber that keeps what `filter` lets through, for the rest of the test.
     fn capture(filter: &str) -> (Captured, tracing::subscriber::DefaultGuard) {
         let captured = Captured::default();
@@ -871,7 +955,7 @@ mod tests {
                 Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
             }
         };
-        download_file(&local, &sha, "ticket", fetch).await.unwrap();
+        download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), fetch).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -896,6 +980,27 @@ mod tests {
         assert!(!captured.text().contains("retrying a blob fetch"), "{}", captured.text());
     }
 
+    #[test]
+    fn unnamed_keeps_only_the_paths_the_document_does_not_name() {
+        let files = serde_json::json!({ "a.md": {} });
+        let files = files.as_object().unwrap();
+
+        let gone = unnamed(vec!["a.md".to_owned(), "b.md".to_owned(), "c.md".to_owned()], files);
+
+        assert_eq!(gone, vec!["b.md".to_owned(), "c.md".to_owned()]);
+    }
+
+    #[test]
+    fn a_landed_file_is_known_only_once_it_is_published() {
+        let mut known = HashMap::new();
+
+        mark_landed(&mut known, "start.md".to_owned(), "sha".to_owned(), Err(anyhow!("offline")));
+        assert!(!known.contains_key("start.md"));
+
+        mark_landed(&mut known, "start.md".to_owned(), "sha".to_owned(), Ok(()));
+        assert_eq!(known.get("start.md").map(String::as_str), Some("sha"));
+    }
+
     #[tokio::test]
     async fn a_file_already_on_disk_is_still_published() {
         let dir = tempfile::tempdir().unwrap();
@@ -904,9 +1009,9 @@ mod tests {
         std::fs::write(&local, bytes).unwrap();
         let sha = sha256_bytes(bytes);
 
-        let result = download_file(&local, &sha, "ticket", |_| async { Ok(Vec::new()) }).await;
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async { Ok(Vec::new()) }).await;
 
-        assert!(matches!(result, Ok(true)), "{result:?}");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -920,8 +1025,10 @@ mod tests {
         let started = tokio::time::Instant::now();
         let result = download_file(
             &local,
+            "start.md",
             &sha,
             "ticket",
+            &gate_wanting("start.md", &sha),
             |_| {
                 calls += 1;
                 let attempt = calls;
