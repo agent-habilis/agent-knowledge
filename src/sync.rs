@@ -188,7 +188,7 @@ async fn download_file<Fut, PublishFut>(
     sha: &str,
     ticket: &str,
     fetch_timeout: Duration,
-    fetch: impl FnOnce(BlobTicket) -> Fut,
+    fetch: impl FnOnce(String) -> Fut,
     publish: impl FnOnce() -> PublishFut,
 ) -> Result<()>
 where
@@ -198,8 +198,7 @@ where
     if file_sha(local).as_deref() == Some(sha) {
         return Ok(());
     }
-    let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
-    let bytes = tokio::time::timeout(fetch_timeout, fetch(ticket)).await.context("fetch timed out")??;
+    let bytes = tokio::time::timeout(fetch_timeout, fetch(ticket.to_owned())).await.context("fetch timed out")??;
     if sha256_bytes(&bytes) != sha {
         bail!("content does not match its sha256");
     }
@@ -210,7 +209,8 @@ where
     publish().await
 }
 
-async fn fetch_blob(ticket: BlobTicket) -> Result<Vec<u8>> {
+async fn fetch_blob(ticket: String) -> Result<Vec<u8>> {
+    let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow!("{error}"))?;
     let mut bytes = Vec::new();
     blob::fetch(&ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
     Ok(bytes)
