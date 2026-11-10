@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
@@ -186,7 +186,7 @@ async fn download_file<Fut, PublishFut>(
     local: &Path,
     sha: &str,
     ticket: &str,
-    fetch: impl FnOnce(String) -> Fut,
+    mut fetch: impl FnMut(String) -> Fut,
     publish: impl FnOnce() -> PublishFut,
 ) -> Result<()>
 where
@@ -196,7 +196,16 @@ where
     if file_sha(local).as_deref() == Some(sha) {
         return Ok(());
     }
-    let bytes = fetch(ticket.to_owned()).await?;
+    let mut attempt = 0;
+    let bytes = loop {
+        match fetch(ticket.to_owned()).await {
+            Ok(bytes) => break bytes,
+            Err(_) => {
+                tokio::time::sleep(backoff(attempt)).await;
+                attempt += 1;
+            }
+        }
+    };
     if sha256_bytes(&bytes) != sha {
         bail!("content does not match its sha256");
     }
@@ -205,6 +214,14 @@ where
     }
     write_atomic(local, &bytes).await?;
     publish().await
+}
+
+/// The wait before retry `attempt`: 2 s, doubling up to 60 s, plus up to half of that as jitter.
+fn backoff(attempt: u32) -> Duration {
+    let base = Duration::from_secs(2).saturating_mul(2u32.saturating_pow(attempt)).min(Duration::from_secs(60));
+    let half_ms = u64::try_from((base / 2).as_millis()).unwrap_or(u64::MAX);
+    let nanos = u64::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos());
+    base + Duration::from_millis(nanos % (half_ms + 1))
 }
 
 async fn fetch_blob(ticket: String) -> Result<Vec<u8>> {
@@ -274,6 +291,37 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&local).unwrap(), bytes);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_that_fails_twice_then_works_still_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let mut calls = 0;
+
+        let result = download_file(
+            &local,
+            &sha,
+            "ticket",
+            |_| {
+                calls += 1;
+                let attempt = calls;
+                async move {
+                    if attempt < 3 {
+                        bail!("dead source");
+                    }
+                    Ok(bytes.to_vec())
+                }
+            },
+            || async { Ok(()) },
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(calls, 3);
         assert_eq!(std::fs::read(&local).unwrap(), bytes);
     }
 }
