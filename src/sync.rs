@@ -204,11 +204,11 @@ impl Downloads {
     }
 
     /// Record how a download ended, so a permanent failure is not started again.
-    fn settle(&mut self, done: &Finished) {
+    fn settle(&mut self, done: &Finished) -> bool {
         // A result from an entry that was replaced or cancelled must not change the current entry's state.
         let current = self.running.get(&done.path).is_some_and(|(sha, ticket, _)| sha == &done.sha && ticket == &done.ticket);
         if !current {
-            return;
+            return false;
         }
         self.running.remove(&done.path);
         match &done.result {
@@ -219,6 +219,7 @@ impl Downloads {
                 self.failed.remove(&done.path);
             }
         }
+        true
     }
 
     /// Stop everything for a path that the document no longer names.
@@ -327,7 +328,9 @@ impl Folder {
 
     /// Take the end of one download. A sha that the document no longer names is dropped.
     async fn finish(&mut self, done: Finished) {
-        self.downloads.settle(&done);
+        if !self.downloads.settle(&done) {
+            return;
+        }
         let Finished { path, sha, result, .. } = done;
         if self.downloads.gate.wanted_sha(&path).as_deref() != Some(sha.as_str()) {
             return;
@@ -1030,6 +1033,25 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_result_for_an_older_ticket_is_not_current() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.running.insert(
+            "start.md".to_owned(),
+            ("same".to_owned(), "t2".to_owned(), tokio::spawn(async {}).abort_handle()),
+        );
+
+        let current = downloads.settle(&Finished {
+            path: "start.md".to_owned(),
+            sha: "same".to_owned(),
+            ticket: "t1".to_owned(),
+            result: Ok(()),
+        });
+
+        assert!(!current);
     }
 
     #[tokio::test]
