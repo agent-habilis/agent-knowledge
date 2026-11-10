@@ -189,7 +189,9 @@ impl Folder {
         if let Some(parent) = local.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        write_atomic(&local, &bytes).await
+        write_atomic(&local, &bytes).await?;
+        // Serve the file too, so a peer can still get it after its author left.
+        self.publish(path, sha).await
     }
 }
 
