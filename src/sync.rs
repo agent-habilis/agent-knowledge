@@ -27,18 +27,47 @@ const MESH_NAME: &str = "agent-knowledge";
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Sync `root` until `shutdown` resolves. With `mesh` `None`, create a new mesh; else join it.
-/// `on_ready` gets the mesh id, which is the hash that `mount` takes.
+/// What to sync, and as whom.
+pub struct Options {
+    /// The folder to keep in sync.
+    pub root: PathBuf,
+    /// The mesh to join, or `None` to create a new one.
+    pub mesh: Option<String>,
+    /// This peer's nickname, or `None` for the mesh to mint a random one.
+    pub nickname: Option<String>,
+}
+
+/// The mesh is up.
+#[derive(Clone, Debug)]
+pub struct Ready {
+    /// The mesh id, which is the hash that `mount` takes.
+    pub mesh: String,
+    /// This peer's nickname: the one asked for, or the one the mesh minted.
+    pub nick: String,
+}
+
+/// Another peer joined or left the mesh, by nickname.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Joined(String),
+    Left(String),
+}
+
+/// Sync `options.root` until `shutdown` resolves. With `options.mesh` `None`, create a new mesh;
+/// else join it. `on_ready` gets the mesh id and this peer's nickname; `on_presence` gets each
+/// other peer that joins or leaves.
 pub async fn run(
-    root: PathBuf,
-    mesh: Option<String>,
-    on_ready: impl FnOnce(&str),
+    options: Options,
+    on_ready: impl FnOnce(&Ready),
+    mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    let Options { root, mesh, nickname } = options;
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
         .mesh(mesh)
+        .nick(nickname)
         .name(Some(MESH_NAME.to_owned()))
         .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
         // The engine default plus `Relay`. Without it, 2 peers whose hole punch fails find each
@@ -63,6 +92,10 @@ pub async fn run(
             () = &mut shutdown => break,
             Some(()) = ticks.recv() => folder.publish_local().await,
             Some(event) = events.recv() => {
+                let Ok(event) = serde_json::from_str::<Value>(&event) else { continue };
+                if let Some(presence) = presence(&event) {
+                    on_presence(presence);
+                }
                 // Not the event's own document: events queue up while a download runs, and an
                 // older snapshot that lacks a path would delete a file that a newer one has.
                 if is_remote_state_change(&event) {
@@ -207,20 +240,35 @@ fn file_sha(path: &Path) -> Option<String> {
     std::fs::read(path).ok().map(|bytes| sha256_bytes(&bytes))
 }
 
-async fn wait_ready(events: &mut mpsc::UnboundedReceiver<String>) -> Result<String> {
+/// Wait for the membership `ready` event and return the mesh id and this peer's nick.
+/// Fails if the mesh stops first or the event lacks either field.
+async fn wait_ready(events: &mut mpsc::UnboundedReceiver<String>) -> Result<Ready> {
     while let Some(event) = events.recv().await {
         let event: Value = serde_json::from_str(&event)?;
         if event["kind"] == "ready" {
-            return event["mesh"].as_str().map(str::to_owned).context("ready event without a mesh id");
+            let field = |name: &str| {
+                event[name].as_str().map(str::to_owned).with_context(|| format!("ready event without a {name}"))
+            };
+            return Ok(Ready { mesh: field("mesh")?, nick: field("nick")? });
         }
     }
     bail!("the mesh stopped before it was ready")
 }
 
-fn is_remote_state_change(event: &str) -> bool {
-    serde_json::from_str::<Value>(event).is_ok_and(|event| {
-        event["kind"] == "state_changed" && event["channel"] == "state" && event["is_self"] == false
-    })
+/// A `joined` or `left` event as a [`Presence`]. Every other kind, `quiet` and `returned`
+/// included, is `None`.
+fn presence(event: &Value) -> Option<Presence> {
+    let presence = match event["kind"].as_str()? {
+        "joined" => Presence::Joined,
+        "left" => Presence::Left,
+        _ => return None,
+    };
+    Some(presence(event["nick"].as_str()?.to_owned()))
+}
+
+/// Whether `event` is another peer's change to the shared `state` document: the cue to reconcile.
+fn is_remote_state_change(event: &Value) -> bool {
+    event["kind"] == "state_changed" && event["channel"] == "state" && event["is_self"] == false
 }
 
 fn spool_dir() -> PathBuf {
