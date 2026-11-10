@@ -287,6 +287,13 @@ impl Downloads {
         });
     }
 
+    /// Stop everything for each path that the document no longer names, including a retry that is waiting.
+    fn prune(&mut self, files: &serde_json::Map<String, Value>) {
+        for path in unnamed(self.gate.wanted_paths(), files) {
+            self.forget(&path);
+        }
+    }
+
     /// Stop every download in flight, on shutdown.
     fn abort_all(&mut self) {
         for (_, (_, handle)) in self.running.drain() {
@@ -365,11 +372,7 @@ impl Folder {
             })
             .collect();
         self.downloads.reconcile(&entries, &self.known, fetch_blob);
-        // Every path the document named at some point, and no longer names, stops downloading.
-        let removed = unnamed(self.downloads.gate.wanted_paths(), files);
-        for path in removed {
-            self.downloads.forget(&path);
-        }
+        self.downloads.prune(files);
         let gone = unnamed(self.known.keys().cloned().collect(), files);
         for path in gone {
             let synced = self.known.remove(&path);
@@ -1202,6 +1205,37 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(600)).await;
 
         assert_eq!(old_calls.load(Ordering::SeqCst), after_switch);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_path_the_document_drops_is_not_written_by_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "flaky".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String| {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(anyhow!("dead source"));
+                    }
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let document = serde_json::json!({ "files": {} });
+        downloads.prune(document["files"].as_object().unwrap());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(!dir.path().join("start.md").exists());
     }
 
     #[tokio::test]
