@@ -442,13 +442,13 @@ where
             Ok(bytes) => break bytes,
             Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
             Err(error) => {
-                // A newer ticket for this sha has its own download, so this one stops between attempts.
-                if !gate.is_latest(path, sha, ticket) {
-                    return Err(Failure::Transient(anyhow!("{path} names another ticket now")));
-                }
                 let wait = backoff(attempt);
                 tracing::debug!(path = %local.display(), attempt = attempt.saturating_add(1), wait = ?wait, error = %error, "retrying a blob fetch");
                 tokio::time::sleep(wait).await;
+                // A newer ticket for this sha has its own download, so this one stops before its next attempt.
+                if !gate.is_latest(path, sha, ticket) {
+                    return Err(Failure::Transient(anyhow!("{path} names another ticket now")));
+                }
                 attempt = attempt.saturating_add(1);
             }
         }
@@ -1268,6 +1268,38 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_superseded_attempt_does_not_run_after_its_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let old_calls = old_calls.clone();
+            move |ticket: String| {
+                let old_calls = old_calls.clone();
+                async move {
+                    if ticket == "old" {
+                        old_calls.fetch_add(1, Ordering::SeqCst);
+                        return Err(anyhow!("dead source"));
+                    }
+                    std::future::pending::<Result<Vec<u8>>>().await
+                }
+            }
+        };
+        let old: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "old".to_owned())];
+        let new: Vec<Entry> = vec![("start.md".to_owned(), sha, "new".to_owned())];
+
+        downloads.reconcile(&old, &HashMap::new(), fetch.clone());
+        // The first attempt fails at once and waits about 2 s. The document names another ticket during that wait.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        downloads.reconcile(&new, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+
+        assert_eq!(old_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
