@@ -174,30 +174,32 @@ impl Folder {
 
     async fn download(&self, path: &str, sha: &str, ticket: &str) -> Result<()> {
         let local = resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
-        if file_sha(&local).as_deref() == Some(sha) {
-            return Ok(());
-        }
-        // Serve the file too, so a peer can still get it after its author left.
-        download_file(&local, sha, ticket, fetch_blob, || self.publish(path, sha)).await
+        download_file(&local, sha, ticket, FETCH_TIMEOUT, fetch_blob, || {
+            // Serve the file too, so a peer can still get it after its author left.
+            self.publish(path, sha)
+        })
+        .await
     }
 }
 
 /// Fetch the blob that `ticket` names, check it against `sha`, write it to `local`, then `publish` it.
-async fn download_file<Fetch, FetchFut, Publish, PublishFut>(
+async fn download_file<Fut, PublishFut>(
     local: &Path,
     sha: &str,
     ticket: &str,
-    fetch: Fetch,
-    publish: Publish,
+    fetch_timeout: Duration,
+    fetch: impl FnOnce(BlobTicket) -> Fut,
+    publish: impl FnOnce() -> PublishFut,
 ) -> Result<()>
 where
-    Fetch: FnOnce(BlobTicket) -> FetchFut,
-    FetchFut: Future<Output = Result<Vec<u8>>>,
-    Publish: FnOnce() -> PublishFut,
+    Fut: Future<Output = Result<Vec<u8>>>,
     PublishFut: Future<Output = Result<()>>,
 {
+    if file_sha(local).as_deref() == Some(sha) {
+        return Ok(());
+    }
     let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
-    let bytes = tokio::time::timeout(FETCH_TIMEOUT, fetch(ticket)).await.context("fetch timed out")??;
+    let bytes = tokio::time::timeout(fetch_timeout, fetch(ticket)).await.context("fetch timed out")??;
     if sha256_bytes(&bytes) != sha {
         bail!("content does not match its sha256");
     }
