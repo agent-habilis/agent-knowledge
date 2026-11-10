@@ -102,8 +102,17 @@ enum Failure {
 
 /// At most this many blob fetches run at once.
 const FETCH_SLOTS: usize = 4;
-/// A fetch that runs this long is cut off, and the retry loop starts a new attempt.
-const ATTEMPT_DEADLINE: Duration = Duration::from_secs(600);
+/// A fetch that runs this long is cut off, and the retry loop starts a new attempt. The dial is capped at 90 s.
+const ATTEMPT_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Cancels the task it holds when dropped, so an aborted outer task takes its inner task with it.
+struct CancelOnDrop(AbortHandle);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// The downloads of one folder. The loop owns it. Each download runs in its own task.
 struct Downloads {
@@ -159,8 +168,8 @@ impl Downloads {
                 None => {}
             }
             let Some(local) = resolve(&self.root, path) else {
-                let result = Err(Failure::Permanent(anyhow!("unsafe path {path:?}")));
-                let _ = self.done.send(Finished { path: path.clone(), sha: sha.clone(), ticket: ticket.clone(), result });
+                self.failed.insert(path.clone(), (sha.clone(), ticket.clone()));
+                eprintln!("download {path} failed: unsafe path {path:?}");
                 continue;
             };
             // A fetch takes a slot only while it runs, so a download that waits to retry holds none.
@@ -176,8 +185,15 @@ impl Downloads {
             };
             let done = self.done.clone();
             let (path_owned, sha_owned, ticket_owned) = (path.clone(), sha.clone(), ticket.clone());
+            let (sha_for_fetch, ticket_for_fetch) = (sha_owned.clone(), ticket_owned.clone());
             let task = tokio::spawn(async move {
-                let result = download_file(&local, &sha_owned, &ticket_owned, attempt).await;
+                // The download runs in an inner task, so a panic in it still reports back as a failure.
+                let inner = tokio::spawn(async move { download_file(&local, &sha_for_fetch, &ticket_for_fetch, attempt).await });
+                let _cancel = CancelOnDrop(inner.abort_handle());
+                let result = match inner.await {
+                    Ok(result) => result,
+                    Err(error) => Err(Failure::Transient(anyhow!("download task ended: {error}"))),
+                };
                 let _ = done.send(Finished { path: path_owned, sha: sha_owned, ticket: ticket_owned, result });
             });
             self.running.insert(path.clone(), (sha.clone(), ticket.clone(), task.abort_handle()));
@@ -186,9 +202,12 @@ impl Downloads {
 
     /// Record how a download ended, so a permanent failure is not started again.
     fn settle(&mut self, done: &Finished) {
-        if self.running.get(&done.path).is_some_and(|(sha, ticket, _)| sha == &done.sha && ticket == &done.ticket) {
-            self.running.remove(&done.path);
+        // A result from an entry that was replaced or cancelled must not change the current entry's state.
+        let current = self.running.get(&done.path).is_some_and(|(sha, ticket, _)| sha == &done.sha && ticket == &done.ticket);
+        if !current {
+            return;
         }
+        self.running.remove(&done.path);
         match &done.result {
             Err(Failure::Permanent(_)) => {
                 self.failed.insert(done.path.clone(), (done.sha.clone(), done.ticket.clone()));
@@ -356,9 +375,10 @@ where
         return Err(Failure::Permanent(anyhow!("content does not match its sha256")));
     }
     if let Some(parent) = local.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| Failure::Transient(error.into()))?;
+        // A local write error, such as a full disk or a folder where the file goes, repeats until the entry changes.
+        tokio::fs::create_dir_all(parent).await.map_err(|error| Failure::Permanent(error.into()))?;
     }
-    write_atomic(local, &bytes).await.map_err(Failure::Transient)?;
+    write_atomic(local, &bytes).await.map_err(Failure::Permanent)?;
     Ok(true)
 }
 
@@ -708,6 +728,89 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(bytes.to_vec()));
+    }
+
+    #[test]
+    fn a_late_result_for_an_old_entry_does_not_clear_a_current_failure() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.failed.insert("start.md".to_owned(), ("same".to_owned(), "t2".to_owned()));
+
+        downloads.settle(&Finished {
+            path: "start.md".to_owned(),
+            sha: "same".to_owned(),
+            ticket: "t1".to_owned(),
+            result: Ok(false),
+        });
+
+        assert!(downloads.failed.contains_key("start.md"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_write_error_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        // A folder where the file should go makes every write fail.
+        std::fs::create_dir(&local).unwrap();
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3600),
+            download_file(&local, &sha, "ticket", |_| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) }),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(Err(Failure::Permanent(_)))), "{outcome:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_fetch_still_reports_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let fetch = |_: String| async {
+            panic!("the fetch broke");
+            #[allow(unreachable_code)]
+            Ok::<Vec<u8>, anyhow::Error>(Vec::new())
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        let reported = tokio::time::timeout(Duration::from_secs(1), finished.recv()).await;
+
+        assert!(matches!(reported, Ok(Some(_))), "no result within a second");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forgotten_path_is_not_written_by_a_retry_that_later_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "flaky".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String| {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(anyhow!("dead source"));
+                    }
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        downloads.forget("start.md");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        assert!(!dir.path().join("start.md").exists());
     }
 
     #[tokio::test]
