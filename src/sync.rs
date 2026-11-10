@@ -138,7 +138,7 @@ struct Downloads {
     /// When a path whose write failed may be tried again.
     local_retry: HashMap<String, LocalRetry>,
     /// The sha of each download in flight, and the handle that cancels it.
-    running: HashMap<String, (String, String, AbortHandle)>,
+    running: HashMap<(String, String), (String, AbortHandle)>,
     slots: Arc<Semaphore>,
     done: mpsc::UnboundedSender<Finished>,
 }
@@ -172,18 +172,22 @@ impl Downloads {
         Fut: Future<Output = Result<Vec<u8>>> + Send,
     {
         for (path, sha, ticket) in entries {
-            self.gate.set_wanted(path, sha);
+            self.gate.set_wanted(path, sha, ticket);
             if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) || self.waiting_to_retry(path, sha, ticket) {
                 continue;
             }
-            match self.running.get(path) {
-                Some((running_sha, running_ticket, _)) if running_sha == sha && running_ticket == ticket => continue,
-                Some((_, _, handle)) => {
-                    handle.abort();
-                    self.running.remove(path);
-                }
-                None => {}
+            let key = (path.clone(), ticket.clone());
+            if self.running.get(&key).is_some_and(|(running_sha, _)| running_sha == sha) {
+                continue;
             }
+            // Another sha for this path is obsolete. A ticket change for this sha is not: its transfer may be half done.
+            self.running.retain(|(running_path, _), (running_sha, handle)| {
+                let obsolete = running_path == path && running_sha != sha;
+                if obsolete {
+                    handle.abort();
+                }
+                !obsolete
+            });
             let Some(local) = resolve(&self.root, path) else {
                 self.failed.insert(path.clone(), (sha.clone(), ticket.clone()));
                 eprintln!("download {path} failed: unsafe path {path:?}");
@@ -217,19 +221,34 @@ impl Downloads {
                 };
                 let _ = done.send(Finished { path: path_owned, sha: sha_owned, ticket: ticket_owned, result });
             });
-            self.running.insert(path.clone(), (sha.clone(), ticket.clone(), task.abort_handle()));
+            self.running.insert(key, (sha.clone(), task.abort_handle()));
         }
     }
 
     /// Record how a download ended, so a permanent failure is not started again.
     fn settle(&mut self, done: &Finished) -> bool {
         // A result from an entry that was replaced or cancelled must not change the current entry's state.
-        let current = self.running.get(&done.path).is_some_and(|(sha, ticket, _)| sha == &done.sha && ticket == &done.ticket);
+        let key = (done.path.clone(), done.ticket.clone());
+        let current = self.running.get(&key).is_some_and(|(sha, _)| sha == &done.sha);
         if !current {
             return false;
         }
-        self.running.remove(&done.path);
+        self.running.remove(&key);
         match &done.result {
+            // A superseded attempt stops with a transient failure. It has nothing to record or publish.
+            Err(Failure::Transient(_)) => return false,
+            Ok(()) => {
+                self.failed.remove(&done.path);
+                self.local_retry.remove(&done.path);
+                // The file landed, so the other tickets for this sha need not finish.
+                self.running.retain(|(running_path, _), (running_sha, handle)| {
+                    let same = running_path == &done.path && running_sha == &done.sha;
+                    if same {
+                        handle.abort();
+                    }
+                    !same
+                });
+            }
             Err(Failure::Permanent(_)) => {
                 self.failed.insert(done.path.clone(), (done.sha.clone(), done.ticket.clone()));
             }
@@ -259,14 +278,18 @@ impl Downloads {
         self.gate.unwant(path);
         self.failed.remove(path);
         self.local_retry.remove(path);
-        if let Some((_, _, handle)) = self.running.remove(path) {
-            handle.abort();
-        }
+        self.running.retain(|(running_path, _), (_, handle)| {
+            let gone = running_path == path;
+            if gone {
+                handle.abort();
+            }
+            !gone
+        });
     }
 
     /// Stop every download in flight, on shutdown.
     fn abort_all(&mut self) {
-        for (_, (_, _, handle)) in self.running.drain() {
+        for (_, (_, handle)) in self.running.drain() {
             handle.abort();
         }
     }
@@ -417,6 +440,10 @@ where
             Ok(bytes) => break bytes,
             Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
             Err(error) => {
+                // A newer ticket for this sha has its own download, so this one stops between attempts.
+                if !gate.is_latest(path, sha, ticket) {
+                    return Err(Failure::Transient(anyhow!("{path} names another ticket now")));
+                }
                 let wait = backoff(attempt);
                 tracing::debug!(path = %local.display(), attempt = attempt.saturating_add(1), wait = ?wait, error = %error, "retrying a blob fetch");
                 tokio::time::sleep(wait).await;
@@ -466,12 +493,17 @@ async fn fetch_blob(ticket: String) -> Result<Vec<u8>> {
 #[derive(Clone, Default)]
 struct Gate {
     turn: Arc<Mutex<()>>,
-    wanted: Arc<Mutex<HashMap<String, String>>>,
+    wanted: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 impl Gate {
-    fn set_wanted(&self, path: &str, sha: &str) {
-        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), sha.to_owned());
+    fn set_wanted(&self, path: &str, sha: &str, ticket: &str) {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), (sha.to_owned(), ticket.to_owned()));
+    }
+
+    /// Whether the document still names this entry, and not another ticket for the same content.
+    fn is_latest(&self, path: &str, sha: &str, ticket: &str) -> bool {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).get(path).is_some_and(|(s, t)| s == sha && t == ticket)
     }
 
     fn unwant(&self, path: &str) {
@@ -479,7 +511,7 @@ impl Gate {
     }
 
     fn wanted_sha(&self, path: &str) -> Option<String> {
-        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).get(path).cloned()
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).get(path).map(|(sha, _)| sha.clone())
     }
 
     fn wanted_paths(&self) -> Vec<String> {
@@ -791,7 +823,7 @@ mod tests {
     fn forget_drops_what_the_document_named() {
         let (done, _finished) = mpsc::unbounded_channel();
         let mut downloads = Downloads::new(PathBuf::from("."), done);
-        downloads.gate.set_wanted("start.md", &"0".repeat(64));
+        downloads.gate.set_wanted("start.md", &"0".repeat(64), "ticket");
 
         downloads.forget("start.md");
 
@@ -949,7 +981,7 @@ mod tests {
     /// A gate in which the document names `sha` for `path`, as a download expects.
     fn gate_wanting(path: &str, sha: &str) -> Gate {
         let gate = Gate::default();
-        gate.set_wanted(path, sha);
+        gate.set_wanted(path, sha, "ticket");
         gate
     }
 
@@ -1073,8 +1105,8 @@ mod tests {
         let (done, _finished) = mpsc::unbounded_channel();
         let mut downloads = Downloads::new(PathBuf::from("."), done);
         downloads.running.insert(
-            "start.md".to_owned(),
-            ("same".to_owned(), "t2".to_owned(), tokio::spawn(async {}).abort_handle()),
+            ("start.md".to_owned(), "t2".to_owned()),
+            ("same".to_owned(), tokio::spawn(async {}).abort_handle()),
         );
 
         let current = downloads.settle(&Finished {
@@ -1109,6 +1141,67 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert_eq!(std::fs::read(&local).ok(), Some(bytes.to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ticket_change_does_not_restart_a_transfer_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let fetch = move |ticket: String| async move {
+            match ticket.as_str() {
+                "slow" => {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+                _ => std::future::pending::<Result<Vec<u8>>>().await,
+            }
+        };
+        let slow: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "slow".to_owned())];
+        let new: Vec<Entry> = vec![("start.md".to_owned(), sha, "new".to_owned())];
+
+        downloads.reconcile(&slow, &HashMap::new(), fetch.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        downloads.reconcile(&new, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(bytes.to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_older_ticket_stops_retrying_once_the_document_names_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let old_calls = old_calls.clone();
+            move |ticket: String| {
+                let old_calls = old_calls.clone();
+                async move {
+                    if ticket == "old" {
+                        old_calls.fetch_add(1, Ordering::SeqCst);
+                        return Err(anyhow!("dead source"));
+                    }
+                    std::future::pending::<Result<Vec<u8>>>().await
+                }
+            }
+        };
+        let old: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "old".to_owned())];
+        let new: Vec<Entry> = vec![("start.md".to_owned(), sha, "new".to_owned())];
+
+        downloads.reconcile(&old, &HashMap::new(), fetch.clone());
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        downloads.reconcile(&new, &HashMap::new(), fetch);
+        // The old attempt may be in a backoff of up to a minute, so give it time to notice.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let after_switch = old_calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+
+        assert_eq!(old_calls.load(Ordering::SeqCst), after_switch);
     }
 
     #[tokio::test]
