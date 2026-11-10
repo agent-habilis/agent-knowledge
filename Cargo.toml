@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tracing = "0.1"
 # Same rev as agent-share's `chore-migrate-habilis-network`. Do not declare `iroh`:
 # habilis-network owns which iroh fork is in the graph.
 habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "fc36a80639a6f2f69d5f7f623e2417ffbc61cc7a", features = ["blob"] }

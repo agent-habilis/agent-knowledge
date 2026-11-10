@@ -365,9 +365,11 @@ where
         match fetch(ticket.to_owned()).await {
             Ok(bytes) => break bytes,
             Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
-            Err(_) => {
-                tokio::time::sleep(backoff(attempt)).await;
-                attempt += 1;
+            Err(error) => {
+                let wait = backoff(attempt);
+                tracing::debug!(path = %local.display(), attempt = attempt.saturating_add(1), wait = ?wait, error = %error, "retrying a blob fetch");
+                tokio::time::sleep(wait).await;
+                attempt = attempt.saturating_add(1);
             }
         }
     };
@@ -811,6 +813,87 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(60)).await;
 
         assert!(!dir.path().join("start.md").exists());
+    }
+
+    /// What a `tracing` subscriber writes, so a test can read it back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Install a subscriber that keeps what `filter` lets through, for the rest of the test.
+    fn capture(filter: &str) -> (Captured, tracing::subscriber::DefaultGuard) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// A download whose first fetch fails, so the retry loop runs once.
+    async fn download_after_one_failure(dir: &Path) {
+        let local = dir.join("start.md");
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let mut calls = 0;
+        let fetch = |_: String| {
+            calls += 1;
+            let attempt = calls;
+            async move {
+                if attempt < 2 {
+                    return Err(anyhow!("dead source"));
+                }
+                Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+            }
+        };
+        download_file(&local, &sha, "ticket", fetch).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_is_logged_at_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let (captured, _guard) = capture("agent_knowledge=debug");
+
+        download_after_one_failure(dir.path()).await;
+
+        let text = captured.text();
+        assert!(text.contains("retrying a blob fetch"), "{text}");
+        assert!(text.contains("attempt=1"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_is_silent_without_the_debug_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (captured, _guard) = capture("error");
+
+        download_after_one_failure(dir.path()).await;
+
+        assert!(!captured.text().contains("retrying a blob fetch"), "{}", captured.text());
     }
 
     #[tokio::test]
