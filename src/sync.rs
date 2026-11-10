@@ -194,7 +194,8 @@ impl Downloads {
                 let _cancel = CancelOnDrop(inner.abort_handle());
                 let result = match inner.await {
                     Ok(result) => result,
-                    Err(error) => Err(Failure::Transient(anyhow!("download task ended: {error}"))),
+                    // A panic is a bug in this code, so a retry would repeat it. It stays failed until the entry changes.
+                    Err(error) => Err(Failure::Permanent(anyhow!("download task ended: {error}"))),
                 };
                 let _ = done.send(Finished { path: path_owned, sha: sha_owned, ticket: ticket_owned, result });
             });
@@ -999,6 +1000,36 @@ mod tests {
 
         mark_landed(&mut known, "start.md".to_owned(), "sha".to_owned(), Ok(()));
         assert_eq!(known.get("start.md").map(String::as_str), Some("sha"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_fetch_is_not_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("the fetch broke");
+                    #[allow(unreachable_code)]
+                    Ok::<Vec<u8>, anyhow::Error>(Vec::new())
+                }
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch.clone());
+        let first = finished.recv().await.unwrap();
+        downloads.settle(&first);
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
