@@ -345,6 +345,7 @@ where
     let bytes = loop {
         match fetch(ticket.to_owned()).await {
             Ok(bytes) => break bytes,
+            Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
             Err(_) => {
                 tokio::time::sleep(backoff(attempt)).await;
                 attempt += 1;
@@ -369,8 +370,20 @@ fn backoff(attempt: u32) -> Duration {
     base + Duration::from_millis(nanos % (half_ms + 1))
 }
 
+/// A ticket that does not decode. No retry can fix it.
+#[derive(Debug)]
+struct BadTicket(String);
+
+impl std::fmt::Display for BadTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bad ticket: {}", self.0)
+    }
+}
+
+impl std::error::Error for BadTicket {}
+
 async fn fetch_blob(ticket: String) -> Result<Vec<u8>> {
-    let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow!("{error}"))?;
+    let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
     let mut bytes = Vec::new();
     blob::fetch(&ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
     Ok(bytes)
@@ -659,6 +672,18 @@ mod tests {
         downloads.forget("start.md");
 
         assert!(downloads.wanted.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ticket_that_does_not_decode_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        let sha = sha256_bytes(b"from author");
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(3600), download_file(&local, &sha, "not a ticket", fetch_blob)).await;
+
+        assert!(matches!(outcome, Ok(Err(Failure::Permanent(_)))), "{outcome:?}");
     }
 
     #[tokio::test]
