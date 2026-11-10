@@ -177,22 +177,41 @@ impl Folder {
         if file_sha(&local).as_deref() == Some(sha) {
             return Ok(());
         }
-        let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
-        let mut bytes = Vec::new();
-        tokio::time::timeout(FETCH_TIMEOUT, blob::fetch(&ticket, &mut bytes, None))
-            .await
-            .context("fetch timed out")?
-            .map_err(|error| anyhow!("{error}"))?;
-        if sha256_bytes(&bytes) != sha {
-            bail!("content does not match its sha256");
-        }
-        if let Some(parent) = local.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        write_atomic(&local, &bytes).await?;
         // Serve the file too, so a peer can still get it after its author left.
-        self.publish(path, sha).await
+        download_file(&local, sha, ticket, fetch_blob, || self.publish(path, sha)).await
     }
+}
+
+/// Fetch the blob that `ticket` names, check it against `sha`, write it to `local`, then `publish` it.
+async fn download_file<Fetch, FetchFut, Publish, PublishFut>(
+    local: &Path,
+    sha: &str,
+    ticket: &str,
+    fetch: Fetch,
+    publish: Publish,
+) -> Result<()>
+where
+    Fetch: FnOnce(BlobTicket) -> FetchFut,
+    FetchFut: Future<Output = Result<Vec<u8>>>,
+    Publish: FnOnce() -> PublishFut,
+    PublishFut: Future<Output = Result<()>>,
+{
+    let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
+    let bytes = tokio::time::timeout(FETCH_TIMEOUT, fetch(ticket)).await.context("fetch timed out")??;
+    if sha256_bytes(&bytes) != sha {
+        bail!("content does not match its sha256");
+    }
+    if let Some(parent) = local.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    write_atomic(local, &bytes).await?;
+    publish().await
+}
+
+async fn fetch_blob(ticket: BlobTicket) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    blob::fetch(&ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
+    Ok(bytes)
 }
 
 /// Write through a hidden sibling and rename it, so an editor never sees half a file.
