@@ -50,7 +50,7 @@ pub async fn run(
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
-    let mut folder = Folder { root, member, blobs, known: HashMap::new() };
+    let mut folder = Folder { root: root.clone(), member, blobs, known: HashMap::new(), downloads: Downloads::new(root) };
 
     folder.reconcile().await;
     folder.publish_local().await;
@@ -82,6 +82,55 @@ struct Folder {
     /// The sha256 of each path as both the disk and the document last agreed on it.
     /// A watcher tick or a document entry that matches it is our own echo, and is skipped.
     known: HashMap<String, String>,
+    downloads: Downloads,
+}
+
+/// One file the document names: its path, its sha256, and its blob ticket.
+type Entry = (String, String, String);
+
+/// The downloads of one folder. The loop owns it.
+struct Downloads {
+    root: PathBuf,
+    /// The sha that the document named for each path when `reconcile` last read it.
+    wanted: HashMap<String, String>,
+}
+
+/// How one download ended. `result` is `Ok(true)` when the caller must publish the file.
+struct Finished {
+    path: String,
+    sha: String,
+    result: Result<bool>,
+}
+
+impl Downloads {
+    fn new(root: PathBuf) -> Self {
+        Self { root, wanted: HashMap::new() }
+    }
+
+    /// Bring each entry to disk that `known` does not already hold, one at a time, and report how each one ended.
+    async fn reconcile<Fut>(
+        &mut self,
+        entries: &[Entry],
+        known: &HashMap<String, String>,
+        fetch: impl Fn(String) -> Fut,
+    ) -> Vec<Finished>
+    where
+        Fut: Future<Output = Result<Vec<u8>>>,
+    {
+        let mut finished = Vec::new();
+        for (path, sha, ticket) in entries {
+            self.wanted.insert(path.clone(), sha.clone());
+            if known.get(path) == Some(sha) {
+                continue;
+            }
+            let result = match resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}")) {
+                Ok(local) => download_file(&local, sha, ticket, &fetch).await,
+                Err(error) => Err(error),
+            };
+            finished.push(Finished { path: path.clone(), sha: sha.clone(), result });
+        }
+        finished
+    }
 }
 
 impl Folder {
@@ -144,23 +193,21 @@ impl Folder {
     async fn apply(&mut self, document: &Value) {
         let empty = serde_json::Map::new();
         let files = document.get("files").and_then(Value::as_object).unwrap_or(&empty);
-        for (path, entry) in files {
-            let (Some(sha), Some(ticket)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
-                continue;
-            };
-            if self.known.get(path).map(String::as_str) == Some(sha) {
-                continue;
-            }
-            match self.download(path, sha, ticket).await {
-                Ok(()) => {
-                    eprintln!("↓ {path}");
-                    self.known.insert(path.clone(), sha.to_owned());
-                }
-                Err(error) => eprintln!("download {path} failed: {error:#}"),
-            }
+        let entries: Vec<Entry> = files
+            .iter()
+            .filter_map(|(path, entry)| {
+                let (Some(sha), Some(ticket)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
+                    return None;
+                };
+                Some((path.clone(), sha.to_owned(), ticket.to_owned()))
+            })
+            .collect();
+        for done in self.downloads.reconcile(&entries, &self.known, fetch_blob).await {
+            self.finish(done).await;
         }
         let gone: Vec<String> = self.known.keys().filter(|path| !files.contains_key(*path)).cloned().collect();
         for path in gone {
+            self.downloads.wanted.remove(&path);
             let synced = self.known.remove(&path);
             let Some(local) = resolve(&self.root, &path) else { continue };
             // Keep a local edit that no peer has seen yet; the next tick publishes it again.
@@ -171,30 +218,36 @@ impl Folder {
         }
     }
 
-    async fn download(&self, path: &str, sha: &str, ticket: &str) -> Result<()> {
-        let local = resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
-        download_file(&local, sha, ticket, fetch_blob, || {
+    /// Take the end of one download. A sha that the document no longer names is dropped.
+    async fn finish(&mut self, done: Finished) {
+        let Finished { path, sha, result } = done;
+        if self.downloads.wanted.get(&path) != Some(&sha) {
+            return;
+        }
+        let result = match result {
             // Serve the file too, so a peer can still get it after its author left.
-            self.publish(path, sha)
-        })
-        .await
+            Ok(true) => self.publish(&path, &sha).await,
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                eprintln!("↓ {path}");
+                self.known.insert(path, sha);
+            }
+            Err(error) => eprintln!("download {path} failed: {error:#}"),
+        }
     }
 }
 
-/// Fetch the blob that `ticket` names, check it against `sha`, write it to `local`, then `publish` it.
-async fn download_file<Fut, PublishFut>(
-    local: &Path,
-    sha: &str,
-    ticket: &str,
-    mut fetch: impl FnMut(String) -> Fut,
-    publish: impl FnOnce() -> PublishFut,
-) -> Result<()>
+/// Fetch the blob that `ticket` names, check it against `sha`, and write it to `local`.
+/// Returns `false` when the file already matches `sha` and nothing was fetched.
+async fn download_file<Fut>(local: &Path, sha: &str, ticket: &str, mut fetch: impl FnMut(String) -> Fut) -> Result<bool>
 where
     Fut: Future<Output = Result<Vec<u8>>>,
-    PublishFut: Future<Output = Result<()>>,
 {
     if file_sha(local).as_deref() == Some(sha) {
-        return Ok(());
+        return Ok(false);
     }
     let mut attempt = 0;
     let bytes = loop {
@@ -213,7 +266,7 @@ where
         tokio::fs::create_dir_all(parent).await?;
     }
     write_atomic(local, &bytes).await?;
-    publish().await
+    Ok(true)
 }
 
 /// The wait before retry `attempt`: 2 s, doubling up to 60 s, plus up to half of that as jitter.
@@ -286,7 +339,6 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(40)).await;
                 Ok(bytes.to_vec())
             },
-            || async { Ok(()) },
         )
         .await;
 
@@ -316,7 +368,6 @@ mod tests {
                     Ok(bytes.to_vec())
                 }
             },
-            || async { Ok(()) },
         )
         .await;
 
