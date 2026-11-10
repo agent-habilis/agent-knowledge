@@ -57,6 +57,7 @@ fn print_nickname(nick: &str) {
     println!("{EMOJI} joined as {nick}");
 }
 
+/// Print another peer's join or leave notice on stdout, for the skills to relay.
 fn print_presence(presence: Presence) {
     println!("{}", notice(&presence));
 }
@@ -99,6 +100,7 @@ fn run_plug(explicit: Vec<Agent>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse the command line and run the chosen command; `share` and `mount` sync until Ctrl-C.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

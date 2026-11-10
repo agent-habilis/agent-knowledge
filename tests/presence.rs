@@ -4,6 +4,7 @@ use agent_knowledge::sync::{self, Presence, Ready};
 use common::{Peer, WAIT, options};
 use tokio::sync::mpsc;
 
+/// Wait up to [`WAIT`] for `want` on the presence channel, skipping other events.
 async fn next(events: &mut mpsc::UnboundedReceiver<Presence>, want: &Presence) {
     let found = tokio::time::timeout(WAIT, async {
         while let Some(event) = events.recv().await {
@@ -35,6 +36,7 @@ async fn peers_get_nicknames_and_hear_join_and_leave() {
     share.stop().await;
 }
 
+/// A nickname the mesh refuses fails `run` before it ever reports ready.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invalid_nickname_fails_before_joining() {
     let dir = tempfile::tempdir().unwrap();

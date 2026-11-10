@@ -240,6 +240,8 @@ fn file_sha(path: &Path) -> Option<String> {
     std::fs::read(path).ok().map(|bytes| sha256_bytes(&bytes))
 }
 
+/// Wait for the membership `ready` event and return the mesh id and this peer's nick.
+/// Fails if the mesh stops first or the event lacks either field.
 async fn wait_ready(events: &mut mpsc::UnboundedReceiver<String>) -> Result<Ready> {
     while let Some(event) = events.recv().await {
         let event: Value = serde_json::from_str(&event)?;
@@ -264,6 +266,7 @@ fn presence(event: &Value) -> Option<Presence> {
     Some(presence(event["nick"].as_str()?.to_owned()))
 }
 
+/// Whether `event` is another peer's change to the shared `state` document: the cue to reconcile.
 fn is_remote_state_change(event: &Value) -> bool {
     event["kind"] == "state_changed" && event["channel"] == "state" && event["is_self"] == false
 }
