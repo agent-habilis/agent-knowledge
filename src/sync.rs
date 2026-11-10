@@ -25,7 +25,6 @@ use crate::watch::watch;
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sync `root` until `shutdown` resolves. With `mesh` `None`, create a new mesh; else join it.
 /// `on_ready` gets the mesh id, which is the hash that `mount` takes.
@@ -174,7 +173,7 @@ impl Folder {
 
     async fn download(&self, path: &str, sha: &str, ticket: &str) -> Result<()> {
         let local = resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
-        download_file(&local, sha, ticket, FETCH_TIMEOUT, fetch_blob, || {
+        download_file(&local, sha, ticket, fetch_blob, || {
             // Serve the file too, so a peer can still get it after its author left.
             self.publish(path, sha)
         })
@@ -187,7 +186,6 @@ async fn download_file<Fut, PublishFut>(
     local: &Path,
     sha: &str,
     ticket: &str,
-    fetch_timeout: Duration,
     fetch: impl FnOnce(String) -> Fut,
     publish: impl FnOnce() -> PublishFut,
 ) -> Result<()>
@@ -198,7 +196,7 @@ where
     if file_sha(local).as_deref() == Some(sha) {
         return Ok(());
     }
-    let bytes = tokio::time::timeout(fetch_timeout, fetch(ticket.to_owned())).await.context("fetch timed out")??;
+    let bytes = fetch(ticket.to_owned()).await?;
     if sha256_bytes(&bytes) != sha {
         bail!("content does not match its sha256");
     }
@@ -250,4 +248,32 @@ fn spool_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let instance = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("agent-knowledge-{}-{instance}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_slower_than_the_cap_still_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+
+        let result = download_file(
+            &local,
+            &sha,
+            "ticket",
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(40)).await;
+                Ok(bytes.to_vec())
+            },
+            || async { Ok(()) },
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&local).unwrap(), bytes);
+    }
 }
