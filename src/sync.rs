@@ -257,10 +257,6 @@ impl Downloads {
                 let retry = LocalRetry { sha: done.sha.clone(), at, attempts };
                 self.local_retry.insert(done.path.clone(), retry);
             }
-            _ => {
-                self.failed.remove(&done.path);
-                self.local_retry.remove(&done.path);
-            }
         }
         true
     }
@@ -860,7 +856,7 @@ mod tests {
         let dead: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "dead".to_owned())];
         let live: Vec<Entry> = vec![("start.md".to_owned(), sha, "live".to_owned())];
 
-        downloads.reconcile(&dead, &HashMap::new(), fetch.clone());
+        downloads.reconcile(&dead, &HashMap::new(), fetch);
         tokio::time::sleep(Duration::from_secs(1)).await;
         downloads.reconcile(&live, &HashMap::new(), fetch);
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1164,7 +1160,7 @@ mod tests {
         let slow: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "slow".to_owned())];
         let new: Vec<Entry> = vec![("start.md".to_owned(), sha, "new".to_owned())];
 
-        downloads.reconcile(&slow, &HashMap::new(), fetch.clone());
+        downloads.reconcile(&slow, &HashMap::new(), fetch);
         tokio::time::sleep(Duration::from_secs(1)).await;
         downloads.reconcile(&new, &HashMap::new(), fetch);
         tokio::time::sleep(Duration::from_secs(20)).await;
