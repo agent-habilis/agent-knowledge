@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
+use agent_knowledge::sync::{self, Options, Presence, Ready};
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
@@ -16,9 +17,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Share a folder. Prints the hash that `mount` takes, then syncs until Ctrl-C.
-    Share { folder: PathBuf },
+    Share {
+        folder: PathBuf,
+        /// This peer's nickname in the mesh. Default: a random one.
+        #[arg(long)]
+        nickname: Option<String>,
+    },
     /// Sync <target> with the folder that `share` printed <hash> for, until Ctrl-C.
-    Mount { hash: String, target: PathBuf },
+    Mount {
+        hash: String,
+        target: PathBuf,
+        /// This peer's nickname in the mesh. Default: a random one.
+        #[arg(long)]
+        nickname: Option<String>,
+    },
     /// Copy the knowledge-share and knowledge-mount skills into each agent's skills folder.
     Plug {
         /// Agent to plug into. Repeat for more than one. Default: every detected agent.
@@ -27,6 +39,26 @@ enum Command {
     },
     /// Print the folder of this agent session's memory, or fail if it runs none.
     Status,
+}
+
+/// The project emoji. Every line printed for the chat starts with it.
+const EMOJI: &str = "📚";
+
+/// The chat line for another peer joining or leaving.
+fn notice(presence: &Presence) -> String {
+    match presence {
+        Presence::Joined(nick) => format!("{EMOJI} {nick} joined"),
+        Presence::Left(nick) => format!("{EMOJI} {nick} left"),
+    }
+}
+
+/// Stdout, not stderr: the skills relay every `📚` line on stdout into the chat.
+fn print_nickname(nick: &str) {
+    println!("{EMOJI} joined as {nick}");
+}
+
+fn print_presence(presence: Presence) {
+    println!("{}", notice(&presence));
 }
 
 fn env(key: &str) -> Option<String> {
@@ -79,18 +111,37 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
     };
     match Cli::parse().command {
-        Command::Share { folder } => {
+        Command::Share { folder, nickname } => {
             let _claim = claim(Kind::Share, &folder)?;
-            let print_hash = |hash: &str| println!("{hash}");
-            agent_knowledge::sync::run(folder, None, print_hash, shutdown).await
+            let on_ready = |ready: &Ready| {
+                println!("{}", ready.mesh);
+                print_nickname(&ready.nick);
+            };
+            let options = Options { root: folder, mesh: None, nickname };
+            sync::run(options, on_ready, print_presence, shutdown).await
         }
-        Command::Mount { hash, target } => {
+        Command::Mount { hash, target, nickname } => {
             let _claim = claim(Kind::Mount, &target)?;
             std::fs::create_dir_all(&target)?;
-            let announce = |_: &str| eprintln!("mounted at {}", target.display());
-            agent_knowledge::sync::run(target.clone(), Some(hash), announce, shutdown).await
+            let on_ready = |ready: &Ready| {
+                eprintln!("mounted at {}", target.display());
+                print_nickname(&ready.nick);
+            };
+            let options = Options { root: target.clone(), mesh: Some(hash), nickname };
+            sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),
         Command::Status => status(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notices_start_with_the_project_emoji() {
+        assert_eq!(notice(&Presence::Joined("b".to_owned())), "📚 b joined");
+        assert_eq!(notice(&Presence::Left("b".to_owned())), "📚 b left");
     }
 }

@@ -1,7 +1,7 @@
 ---
 name: knowledge-mount
 description: Mount a shared folder by hash with live two-way sync by running `agent-knowledge mount <hash> <target>` in the background. Use when the user has a hash from the knowledge-share skill (or `agent-knowledge share`) and wants that folder on this machine.
-argument-hint: <hash> <target>
+argument-hint: <hash> <target> [--nickname <nick>]
 ---
 
 # knowledge-mount
@@ -27,8 +27,10 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 ## Steps
 
 1. **Parse the arguments.** The arguments (see Agent differences) hold `<hash>
-   <target>`. If the hash is missing, ask for it. If the target is missing, ask
-   for it. Do not invent a hash. Resolve the target to an absolute path.
+   <target> [--nickname <nick>]`. Take `--nickname <nick>` out first, if it is
+   there. If the hash is missing, ask for it. If the target is missing, ask
+   for it. Do not invent a hash or a nickname: with no flag, the mesh picks a
+   random nickname. Resolve the target to an absolute path.
 
 2. **Check the target.** The command creates the target if it does not exist.
    - Missing or empty: go ahead.
@@ -43,16 +45,18 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 
 4. **Run it in the background.** It runs until stopped, so never wait on it
    in the foreground.
+   Add `--nickname "<nick>"` to the command only if the user gave one.
    - Claude Code: call Bash with `run_in_background: true` and run
-     `agent-knowledge mount "<hash>" "<absolute-target>"`.
+     `agent-knowledge mount "<hash>" "<absolute-target>" [--nickname "<nick>"]`.
    - Codex and Pi: their shell tool waits for the command to end, so detach
      it and log to a new file:
-     `log=$(mktemp -t agent-knowledge); nohup agent-knowledge mount "<hash>" "<absolute-target>" > "$log" 2>&1 & echo "$! $log"`.
+     `log=$(mktemp -t agent-knowledge); nohup agent-knowledge mount "<hash>" "<absolute-target>" [--nickname "<nick>"] > "$log" 2>&1 & echo "$! $log"`.
      Note the PID and the log path, and read the log in the next step.
 
-5. **Confirm the mount.** The process prints `mounted at <target>` on stderr
-   once it joins. Read the background task's output until that line appears.
-   If the process exits instead, show the error output and stop. A bad hash
+5. **Confirm the mount.** Once it joins, the process prints `mounted at
+   <target>` on stderr and `📚 joined as <nick>` on stdout. Read the
+   background task's output until both lines appear. If the process exits
+   instead, show the error output and stop. A bad hash or a refused nickname
    fails here.
 
    If it exits with `this session already runs a ... memory`, report that
@@ -60,11 +64,21 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
    the message and say to stop it before starting another.
 
 6. **Report.** Tell the user:
+   - the `📚 joined as <nick>` line, as printed,
    - where the folder is mounted, and how many files have arrived so far,
    - that edits on either side sync within a few seconds, deletes included,
    - that the mount keeps running in the background, and how to stop it (stop
      the background task, or `kill <pid>`). Stopping leaves the
      files in place; it only stops syncing.
+
+7. **Relay join and leave notices.** While the mount runs, the process prints
+   `📚 <nick> joined` and `📚 <nick> left` on stdout as peers come and go.
+   Print each such line in the chat as it is, one line per notice, and
+   nothing else from the output.
+   - Claude Code: watch the background task's output with Monitor, filtered
+     to lines that start with `📚`.
+   - Codex and Pi: read new lines of the log file whenever you take a turn,
+     and print the `📚` lines that are new since the last read.
 
 ## Notes
 
