@@ -241,13 +241,14 @@ impl Folder {
 }
 
 /// Fetch the blob that `ticket` names, check it against `sha`, and write it to `local`.
-/// Returns `false` when the file already matches `sha` and nothing was fetched.
+/// Returns `true` when the caller must publish the file, which is also when it already matched `sha`:
+/// a peer that gets the file from its author would otherwise never serve it.
 async fn download_file<Fut>(local: &Path, sha: &str, ticket: &str, mut fetch: impl FnMut(String) -> Fut) -> Result<bool>
 where
     Fut: Future<Output = Result<Vec<u8>>>,
 {
     if file_sha(local).as_deref() == Some(sha) {
-        return Ok(false);
+        return Ok(true);
     }
     let mut attempt = 0;
     let bytes = loop {
@@ -344,6 +345,19 @@ mod tests {
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read(&local).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn a_file_already_on_disk_is_still_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        let bytes = b"from author";
+        std::fs::write(&local, bytes).unwrap();
+        let sha = sha256_bytes(bytes);
+
+        let result = download_file(&local, &sha, "ticket", |_| async { Ok(Vec::new()) }).await;
+
+        assert!(matches!(result, Ok(true)), "{result:?}");
     }
 
     #[tokio::test(start_paused = true)]
