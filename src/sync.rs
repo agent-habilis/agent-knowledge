@@ -15,7 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
 use habilis_network::net::direct::PayloadPath;
-use habilis_network::ops::blob::{self, BlobServer, BlobTicket, ContentId};
+use habilis_network::iroh::Endpoint;
+use habilis_network::net::build_peer_endpoint;
+use habilis_network::ops::blob::{BlobServer, BlobTicket, ContentId, fetch_with_endpoint};
 use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
@@ -53,7 +55,14 @@ pub async fn run(
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
-    let mut folder = Folder { root: root.clone(), member, blobs, known: HashMap::new(), downloads: Downloads::new(root, done) };
+    let mut folder = Folder {
+        root: root.clone(),
+        member,
+        blobs,
+        known: HashMap::new(),
+        downloads: Downloads::new(root, done),
+        consumer: Arc::new(Consumer::new()),
+    };
 
     folder.reconcile().await;
     folder.publish_local().await;
@@ -76,6 +85,9 @@ pub async fn run(
         }
     }
     folder.downloads.abort_all();
+    if let Some(endpoint) = folder.consumer.take().await {
+        endpoint.close().await;
+    }
     folder.blobs.shutdown().await;
     membership::depart(folder.member.node).await.map_err(|error| anyhow!("{error}"))
 }
@@ -88,6 +100,7 @@ struct Folder {
     /// A watcher tick or a document entry that matches it is our own echo, and is skipped.
     known: HashMap<String, String>,
     downloads: Downloads,
+    consumer: Arc<Consumer<Endpoint>>,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -366,7 +379,8 @@ impl Folder {
                 Some((path.clone(), sha.to_owned(), ticket.to_owned()))
             })
             .collect();
-        self.downloads.reconcile(&entries, &self.known, fetch_blob);
+        let consumer = self.consumer.clone();
+        self.downloads.reconcile(&entries, &self.known, move |ticket| fetch_blob(consumer.clone(), ticket));
         self.downloads.prune(files);
         let gone = unnamed(self.known.keys().cloned().collect(), files);
         for path in gone {
@@ -479,10 +493,52 @@ impl std::fmt::Display for BadTicket {
 
 impl std::error::Error for BadTicket {}
 
-async fn fetch_blob(ticket: String) -> Result<Vec<u8>> {
+/// What the consumer needs from an endpoint: whether it has closed.
+trait Closable {
+    fn closed(&self) -> bool;
+}
+
+impl Closable for Endpoint {
+    fn closed(&self) -> bool {
+        self.is_closed()
+    }
+}
+
+/// The one endpoint that every blob fetch of this process uses. It is built on first use, and again only after it closes.
+struct Consumer<E> {
+    current: tokio::sync::Mutex<Option<E>>,
+}
+
+impl<E: Clone + Closable> Consumer<E> {
+    fn new() -> Self {
+        Self { current: tokio::sync::Mutex::new(None) }
+    }
+
+    async fn get<Fut>(&self, build: impl FnOnce() -> Fut) -> Result<E>
+    where
+        Fut: Future<Output = Result<E>>,
+    {
+        let mut current = self.current.lock().await;
+        if let Some(endpoint) = current.as_ref().filter(|endpoint| !endpoint.closed()) {
+            return Ok(endpoint.clone());
+        }
+        let endpoint = build().await?;
+        *current = Some(endpoint.clone());
+        Ok(endpoint)
+    }
+
+    async fn take(&self) -> Option<E> {
+        self.current.lock().await.take()
+    }
+}
+
+async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
+    let endpoint = consumer
+        .get(|| async { build_peer_endpoint(&LookupOpts::public_preset()).await.map_err(|error| anyhow!("{error}")) })
+        .await?;
     let mut bytes = Vec::new();
-    blob::fetch(&ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
+    fetch_with_endpoint(&endpoint, &ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
     Ok(bytes)
 }
 
@@ -834,8 +890,14 @@ mod tests {
         let local = dir.path().join("start.md");
         let sha = sha256_bytes(b"from author");
 
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(3600), download_file(&local, "start.md", &sha, "not a ticket", &gate_wanting("start.md", &sha), fetch_blob)).await;
+        let consumer = Arc::new(Consumer::<Endpoint>::new());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3600),
+            download_file(&local, "start.md", &sha, "not a ticket", &gate_wanting("start.md", &sha), move |ticket| {
+                fetch_blob(consumer.clone(), ticket)
+            }),
+        )
+        .await;
 
         assert!(matches!(outcome, Ok(Err(Failure::Permanent(_)))), "{outcome:?}");
     }
@@ -1296,6 +1358,65 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(600)).await;
 
         assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stand-in endpoint: it closes when a test says so.
+    #[derive(Clone, Default)]
+    struct FakeEndpoint(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Closable for FakeEndpoint {
+        fn closed(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn many_downloads_build_the_endpoint_once() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default())
+        };
+
+        for _ in 0..3 {
+            consumer.get(build).await.unwrap();
+        }
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_does_not_build_another_endpoint() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default())
+        };
+
+        consumer.get(build).await.unwrap();
+        // A fetch that fails leaves the endpoint open, so the next download reuses it.
+        consumer.get(build).await.unwrap();
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_endpoint_is_rebuilt_once() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default())
+        };
+
+        let first = consumer.get(build).await.unwrap();
+        first.0.store(true, Ordering::SeqCst);
+        consumer.get(build).await.unwrap();
+        consumer.get(build).await.unwrap();
+
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
