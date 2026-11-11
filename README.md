@@ -35,13 +35,17 @@ other peer that joins or leaves. Each line starts with 📚:
 | `/knowledge-mount <hash> <target> [--nickname <nick>]` | Runs `mount` in the background and relays the 📚 lines. The target is the memory bank. |
 | `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the session's memory bank. Errors if there is none. |
 | `/knowledge-read [question]` | Answers from the session's memory bank. Errors if there is none. |
+| `/knowledge-status` | Shows the mesh (kind, hash, your nickname, each peer's path and last seen) and the docs (file count, size, last sync, failed transfers, last 5 changes). Errors if there is no memory bank. |
 
 ### One memory per session
 
 Each agent session runs at most one memory: one `share` or one `mount`. A
 second one in the same session fails with `this session already runs a ...
-memory`. `status` prints the folder of the running one, and
-`/knowledge-write` and `/knowledge-read` use it.
+memory`. `status` prints the folder of the running one on its first line, and
+`/knowledge-write` and `/knowledge-read` use it. After the folder, it prints a
+📚 block with the mesh and the docs. The running process keeps that state in
+`<registry>/<session>.status.json`, beside its registry entry, and removes it
+when it stops. `/knowledge-status` prints the block.
 
 The session is `$CLAUDE_CODE_SESSION_ID` in Claude Code, `$CODEX_THREAD_ID` in
 Codex, or `$AGENT_KNOWLEDGE_SESSION`. Without any of them (Pi, a plain
@@ -146,6 +150,7 @@ cargo test --workspace --no-fail-fast                                    # test
 - `src/skills/`: the skills that `plug` installs. Edit them here, then rebuild.
 - `src/sync.rs`: the sync loop. Both commands run it.
 - `src/scan.rs`: walks a folder and hashes each file. It also rejects unsafe paths from a peer.
+- `src/status.rs`: the status file that a running memory writes, and the 📚 block that `status` prints from it.
 - `src/watch.rs`: the file watcher. It sends 1 tick after 300ms with no changes.
 
 ### How it works

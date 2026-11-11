@@ -43,7 +43,8 @@ Each agent session runs at most one memory: a share or a mount. Ask for it:
 agent-knowledge status
 ```
 
-- **Exit 0:** stdout is the memory bank folder. Call it `<bank>` below.
+- **Exit 0:** the first line of stdout is the memory bank folder. Call it
+  `<bank>` below. Ignore the lines after it: they are the status block.
 - **Non-zero exit:** stop, write nothing, and show this error:
   `No memory bank in this session. Run /knowledge-mount <hash> <target> or /knowledge-share <folder> first.`
   Use the agent form of the commands (see Agent differences).
