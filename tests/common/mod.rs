@@ -10,9 +10,18 @@ use tokio::task::JoinHandle;
 /// How long a test waits for the mesh to deliver something.
 pub const WAIT: Duration = Duration::from_secs(30);
 
+/// How long a test waits for a peer to find the rest of a mesh whose creator has left. Measured
+/// at 20 to 30 seconds on one machine.
+pub const REJOIN_WAIT: Duration = Duration::from_secs(90);
+
 /// Poll `path` until its contents equal `want` (`None`: the file is absent); fail after [`WAIT`].
 pub async fn wait_for(path: &Path, want: Option<&str>) {
-    let deadline = tokio::time::Instant::now() + WAIT;
+    wait_for_within(path, want, WAIT).await;
+}
+
+/// [`wait_for`] with its own deadline.
+pub async fn wait_for_within(path: &Path, want: Option<&str>, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
     loop {
         let got = std::fs::read_to_string(path).ok();
         if got.as_deref() == want {

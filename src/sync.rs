@@ -3,7 +3,8 @@
 //! The mesh `state` document is the file list: `{"files": {"<rel/path>": {"sha256", "ticket"}}}`.
 //! It is an automerge CRDT, so concurrent writes from both sides merge, and the last write to one
 //! path wins. File bytes do not fit in a gossip frame, so each entry holds a blob ticket that a
-//! peer redeems against the author's blob server.
+//! peer redeems against the author's blob server. Every peer that holds a copy offers its own
+//! ticket too (see [`crate::providers`]), so a file outlives its author.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,12 +20,14 @@ use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::providers;
 use crate::scan::{self, resolve, sha256_bytes};
 use crate::watch::watch;
 
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
+/// Per ticket. The tickets of one file are tried at once, so a dead one costs no extra wait.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What to sync, and as whom.
@@ -80,10 +83,11 @@ pub async fn run(
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
-    let mut folder = Folder { root, member, blobs, known: HashMap::new() };
+    let mut folder = Folder { root, member, blobs, known: HashMap::new(), offered: HashMap::new() };
 
     folder.reconcile().await;
     folder.publish_local().await;
+    folder.offer_held().await;
 
     let mut every = tokio::time::interval(RECONCILE_EVERY);
     tokio::pin!(shutdown);
@@ -102,9 +106,13 @@ pub async fn run(
                     folder.reconcile().await;
                 }
             }
-            _ = every.tick() => folder.reconcile().await,
+            _ = every.tick() => {
+                folder.reconcile().await;
+                folder.offer_held().await;
+            }
         }
     }
+    folder.withdraw_all().await;
     folder.blobs.shutdown().await;
     membership::depart(folder.member.node).await.map_err(|error| anyhow!("{error}"))
 }
@@ -116,6 +124,17 @@ struct Folder {
     /// The sha256 of each path as both the disk and the document last agreed on it.
     /// A watcher tick or a document entry that matches it is our own echo, and is skipped.
     known: HashMap<String, String>,
+    /// The content this peer offers in the `providers` map, by sha256.
+    offered: HashMap<String, Offer>,
+}
+
+/// This peer's offer of one content.
+struct Offer {
+    /// The key this peer offers under: its blob server's endpoint id.
+    peer: String,
+    /// Whether the ticket names a relay. Without one, a peer behind another NAT can never reach
+    /// it, so the offer is minted again until the blob server has a relay.
+    relayed: bool,
 }
 
 impl Folder {
@@ -166,11 +185,70 @@ impl Folder {
     }
 
     async fn reconcile(&mut self) {
-        let Ok(text) = self.member.request(|reply| Request::Inspect(Inspect::StateJson { reply })).await else {
-            return;
+        let text = match self.member.request(|reply| Request::Inspect(Inspect::StateJson { reply })).await {
+            Ok(text) => text,
+            Err(error) => return eprintln!("reading the shared file list failed: {error}"),
         };
-        if let Ok(document) = serde_json::from_str::<Value>(&text) {
-            self.apply(&document).await;
+        match serde_json::from_str::<Value>(&text) {
+            Ok(document) => self.apply(&document).await,
+            Err(error) => eprintln!("the shared file list is not JSON: {error}"),
+        }
+    }
+
+    /// Offer this peer's ticket for each content it holds in sync, and withdraw the offers for
+    /// content it no longer holds. An offer whose ticket names no relay is minted again on every
+    /// call, until the blob server has a relay.
+    async fn offer_held(&mut self) {
+        let mut held: HashMap<&str, &str> = HashMap::new();
+        for (path, sha) in &self.known {
+            held.entry(sha.as_str()).or_insert(path.as_str());
+        }
+        let stale: Vec<String> = self.offered.keys().filter(|sha| !held.contains_key(sha.as_str())).cloned().collect();
+        let due: Vec<(String, String)> = held
+            .iter()
+            .filter(|(sha, _)| self.offered.get(**sha).is_none_or(|offer| !offer.relayed))
+            .map(|(sha, path)| ((*sha).to_owned(), (*path).to_owned()))
+            .collect();
+        for sha in stale {
+            self.withdraw(&sha).await;
+        }
+        for (sha, path) in due {
+            if let Err(error) = self.offer(&path, &sha).await {
+                eprintln!("offering {path} failed: {error:#}");
+            }
+        }
+    }
+
+    /// Mint a ticket for the content `sha`, read from `path`, and offer it if it is new or now
+    /// names a relay.
+    async fn offer(&mut self, path: &str, sha: &str) -> Result<()> {
+        let ticket = self
+            .blobs
+            .register(&self.root.join(path), ContentId::new(sha))
+            .await
+            .map_err(|error| anyhow!("{error}"))?;
+        let relayed = ticket.address.relay_urls().next().is_some();
+        if self.offered.get(sha).is_some_and(|offer| offer.relayed == relayed) {
+            return Ok(());
+        }
+        let peer = ticket.address.id.to_string();
+        self.merge(providers::offer(sha, &peer, &ticket.encode())).await?;
+        self.offered.insert(sha.to_owned(), Offer { peer, relayed });
+        Ok(())
+    }
+
+    async fn withdraw(&mut self, sha: &str) {
+        let Some(offer) = self.offered.remove(sha) else { return };
+        if let Err(error) = self.merge(providers::withdraw(sha, &offer.peer)).await {
+            eprintln!("withdrawing an offer failed: {error:#}");
+        }
+    }
+
+    /// Take back every offer, so peers stop trying a blob server that is about to stop.
+    async fn withdraw_all(&mut self) {
+        let shas: Vec<String> = self.offered.keys().cloned().collect();
+        for sha in shas {
+            self.withdraw(&sha).await;
         }
     }
 
@@ -179,13 +257,11 @@ impl Folder {
         let empty = serde_json::Map::new();
         let files = document.get("files").and_then(Value::as_object).unwrap_or(&empty);
         for (path, entry) in files {
-            let (Some(sha), Some(ticket)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
-                continue;
-            };
+            let Some(sha) = entry["sha256"].as_str() else { continue };
             if self.known.get(path).map(String::as_str) == Some(sha) {
                 continue;
             }
-            match self.download(path, sha, ticket).await {
+            match self.download(path, sha, providers::tickets(document, entry, sha)).await {
                 Ok(()) => {
                     eprintln!("↓ {path}");
                     self.known.insert(path.clone(), sha.to_owned());
@@ -205,25 +281,52 @@ impl Folder {
         }
     }
 
-    async fn download(&self, path: &str, sha: &str, ticket: &str) -> Result<()> {
+    async fn download(&self, path: &str, sha: &str, tickets: Vec<String>) -> Result<()> {
         let local = resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
         if file_sha(&local).as_deref() == Some(sha) {
             return Ok(());
         }
-        let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
-        let mut bytes = Vec::new();
-        tokio::time::timeout(FETCH_TIMEOUT, blob::fetch(&ticket, &mut bytes, None))
-            .await
-            .context("fetch timed out")?
-            .map_err(|error| anyhow!("{error}"))?;
-        if sha256_bytes(&bytes) != sha {
-            bail!("content does not match its sha256");
-        }
+        let bytes = fetch_any(tickets, sha).await?;
         if let Some(parent) = local.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         write_atomic(&local, &bytes).await
     }
+}
+
+/// Fetch the content `sha` through every ticket at once and keep the first copy that matches.
+/// The others are cancelled. Fails, naming each ticket's error, only if every ticket fails.
+async fn fetch_any(tickets: Vec<String>, sha: &str) -> Result<Vec<u8>> {
+    if tickets.is_empty() {
+        bail!("no peer offers this content");
+    }
+    let mut fetches = tokio::task::JoinSet::new();
+    for ticket in tickets {
+        let sha = sha.to_owned();
+        fetches.spawn(async move { fetch_one(&ticket, &sha).await });
+    }
+    let mut errors = Vec::new();
+    while let Some(joined) = fetches.join_next().await {
+        match joined.map_err(anyhow::Error::from).and_then(|fetched| fetched) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    bail!("every peer failed: {}", errors.join("; "))
+}
+
+/// Fetch the content `sha` through one ticket, within [`FETCH_TIMEOUT`].
+async fn fetch_one(ticket: &str, sha: &str) -> Result<Vec<u8>> {
+    let ticket = BlobTicket::decode(ticket).map_err(|error| anyhow!("{error}"))?;
+    let mut bytes = Vec::new();
+    tokio::time::timeout(FETCH_TIMEOUT, blob::fetch(&ticket, &mut bytes, None))
+        .await
+        .context("fetch timed out")?
+        .map_err(|error| anyhow!("{error}"))?;
+    if sha256_bytes(&bytes) != sha {
+        bail!("content does not match its sha256");
+    }
+    Ok(bytes)
 }
 
 /// Write through a hidden sibling and rename it, so an editor never sees half a file.
