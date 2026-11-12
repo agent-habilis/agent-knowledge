@@ -119,16 +119,24 @@ cargo build
 
 ### Test
 
+CI (`.github/workflows/ci.yml`) runs 4 jobs on each push and pull request to
+`main`. To run the same checks locally:
+
 ```bash
-cargo test
-cargo clippy
+cargo fmt --all -- --check                                               # fmt
+cargo clippy --workspace --all-targets -- -D warnings                    # clippy
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items  # doc
+cargo test --workspace --no-fail-fast                                    # test
 ```
+
+`cargo fmt --all` fixes the format. `rustfmt.toml` sets the style.
 
 - `src/scan.rs` has the unit tests.
 - `tests/memory.rs` checks the session id, the registry, and the one-memory rule.
 - `tests/plug.rs` checks the embedded skills, the skills folder and the detection of each agent, and the install.
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
 - `tests/presence.rs` starts 2 peers with nicknames. The first peer must see the second join, then leave. It also checks the random nickname, a refused nickname, and the 📚 line format.
+- `tests/relay_only.rs` blocks every direct path, so 2 peers sync only through the public relay. It needs internet access.
 
 ### Code map
 
