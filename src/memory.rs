@@ -132,9 +132,7 @@ fn read_entry(path: &Path) -> anyhow::Result<Option<Memory>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("cannot read {}", path.display())),
     };
-    parse_entry(&text)
-        .with_context(|| format!("bad session entry {}; delete it to continue", path.display()))
-        .map(Some)
+    parse_entry(&text).with_context(|| format!("bad session entry {}; delete it to continue", path.display())).map(Some)
 }
 
 fn parse_entry(text: &str) -> anyhow::Result<Memory> {

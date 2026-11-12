@@ -4,18 +4,35 @@ Share a folder with live two-way sync over
 [habilis-network](https://github.com/agent-habilis/habilis-network).
 
 ```bash
-agent-knowledge share <folder>          # prints a hash
-agent-knowledge mount <hash> <target>   # keeps <target> in sync with <folder>
-agent-knowledge plug                    # installs the skills into Claude Code, Codex, and Pi
-agent-knowledge status                  # prints this session's memory bank folder
+agent-knowledge share <folder> [--nickname <nick>]          # prints a hash
+agent-knowledge mount <hash> <target> [--nickname <nick>]   # keeps <target> in sync with <folder>
+agent-knowledge plug                                        # installs the skills into Claude Code, Codex, and Pi
+agent-knowledge status                                      # prints this session's memory bank folder
 ```
+
+### Nicknames and notices
+
+Each peer has a nickname in the mesh. `--nickname <nick>` sets it. Without
+the flag, the mesh picks a random one, such as `baton-garden`. A nickname is
+1 to 32 characters, with no whitespace and none of `/ \ < > #`.
+
+`share` and `mount` print one line on stdout for this peer, and one for each
+other peer that joins or leaves. Each line starts with 📚:
+
+```text
+📚 joined as a
+📚 b joined
+📚 b left
+```
+
+`share` prints the hash first, on its own line, before these lines.
 
 ### Skills
 
 | Skill | What it does |
 |---|---|
-| `/knowledge-share <folder>` | Runs `share` in the background and prints the hash. |
-| `/knowledge-mount <hash> <target>` | Runs `mount` in the background. The target is the memory bank. |
+| `/knowledge-share <folder> [--nickname <nick>]` | Runs `share` in the background, prints the hash, and relays the 📚 lines. |
+| `/knowledge-mount <hash> <target> [--nickname <nick>]` | Runs `mount` in the background and relays the 📚 lines. The target is the memory bank. |
 | `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the session's memory bank. Errors if there is none. |
 | `/knowledge-read [question]` | Answers from the session's memory bank. Errors if there is none. |
 
@@ -102,15 +119,24 @@ cargo build
 
 ### Test
 
+CI (`.github/workflows/ci.yml`) runs 4 jobs on each push and pull request to
+`main`. To run the same checks locally:
+
 ```bash
-cargo test
-cargo clippy
+cargo fmt --all -- --check                                               # fmt
+cargo clippy --workspace --all-targets -- -D warnings                    # clippy
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items  # doc
+cargo test --workspace --no-fail-fast                                    # test
 ```
+
+`cargo fmt --all` fixes the format. `rustfmt.toml` sets the style.
 
 - `src/scan.rs` has the unit tests.
 - `tests/memory.rs` checks the session id, the registry, and the one-memory rule.
 - `tests/plug.rs` checks the embedded skills, the skills folder and the detection of each agent, and the install.
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
+- `tests/presence.rs` starts 2 peers with nicknames. The first peer must see the second join, then leave. It also checks the random nickname, a refused nickname, and the 📚 line format.
+- `tests/relay_only.rs` blocks every direct path, so 2 peers sync only through the public relay. It needs internet access.
 
 ### Code map
 

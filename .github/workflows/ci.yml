@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Same setup as agent-gossip's ci.yml. Every job installs the toolchain and
+# components from rust-toolchain.toml (the one source of truth), so local and
+# CI compile with the same rustc. setup-rust-toolchain also caches the build.
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # `--document-private-items`: most items are private, and rustdoc skips their docs otherwise.
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # One crate with a few test binaries, so one job, no shards. `two_way`,
+  # `relay_only` and `presence` start real meshes over mDNS, DHT and the public
+  # relay, so they need outbound network. The cap kills a wedged mesh test
+  # while the run still means something.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # A separate build step, so a compile error reads apart from a test failure.
+      - name: Build test binaries
+        run: cargo test --workspace --no-run
+      # `--no-fail-fast`: one failing binary must not hide the others' results.
+      - name: Run tests
+        run: cargo test --workspace --no-fail-fast
