@@ -478,7 +478,12 @@ impl Downloads {
     ) {
         for (path, copy) in self.drop_unnamed(files, known) {
             if let Some(local) = &copy {
-                if let Err(error) = remove(local) {
+                // A file that is already gone counts as removed.
+                let removed = remove(local).or_else(|error| match error.kind() {
+                    io::ErrorKind::NotFound => Ok(()),
+                    _ => Err(error),
+                });
+                if let Err(error) = removed {
                     tracing::debug!(path = %path, error = %error, "retrying a file removal on the next reconcile");
                     continue;
                 }
@@ -2344,6 +2349,20 @@ mod tests {
 
         assert_eq!(first.len(), 1, "the first drop lists the file");
         assert_eq!(again.len(), 1, "the record was cleared before the file was removed");
+    }
+
+    #[test]
+    fn a_removed_copy_drops_its_landed_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.md"), "Y").unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        downloads.gate.record_landed("gone.md", &sha256_bytes(b"Y"));
+        let mut known = HashMap::from([("gone.md".to_owned(), sha256_bytes(b"X"))]);
+
+        downloads.remove_dropped(&serde_json::Map::new(), &mut known, |local| std::fs::remove_file(local));
+
+        assert!(downloads.gate.landed_sha("gone.md").is_none(), "the landed record survived the removal");
     }
 
     #[test]
