@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +50,7 @@ pub async fn run(
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     on_ready(&wait_ready(&mut events).await?);
 
-    let blobs = BlobServer::start(LookupOpts::public_preset(), spool_dir(), None, PayloadPath::RelayAllowed)
+    let blobs = BlobServer::start(blob_lookups(), spool_dir(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
@@ -493,6 +493,12 @@ impl std::fmt::Display for BadTicket {
 
 impl std::error::Error for BadTicket {}
 
+/// The lookups of every blob endpoint. The server and the consumers must share them, so a ticket that one side
+/// publishes is found by the other side.
+fn blob_lookups() -> LookupOpts {
+    LookupOpts::public_preset()
+}
+
 /// What the consumer needs from an endpoint: whether it has closed.
 trait Closable {
     fn closed(&self) -> bool;
@@ -504,38 +510,66 @@ impl Closable for Endpoint {
     }
 }
 
-/// The one endpoint that every blob fetch of this process uses. It is built on first use, and again only after it closes.
+/// How long a failed endpoint build is remembered. The waiting downloads get the same error until then.
+const BUILD_RETRY_WAIT: Duration = Duration::from_secs(5);
+
+/// The endpoint that the blob fetches of one folder use. It is built on first use, and again only after it closes.
 struct Consumer<E> {
-    current: tokio::sync::Mutex<Option<E>>,
+    state: tokio::sync::Mutex<ConsumerState<E>>,
+    /// Set on shutdown. A download that starts after it must not build an endpoint.
+    closed: AtomicBool,
+}
+
+struct ConsumerState<E> {
+    endpoint: Option<E>,
+    last_failure: Option<(tokio::time::Instant, String)>,
 }
 
 impl<E: Clone + Closable> Consumer<E> {
     fn new() -> Self {
-        Self { current: tokio::sync::Mutex::new(None) }
+        let state = ConsumerState { endpoint: None, last_failure: None };
+        Self { state: tokio::sync::Mutex::new(state), closed: AtomicBool::new(false) }
     }
 
     async fn get<Fut>(&self, build: impl FnOnce() -> Fut) -> Result<E>
     where
         Fut: Future<Output = Result<E>>,
     {
-        let mut current = self.current.lock().await;
-        if let Some(endpoint) = current.as_ref().filter(|endpoint| !endpoint.closed()) {
+        if self.closed.load(Ordering::SeqCst) {
+            bail!("the folder is shutting down");
+        }
+        let mut state = self.state.lock().await;
+        if let Some(endpoint) = state.endpoint.as_ref().filter(|endpoint| !endpoint.closed()) {
             return Ok(endpoint.clone());
         }
-        let endpoint = build().await?;
-        *current = Some(endpoint.clone());
-        Ok(endpoint)
+        if let Some((failed_at, message)) = &state.last_failure {
+            if failed_at.elapsed() < BUILD_RETRY_WAIT {
+                bail!("{message}");
+            }
+        }
+        match build().await {
+            Ok(endpoint) => {
+                state.endpoint = Some(endpoint.clone());
+                state.last_failure = None;
+                Ok(endpoint)
+            }
+            Err(error) => {
+                state.last_failure = Some((tokio::time::Instant::now(), format!("{error:#}")));
+                Err(error)
+            }
+        }
     }
 
     async fn take(&self) -> Option<E> {
-        self.current.lock().await.take()
+        self.closed.store(true, Ordering::SeqCst);
+        self.state.lock().await.endpoint.take()
     }
 }
 
 async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
     let endpoint = consumer
-        .get(|| async { build_peer_endpoint(&LookupOpts::public_preset()).await.map_err(|error| anyhow!("{error}")) })
+        .get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(|error| anyhow!("{error}")) })
         .await?;
     let mut bytes = Vec::new();
     fetch_with_endpoint(&endpoint, &ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
@@ -1417,6 +1451,39 @@ mod tests {
         consumer.get(build).await.unwrap();
 
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_download_after_shutdown_does_not_build_an_endpoint() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default())
+        };
+        consumer.get(build).await.unwrap();
+
+        consumer.take().await;
+        let late = consumer.get(build).await;
+
+        assert!(late.is_err());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_build_error_is_not_retried_at_once() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Err::<FakeEndpoint, anyhow::Error>(anyhow!("offline"))
+        };
+
+        let first = consumer.get(build).await;
+        let second = consumer.get(build).await;
+
+        assert!(first.is_err() && second.is_err());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
