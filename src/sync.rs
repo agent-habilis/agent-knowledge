@@ -5,7 +5,7 @@
 //! path wins. File bytes do not fit in a gossip frame, so each entry holds a blob ticket that a
 //! peer redeems against the author's blob server.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -304,7 +304,9 @@ impl Downloads {
     {
         for (path, sha, ticket) in entries {
             self.gate.set_wanted(path, sha, ticket);
-            if known.get(path) == Some(sha)
+            // A landed copy that is not `sha` is a stale download, so `sha` is fetched again even when `known` holds it.
+            let synced = known.get(path) == Some(sha) && self.gate.landed_sha(path).is_none_or(|landed| &landed == sha);
+            if synced
                 || self.failed.get(path) == Some(&(sha.clone(), ticket.clone()))
                 || self.waiting_to_retry(path, sha)
             {
@@ -401,19 +403,61 @@ impl Downloads {
         self.local_retry.get(path).is_some_and(|retry| retry.sha == sha && tokio::time::Instant::now() < retry.at)
     }
 
-    /// Scans the folder. A path whose disk sha the document does not know is a local edit, and its download is
-    /// forgotten, so an older download cannot overwrite the edit. The write turn is held across the scan, so no download
-    /// write runs in between.
+    /// Scans the folder. A file that differs from its known baseline is a local edit, and its download is forgotten, so
+    /// an older download cannot overwrite it. A file with no baseline is not an edit: after a restart, the document's
+    /// copy replaces it, as before. Keeping such an edit needs a persisted baseline. A write that a download made is
+    /// not an edit either. The write turn is held across the scan, so no download write runs in between.
     fn claim_edits(&mut self, known: &HashMap<String, String>) -> io::Result<BTreeMap<String, String>> {
         let turn = self.gate.turn.clone();
         let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
         let disk = scan::scan(&self.root)?;
+        self.gate.keep_landed(&disk);
         for (path, sha) in &disk {
-            if known.get(path) != Some(sha) {
+            if self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
+                continue;
+            }
+            if known.get(path).is_some_and(|base| base != sha) {
                 self.forget(path);
             }
         }
         Ok(disk)
+    }
+
+    /// The disk files that `publish_local` publishes. A download's own write waits for its result. An untracked file
+    /// waits while the document names other content for its path, so it does not replace that content.
+    fn publishable(&self, disk: &BTreeMap<String, String>, known: &HashMap<String, String>) -> Vec<(String, String)> {
+        disk.iter()
+            .filter(|&(path, sha)| {
+                if known.get(path) == Some(sha) || self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
+                    return false;
+                }
+                let untracked = !known.contains_key(path);
+                !(untracked && self.gate.wanted_sha(path).is_some_and(|wanted| &wanted != sha))
+            })
+            .map(|(path, sha)| (path.clone(), sha.clone()))
+            .collect()
+    }
+
+    /// Forgets each path that the document does not name. Returns the local copy of each such path that holds content
+    /// this peer got from the mesh, so the caller removes it. A local edit that no peer has seen stays on disk.
+    fn drop_unnamed(
+        &mut self,
+        files: &serde_json::Map<String, Value>,
+        known: &mut HashMap<String, String>,
+    ) -> Vec<(String, PathBuf)> {
+        let tracked: BTreeSet<String> = known.keys().cloned().chain(self.gate.landed_paths()).collect();
+        let mut copies = Vec::new();
+        for path in unnamed(tracked.into_iter().collect(), files) {
+            let synced = known.remove(&path);
+            let landed = self.gate.landed_sha(&path);
+            self.gate.forget_landed(&path);
+            let Some(local) = resolve(&self.root, &path) else { continue };
+            let on_disk = file_sha(&local);
+            if on_disk.is_some() && (on_disk == synced || on_disk == landed) {
+                copies.push((path, local));
+            }
+        }
+        copies
     }
 
     /// Stop everything for a path that the document no longer names.
@@ -451,11 +495,8 @@ impl Folder {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
         };
-        for (path, sha) in &disk {
-            if self.known.get(path) == Some(sha) {
-                continue;
-            }
-            match self.publish(path, sha).await {
+        for (path, sha) in self.downloads.publishable(&disk, &self.known) {
+            match self.publish(&path, &sha).await {
                 Ok(()) => {
                     eprintln!("↑ {path}");
                     self.known.insert(path.clone(), sha.clone());
@@ -518,15 +559,9 @@ impl Folder {
         self.downloads
             .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
         self.downloads.prune(files);
-        let gone = unnamed(self.known.keys().cloned().collect(), files);
-        for path in gone {
-            let synced = self.known.remove(&path);
-            let Some(local) = resolve(&self.root, &path) else { continue };
-            // Keep a local edit that no peer has seen yet; the next tick publishes it again.
-            if file_sha(&local).is_some() && file_sha(&local) == synced {
-                let _ = std::fs::remove_file(&local);
-                eprintln!("↓ deleted {path}");
-            }
+        for (path, local) in self.downloads.drop_unnamed(files, &mut self.known) {
+            let _ = std::fs::remove_file(&local);
+            eprintln!("↓ deleted {path}");
         }
     }
 
@@ -868,6 +903,8 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress:
 struct Gate {
     turn: Arc<Mutex<()>>,
     wanted: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// The sha that the last download wrote to each path. It holds only while the disk still has that sha.
+    landed: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Gate {
@@ -899,6 +936,27 @@ impl Gate {
         self.wanted.lock().unwrap_or_else(PoisonError::into_inner).keys().cloned().collect()
     }
 
+    fn record_landed(&self, path: &str, sha: &str) {
+        self.landed.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), sha.to_owned());
+    }
+
+    fn landed_sha(&self, path: &str) -> Option<String> {
+        self.landed.lock().unwrap_or_else(PoisonError::into_inner).get(path).cloned()
+    }
+
+    fn landed_paths(&self) -> Vec<String> {
+        self.landed.lock().unwrap_or_else(PoisonError::into_inner).keys().cloned().collect()
+    }
+
+    fn forget_landed(&self, path: &str) {
+        self.landed.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
+    }
+
+    /// Keeps a record only while the disk still holds the sha that it records.
+    fn keep_landed(&self, disk: &BTreeMap<String, String>) {
+        self.landed.lock().unwrap_or_else(PoisonError::into_inner).retain(|path, sha| disk.get(path) == Some(sha));
+    }
+
     /// Write `bytes` to `local`, unless the document no longer names `sha` for `path`.
     /// The write runs on a blocking thread, so an aborted download cannot stop it halfway.
     async fn write(&self, local: &Path, path: &str, sha: &str, bytes: Vec<u8>) -> Result<bool> {
@@ -910,6 +968,7 @@ impl Gate {
                 return Ok(false);
             }
             write_file(&local, &bytes)?;
+            gate.record_landed(&path, &sha);
             Ok(true)
         })
         .await
@@ -2087,12 +2146,143 @@ mod tests {
         assert!(calls.load(Ordering::SeqCst) >= 2, "attempts: {}", calls.load(Ordering::SeqCst));
     }
 
+    /// Waits until `path` holds `bytes`. The write runs on a blocking thread, so the clock is polled, not waited on.
+    async fn until_written(path: &Path, bytes: &[u8]) {
+        let wait = async {
+            while std::fs::read(path).ok().as_deref() != Some(bytes) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), wait).await.expect("the file never landed");
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn a_local_edit_is_not_overwritten_by_an_older_download() {
+    async fn a_restarted_peer_does_not_abort_the_download_it_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("start.md"), "old copy").unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"new copy");
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "new".to_owned())];
+        let fetch = |_: String, _: Progress| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<Vec<u8>, anyhow::Error>(b"new copy".to_vec())
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        downloads.claim_edits(&HashMap::new()).unwrap();
+        let reported = tokio::time::timeout(Duration::from_secs(60), finished.recv()).await;
+
+        assert!(matches!(reported, Ok(Some(ref done)) if done.result.is_ok()), "the download was aborted");
+        assert_eq!(std::fs::read(dir.path().join("start.md")).unwrap(), b"new copy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_download_the_document_moved_past_is_not_aborted_by_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start.md");
+        std::fs::write(&path, "X").unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let known = HashMap::from([("start.md".to_owned(), sha256_bytes(b"X"))]);
+        let entry = |sha: &str, ticket: &str| -> Vec<Entry> {
+            vec![("start.md".to_owned(), sha.to_owned(), ticket.to_owned())]
+        };
+        let y_fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"Y".to_vec()) };
+        let z_fetch = |_: String, _: Progress| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<Vec<u8>, anyhow::Error>(b"Z".to_vec())
+        };
+
+        downloads.reconcile(&entry(&sha256_bytes(b"Y"), "ty"), &known, y_fetch);
+        until_written(&path, b"Y").await;
+        downloads.reconcile(&entry(&sha256_bytes(b"Z"), "tz"), &known, z_fetch);
+        downloads.claim_edits(&known).unwrap();
+
+        let landed = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let done = finished.recv().await?;
+                if done.sha == sha256_bytes(b"Z") && done.result.is_ok() {
+                    return Some(());
+                }
+            }
+        })
+        .await;
+
+        assert!(matches!(landed, Ok(Some(()))), "the scan aborted the download of Z");
+        assert_eq!(std::fs::read(&path).unwrap(), b"Z");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_landed_copy_that_is_not_the_document_is_fetched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start.md");
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let x = sha256_bytes(b"X");
+        let known = HashMap::from([("start.md".to_owned(), x.clone())]);
+        let entry = |sha: &str, ticket: &str| -> Vec<Entry> {
+            vec![("start.md".to_owned(), sha.to_owned(), ticket.to_owned())]
+        };
+        let y_fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"Y".to_vec()) };
+        let x_fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"X".to_vec()) };
+
+        downloads.reconcile(&entry(&sha256_bytes(b"Y"), "ty"), &known, y_fetch);
+        until_written(&path, b"Y").await;
+        downloads.reconcile(&entry(&x, "tx"), &known, x_fetch);
+
+        let landed = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let done = finished.recv().await?;
+                if done.sha == x && done.result.is_ok() {
+                    return Some(());
+                }
+            }
+        })
+        .await;
+
+        assert!(matches!(landed, Ok(Some(()))), "the document names X, but the disk copy was never fetched again");
+        assert_eq!(std::fs::read(&path).unwrap(), b"X");
+    }
+
+    #[test]
+    fn an_untracked_file_is_not_published_over_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let downloads = Downloads::new(dir.path().to_path_buf(), done);
+        downloads.gate.set_wanted("start.md", &sha256_bytes(b"Y"), "ty");
+        let disk =
+            BTreeMap::from([("start.md".to_owned(), sha256_bytes(b"X")), ("new.md".to_owned(), sha256_bytes(b"Z"))]);
+
+        let publish = downloads.publishable(&disk, &HashMap::new());
+
+        assert_eq!(publish, vec![("new.md".to_owned(), sha256_bytes(b"Z"))]);
+    }
+
+    #[test]
+    fn a_dropped_path_removes_only_a_copy_from_the_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.md"), "Y").unwrap();
+        std::fs::write(dir.path().join("edit.md"), "W").unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        downloads.gate.record_landed("gone.md", &sha256_bytes(b"Y"));
+        let mut known = HashMap::from([("edit.md".to_owned(), sha256_bytes(b"X"))]);
+
+        let copies = downloads.drop_unnamed(&serde_json::Map::new(), &mut known);
+
+        let removed: Vec<&str> = copies.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(removed, vec!["gone.md"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracked_local_edit_is_not_overwritten_by_an_older_download() {
+        // The baseline is known, so the edit is kept. A file with no baseline is replaced instead; see `claim_edits`.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("start.md"), "local edit").unwrap();
         let (done, mut finished) = mpsc::unbounded_channel();
         let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let known = HashMap::from([("start.md".to_owned(), sha256_bytes(b"baseline"))]);
         let sha = sha256_bytes(b"from author");
         let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "slow".to_owned())];
         let fetch = |_: String, _: Progress| async {
@@ -2100,8 +2290,8 @@ mod tests {
             Ok::<Vec<u8>, anyhow::Error>(b"from author".to_vec())
         };
 
-        downloads.reconcile(&entries, &HashMap::new(), fetch);
-        downloads.claim_edits(&HashMap::new()).unwrap();
+        downloads.reconcile(&entries, &known, fetch);
+        downloads.claim_edits(&known).unwrap();
         tokio::time::sleep(Duration::from_secs(20)).await;
 
         assert_eq!(std::fs::read_to_string(dir.path().join("start.md")).unwrap(), "local edit");
