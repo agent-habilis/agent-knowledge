@@ -449,23 +449,49 @@ impl Downloads {
     /// Forgets each path that the document does not name. Returns the local copy of each such path that holds content
     /// this peer got from the mesh, so the caller removes it. A local edit that no peer has seen stays on disk.
     fn drop_unnamed(
+        &self,
+        files: &serde_json::Map<String, Value>,
+        known: &HashMap<String, String>,
+    ) -> Vec<(String, Option<PathBuf>)> {
+        let tracked: BTreeSet<String> = known.keys().cloned().chain(self.gate.landed_paths()).collect();
+        unnamed(tracked.into_iter().collect(), files)
+            .into_iter()
+            .map(|path| {
+                let synced = known.get(&path).cloned();
+                let landed = self.gate.landed_sha(&path);
+                let copy = resolve(&self.root, &path).filter(|local| {
+                    let on_disk = file_sha(local);
+                    on_disk.is_some() && (on_disk == synced || on_disk == landed)
+                });
+                (path, copy)
+            })
+            .collect()
+    }
+
+    /// Removes the local copy of each path that the document no longer names. A copy whose removal fails keeps its
+    /// record, so the next call retries it, and the file is not published back as a local edit.
+    fn remove_dropped(
         &mut self,
         files: &serde_json::Map<String, Value>,
         known: &mut HashMap<String, String>,
-    ) -> Vec<(String, PathBuf)> {
-        let tracked: BTreeSet<String> = known.keys().cloned().chain(self.gate.landed_paths()).collect();
-        let mut copies = Vec::new();
-        for path in unnamed(tracked.into_iter().collect(), files) {
-            let synced = known.remove(&path);
-            let landed = self.gate.landed_sha(&path);
-            self.gate.forget_landed(&path);
-            let Some(local) = resolve(&self.root, &path) else { continue };
-            let on_disk = file_sha(&local);
-            if on_disk.is_some() && (on_disk == synced || on_disk == landed) {
-                copies.push((path, local));
+        remove: impl Fn(&Path) -> io::Result<()>,
+    ) {
+        for (path, copy) in self.drop_unnamed(files, known) {
+            if let Some(local) = &copy {
+                if let Err(error) = remove(local) {
+                    tracing::debug!(path = %path, error = %error, "retrying a file removal on the next reconcile");
+                    continue;
+                }
+                eprintln!("↓ deleted {path}");
             }
+            self.drop_record(&path, known);
         }
-        copies
+    }
+
+    /// Forgets a path that the document no longer names, once its local copy is gone or kept.
+    fn drop_record(&self, path: &str, known: &mut HashMap<String, String>) {
+        known.remove(path);
+        self.gate.forget_landed(path);
     }
 
     /// Stop everything for a path that the document no longer names.
@@ -567,10 +593,7 @@ impl Folder {
         self.downloads
             .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
         self.downloads.prune(files);
-        for (path, local) in self.downloads.drop_unnamed(files, &mut self.known) {
-            let _ = std::fs::remove_file(&local);
-            eprintln!("↓ deleted {path}");
-        }
+        self.downloads.remove_dropped(files, &mut self.known, |local| std::fs::remove_file(local));
     }
 
     /// Take the end of one download. A sha that the document no longer names is dropped.
@@ -2296,14 +2319,50 @@ mod tests {
         std::fs::write(dir.path().join("gone.md"), "Y").unwrap();
         std::fs::write(dir.path().join("edit.md"), "W").unwrap();
         let (done, _finished) = mpsc::unbounded_channel();
-        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let downloads = Downloads::new(dir.path().to_path_buf(), done);
         downloads.gate.record_landed("gone.md", &sha256_bytes(b"Y"));
-        let mut known = HashMap::from([("edit.md".to_owned(), sha256_bytes(b"X"))]);
+        let known = HashMap::from([("edit.md".to_owned(), sha256_bytes(b"X"))]);
 
-        let copies = downloads.drop_unnamed(&serde_json::Map::new(), &mut known);
+        let copies = downloads.drop_unnamed(&serde_json::Map::new(), &known);
 
-        let removed: Vec<&str> = copies.iter().map(|(path, _)| path.as_str()).collect();
+        let removed: Vec<&str> =
+            copies.iter().filter(|(_, copy)| copy.is_some()).map(|(path, _)| path.as_str()).collect();
         assert_eq!(removed, vec!["gone.md"]);
+    }
+
+    #[test]
+    fn a_dropped_path_keeps_its_record_until_its_file_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.md"), "Y").unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let downloads = Downloads::new(dir.path().to_path_buf(), done);
+        downloads.gate.record_landed("gone.md", &sha256_bytes(b"Y"));
+        let known = HashMap::from([("gone.md".to_owned(), sha256_bytes(b"X"))]);
+
+        let first = downloads.drop_unnamed(&serde_json::Map::new(), &known);
+        let again = downloads.drop_unnamed(&serde_json::Map::new(), &known);
+
+        assert_eq!(first.len(), 1, "the first drop lists the file");
+        assert_eq!(again.len(), 1, "the record was cleared before the file was removed");
+    }
+
+    #[test]
+    fn a_failed_removal_is_retried_and_not_published_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gone.md"), "X").unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let mut known = HashMap::from([("gone.md".to_owned(), sha256_bytes(b"X"))]);
+
+        downloads.remove_dropped(&serde_json::Map::new(), &mut known, |_| Err(io::Error::other("read-only")));
+        let disk = downloads.claim_edits(&known).unwrap();
+
+        assert!(downloads.publishable(&disk, &known).is_empty(), "the file was published back to the document");
+        assert!(dir.path().join("gone.md").exists());
+
+        downloads.remove_dropped(&serde_json::Map::new(), &mut known, |local| std::fs::remove_file(local));
+        assert!(!dir.path().join("gone.md").exists(), "the retry did not remove the file");
+        assert!(known.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
