@@ -156,12 +156,55 @@ const FETCH_SLOTS: usize = 4;
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(180);
 
 /// How far one blob transfer has got, in bytes. The writer that collects the transfer records each write here.
-#[derive(Clone, Default)]
-struct Progress(Arc<std::sync::Mutex<u64>>);
+/// How long a transfer may stay quiet after its last byte before it is cut.
+const IDLE_LIMIT: Duration = Duration::from_secs(60);
+
+/// One blob transfer's progress: its bytes, when it started, and when its last byte came.
+#[derive(Clone)]
+struct Progress(Arc<std::sync::Mutex<Transfer>>);
+
+struct Transfer {
+    bytes: u64,
+    started: tokio::time::Instant,
+    last: tokio::time::Instant,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        let now = tokio::time::Instant::now();
+        Self(Arc::new(std::sync::Mutex::new(Transfer { bytes: 0, started: now, last: now })))
+    }
+}
 
 impl Progress {
     fn record(&self, bytes: usize) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) += bytes as u64;
+        let mut transfer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        transfer.bytes += bytes as u64;
+        transfer.last = tokio::time::Instant::now();
+    }
+
+    /// Before the first byte, the setup deadline applies. After it, the transfer is cut only when it has been quiet
+    /// for `IDLE_LIMIT`, so a slow transfer that keeps moving can finish.
+    fn deadline(&self) -> tokio::time::Instant {
+        let transfer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if transfer.bytes == 0 { transfer.started + ATTEMPT_DEADLINE } else { transfer.last + IDLE_LIMIT }
+    }
+}
+
+/// How often a transfer's deadline is checked. A byte moves the deadline, so the check must run again to see it.
+const DEADLINE_CHECK: Duration = Duration::from_secs(1);
+
+/// Runs `attempt` until it ends, or returns `None` once the transfer is past its deadline.
+async fn guarded<T>(attempt: impl Future<Output = T>, progress: &Progress) -> Option<T> {
+    tokio::pin!(attempt);
+    loop {
+        tokio::select! {
+            out = &mut attempt => return Some(out),
+            () = tokio::time::sleep(DEADLINE_CHECK) => {}
+        }
+        if tokio::time::Instant::now() >= progress.deadline() {
+            return None;
+        }
     }
 }
 
@@ -282,9 +325,7 @@ impl Downloads {
                 let (slots, fetch) = (slots.clone(), fetch_again.clone());
                 async move {
                     let _slot = slots.acquire_owned().await;
-                    tokio::time::timeout(ATTEMPT_DEADLINE, fetch(ticket, progress))
-                        .await
-                        .unwrap_or_else(|_| Err(anyhow!("fetch timed out")))
+                    fetch(ticket, progress).await
                 }
             };
             let done = self.done.clone();
@@ -519,7 +560,12 @@ where
     }
     let mut attempt = 0;
     let bytes = loop {
-        match fetch(ticket.to_owned(), Progress::default()).await {
+        let progress = Progress::default();
+        let outcome = match guarded(fetch(ticket.to_owned(), progress.clone()), &progress).await {
+            Some(outcome) => outcome,
+            None => Err(anyhow!("the transfer went quiet")),
+        };
+        match outcome {
             Ok(bytes) => break bytes,
             Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
             Err(error) => {
@@ -1878,6 +1924,54 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert!(endpoint.closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_that_keeps_moving_is_not_cut_at_the_attempt_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "slow".to_owned())];
+        let fetch = move |_: String, progress: Progress| async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                progress.record(1);
+            }
+            Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        let reported = tokio::time::timeout(Duration::from_secs(400), finished.recv()).await;
+
+        assert!(matches!(reported, Ok(Some(ref done)) if done.result.is_ok()), "no successful result");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_transfer_is_cut_after_its_idle_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "stuck".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String, progress: Progress| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    progress.record(1);
+                    std::future::pending::<Result<Vec<u8>>>().await
+                }
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(100)).await;
+
+        assert!(calls.load(Ordering::SeqCst) >= 2, "attempts: {}", calls.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
