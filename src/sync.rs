@@ -5,7 +5,7 @@
 //! path wins. File bytes do not fit in a gossip frame, so each entry holds a blob ticket that a
 //! peer redeems against the author's blob server.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -392,6 +392,21 @@ impl Downloads {
         self.local_retry.get(path).is_some_and(|retry| retry.sha == sha && tokio::time::Instant::now() < retry.at)
     }
 
+    /// Scans the folder. A path whose disk sha the document does not know is a local edit, and its download is
+    /// forgotten, so an older download cannot overwrite the edit. The write turn is held across the scan, so no download
+    /// write runs in between.
+    fn claim_edits(&mut self, known: &HashMap<String, String>) -> io::Result<BTreeMap<String, String>> {
+        let turn = self.gate.turn.clone();
+        let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
+        let disk = scan::scan(&self.root)?;
+        for (path, sha) in &disk {
+            if known.get(path) != Some(sha) {
+                self.forget(path);
+            }
+        }
+        Ok(disk)
+    }
+
     /// Stop everything for a path that the document no longer names.
     fn forget(&mut self, path: &str) {
         self.gate.unwant(path);
@@ -423,7 +438,7 @@ impl Downloads {
 
 impl Folder {
     async fn publish_local(&mut self) {
-        let disk = match scan::scan(&self.root) {
+        let disk = match self.downloads.claim_edits(&self.known) {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
         };
@@ -1972,6 +1987,27 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(100)).await;
 
         assert!(calls.load(Ordering::SeqCst) >= 2, "attempts: {}", calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_local_edit_is_not_overwritten_by_an_older_download() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("start.md"), "local edit").unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from author");
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "slow".to_owned())];
+        let fetch = |_: String, _: Progress| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<Vec<u8>, anyhow::Error>(b"from author".to_vec())
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        downloads.claim_edits(&HashMap::new()).unwrap();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        assert_eq!(std::fs::read_to_string(dir.path().join("start.md")).unwrap(), "local edit");
+        assert!(tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.is_err());
     }
 
     #[tokio::test]
