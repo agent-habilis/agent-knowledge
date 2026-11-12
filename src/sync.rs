@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -499,22 +499,29 @@ fn blob_lookups() -> LookupOpts {
     LookupOpts::public_preset()
 }
 
-/// What the consumer needs from an endpoint: whether it has closed.
+/// What the consumer needs from an endpoint: whether it has closed, and how to close it.
 trait Closable {
     fn closed(&self) -> bool;
+    fn close_now(&self) -> impl Future<Output = ()> + Send;
 }
 
 impl Closable for Endpoint {
     fn closed(&self) -> bool {
         self.is_closed()
     }
+
+    async fn close_now(&self) {
+        self.close().await;
+    }
 }
 
 /// How long a failed endpoint build is remembered. The waiting downloads get the same error until then.
 const BUILD_RETRY_WAIT: Duration = Duration::from_secs(5);
 
-/// The endpoint that the blob fetches of one folder use. It is built on first use, and again only after it closes
-/// or stalls.
+/// How often a retired endpoint checks whether its last lease has ended.
+const RETIRE_POLL: Duration = Duration::from_secs(1);
+
+/// The endpoint that the blob fetches of one folder use. It is built on first use, and again after it closes or stalls.
 struct Consumer<E> {
     state: tokio::sync::Mutex<ConsumerState<E>>,
     /// Set on shutdown. A download that starts after it must not build an endpoint.
@@ -525,18 +532,32 @@ struct ConsumerState<E> {
     endpoint: Option<E>,
     /// Counts the builds. A stall reports the generation it used, so only the first stall of an endpoint replaces it.
     generation: u64,
+    /// The leases that hold the endpoint of `generation`.
+    leases: Arc<AtomicUsize>,
     last_failure: Option<(tokio::time::Instant, String)>,
 }
 
-/// The endpoint a download uses, with the generation it was built in.
+/// The endpoint a download uses. It counts as held until it is dropped.
 struct Lease<E> {
     endpoint: E,
     generation: u64,
+    leases: Arc<AtomicUsize>,
 }
 
-impl<E: Clone + Closable> Consumer<E> {
+impl<E> Drop for Lease<E> {
+    fn drop(&mut self) {
+        self.leases.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl<E: Clone + Closable + Send + 'static> Consumer<E> {
     fn new() -> Self {
-        let state = ConsumerState { endpoint: None, generation: 0, last_failure: None };
+        let state = ConsumerState {
+            endpoint: None,
+            generation: 0,
+            leases: Arc::new(AtomicUsize::new(0)),
+            last_failure: None,
+        };
         Self { state: tokio::sync::Mutex::new(state), closed: AtomicBool::new(false) }
     }
 
@@ -550,7 +571,7 @@ impl<E: Clone + Closable> Consumer<E> {
             bail!("the folder is shutting down");
         }
         if let Some(endpoint) = state.endpoint.as_ref().filter(|endpoint| !endpoint.closed()) {
-            return Ok(Lease { endpoint: endpoint.clone(), generation: state.generation });
+            return Ok(lease_of(&state, endpoint.clone()));
         }
         if let Some((failed_at, message)) = &state.last_failure && failed_at.elapsed() < BUILD_RETRY_WAIT {
             bail!("{message}");
@@ -558,9 +579,10 @@ impl<E: Clone + Closable> Consumer<E> {
         match build().await {
             Ok(endpoint) => {
                 state.generation += 1;
+                state.leases = Arc::new(AtomicUsize::new(0));
                 state.endpoint = Some(endpoint.clone());
                 state.last_failure = None;
-                Ok(Lease { endpoint, generation: state.generation })
+                Ok(lease_of(&state, endpoint))
             }
             Err(error) => {
                 state.last_failure = Some((tokio::time::Instant::now(), format!("{error:#}")));
@@ -569,20 +591,37 @@ impl<E: Clone + Closable> Consumer<E> {
         }
     }
 
-    /// The endpoint of `generation` stalled. It is cleared, so the next get() builds a new one, and the caller closes it.
-    /// A stall from an older generation returns None: a newer endpoint is already in place.
-    async fn stalled(&self, generation: u64) -> Option<E> {
+    /// The endpoint of `generation` stalled. The next get() builds a new one. The old endpoint closes when its last
+    /// lease ends, or at ATTEMPT_DEADLINE if one never ends, so a transfer in flight on it is not cut. A stall from an
+    /// older generation does nothing: a newer endpoint is already in place.
+    async fn stalled(&self, generation: u64) {
         let mut state = self.state.lock().await;
         if state.generation != generation {
-            return None;
+            return;
         }
-        state.endpoint.take()
+        if let Some(endpoint) = state.endpoint.take() {
+            tokio::spawn(close_when_idle(endpoint, state.leases.clone()));
+        }
     }
 
     async fn take(&self) -> Option<E> {
         self.closed.store(true, Ordering::SeqCst);
         self.state.lock().await.endpoint.take()
     }
+}
+
+fn lease_of<E: Clone>(state: &ConsumerState<E>, endpoint: E) -> Lease<E> {
+    state.leases.fetch_add(1, Ordering::SeqCst);
+    Lease { endpoint, generation: state.generation, leases: state.leases.clone() }
+}
+
+/// Close `endpoint` once no lease holds it, or at the cap, so a lease that never ends cannot keep it open for ever.
+async fn close_when_idle<E: Closable>(endpoint: E, leases: Arc<AtomicUsize>) {
+    let cap = tokio::time::Instant::now() + ATTEMPT_DEADLINE;
+    while leases.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < cap {
+        tokio::time::sleep(RETIRE_POLL).await;
+    }
+    endpoint.close_now().await;
 }
 
 async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result<Vec<u8>> {
@@ -595,9 +634,7 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result
         Ok(()) => Ok(bytes),
         // Checked before the error becomes a string. The endpoint stays open, so this download closes it.
         Err(BlobError::HandshakeStalled) => {
-            if let Some(endpoint) = consumer.stalled(lease.generation).await {
-                endpoint.close().await;
-            }
+            consumer.stalled(lease.generation).await;
             tracing::debug!(generation = lease.generation, "blob handshake stalled; the next attempt builds an endpoint");
             Err(anyhow!("blob handshake stalled"))
         }
@@ -1428,6 +1465,10 @@ mod tests {
     struct FakeEndpoint(Arc<std::sync::atomic::AtomicBool>);
 
     impl Closable for FakeEndpoint {
+        async fn close_now(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
         fn closed(&self) -> bool {
             self.0.load(Ordering::SeqCst)
         }
@@ -1541,8 +1582,8 @@ mod tests {
         };
         let first = consumer.get(build).await.unwrap();
 
-        assert!(consumer.stalled(first.generation).await.is_some());
-        assert!(consumer.stalled(first.generation).await.is_none());
+        consumer.stalled(first.generation).await;
+        consumer.stalled(first.generation).await;
         consumer.get(build).await.unwrap();
 
         assert_eq!(builds.load(Ordering::SeqCst), 2);
@@ -1560,11 +1601,51 @@ mod tests {
         consumer.stalled(first.generation).await;
         let second = consumer.get(build).await.unwrap();
 
-        assert!(consumer.stalled(first.generation).await.is_none());
+        consumer.stalled(first.generation).await;
         consumer.get(build).await.unwrap();
 
         assert_eq!(builds.load(Ordering::SeqCst), 2);
         assert_ne!(first.generation, second.generation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_does_not_cut_a_transfer_in_flight() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let build = || async { Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default()) };
+        let in_flight = consumer.get(build).await.unwrap();
+
+        consumer.stalled(in_flight.generation).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        assert!(!in_flight.endpoint.closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_old_endpoint_closes_after_its_last_lease() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let build = || async { Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default()) };
+        let lease = consumer.get(build).await.unwrap();
+        let endpoint = lease.endpoint.clone();
+        consumer.stalled(lease.generation).await;
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert!(endpoint.closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_old_endpoint_closes_at_the_cap_even_if_a_lease_never_ends() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let build = || async { Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default()) };
+        let lease = consumer.get(build).await.unwrap();
+        let endpoint = lease.endpoint.clone();
+        consumer.stalled(lease.generation).await;
+
+        tokio::time::sleep(ATTEMPT_DEADLINE + Duration::from_secs(5)).await;
+
+        assert!(endpoint.closed());
+        drop(lease);
     }
 
     #[tokio::test]
