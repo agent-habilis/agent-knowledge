@@ -152,10 +152,10 @@ enum Failure {
 
 /// At most this many blob fetches run at once.
 const FETCH_SLOTS: usize = 4;
-/// A fetch that runs this long is cut off, and the retry loop starts a new attempt. The dial is capped at 90 s.
+/// A transfer that gets no byte this long after it starts is cut off, and the retry loop starts a new attempt. The
+/// dial is capped at 90 s.
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(180);
 
-/// How far one blob transfer has got, in bytes. The writer that collects the transfer records each write here.
 /// How long a transfer may stay quiet after its last byte before it is cut.
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
 
@@ -165,18 +165,25 @@ struct Progress(Arc<std::sync::Mutex<Transfer>>);
 
 struct Transfer {
     bytes: u64,
-    started: tokio::time::Instant,
+    started: Option<tokio::time::Instant>,
     last: tokio::time::Instant,
 }
 
 impl Default for Progress {
     fn default() -> Self {
-        let now = tokio::time::Instant::now();
-        Self(Arc::new(std::sync::Mutex::new(Transfer { bytes: 0, started: now, last: now })))
+        Self(Arc::new(std::sync::Mutex::new(Transfer { bytes: 0, started: None, last: tokio::time::Instant::now() })))
     }
 }
 
 impl Progress {
+    /// Starts the clock. Until then the transfer is not cut, so a wait for a fetch slot does not count as a stall.
+    fn start(&self) {
+        let now = tokio::time::Instant::now();
+        let mut transfer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        transfer.started = Some(now);
+        transfer.last = now;
+    }
+
     fn record(&self, bytes: usize) {
         let mut transfer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         transfer.bytes += bytes as u64;
@@ -184,10 +191,11 @@ impl Progress {
     }
 
     /// Before the first byte, the setup deadline applies. After it, the transfer is cut only when it has been quiet
-    /// for `IDLE_LIMIT`, so a slow transfer that keeps moving can finish.
-    fn deadline(&self) -> tokio::time::Instant {
+    /// for `IDLE_LIMIT`, so a slow transfer that keeps moving can finish. `None` until `start`.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
         let transfer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if transfer.bytes == 0 { transfer.started + ATTEMPT_DEADLINE } else { transfer.last + IDLE_LIMIT }
+        let started = transfer.started?;
+        Some(if transfer.bytes == 0 { started + ATTEMPT_DEADLINE } else { transfer.last + IDLE_LIMIT })
     }
 }
 
@@ -202,7 +210,7 @@ async fn guarded<T>(attempt: impl Future<Output = T>, progress: &Progress) -> Op
             out = &mut attempt => return Some(out),
             () = tokio::time::sleep(DEADLINE_CHECK) => {}
         }
-        if tokio::time::Instant::now() >= progress.deadline() {
+        if progress.deadline().is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return None;
         }
     }
@@ -325,6 +333,7 @@ impl Downloads {
                 let (slots, fetch) = (slots.clone(), fetch_again.clone());
                 async move {
                     let _slot = slots.acquire_owned().await;
+                    progress.start();
                     fetch(ticket, progress).await
                 }
             };
@@ -787,8 +796,8 @@ impl<E: Clone + Closable + Send + 'static> Consumer<E> {
     }
 
     /// The endpoint of `generation` stalled. The next get() builds a new one. The old endpoint closes when its last
-    /// lease ends, or at ATTEMPT_DEADLINE if one never ends, so a transfer in flight on it is not cut. A stall from an
-    /// older generation does nothing: a newer endpoint is already in place.
+    /// lease ends, so a transfer in flight on it is not cut. A stall from an older generation does nothing: a newer
+    /// endpoint is already in place.
     async fn stalled(&self, generation: u64) {
         let mut state = self.state.lock().await;
         if state.generation != generation {
@@ -819,10 +828,9 @@ fn lease_of<E: Clone>(state: &ConsumerState<E>, endpoint: E) -> Lease<E> {
     Lease { endpoint, generation: state.generation, leases: state.leases.clone() }
 }
 
-/// Close `endpoint` once no lease holds it, or at the cap, so a lease that never ends cannot keep it open for ever.
+/// Close `endpoint` once no lease holds it. A lease always ends, because `guarded` cuts a transfer that goes quiet.
 async fn close_when_idle<E: Closable>(endpoint: E, leases: Arc<AtomicUsize>) {
-    let cap = tokio::time::Instant::now() + ATTEMPT_DEADLINE;
-    while leases.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < cap {
+    while leases.load(Ordering::SeqCst) > 0 {
         tokio::time::sleep(RETIRE_POLL).await;
     }
     endpoint.close_now().await;
@@ -1886,7 +1894,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_old_endpoint_closes_at_the_cap_even_if_a_lease_never_ends() {
+    async fn the_old_endpoint_stays_open_while_a_lease_moves() {
         let consumer = Consumer::<FakeEndpoint>::new();
         let build = || async { Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default()) };
         let lease = consumer.get(build).await.unwrap();
@@ -1894,9 +1902,11 @@ mod tests {
         consumer.stalled(lease.generation).await;
 
         tokio::time::sleep(ATTEMPT_DEADLINE + Duration::from_secs(5)).await;
+        assert!(!endpoint.closed(), "closed under a live lease");
 
-        assert!(endpoint.closed());
         drop(lease);
+        tokio::time::sleep(RETIRE_POLL * 2).await;
+        assert!(endpoint.closed());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1961,6 +1971,62 @@ mod tests {
         let reported = tokio::time::timeout(Duration::from_secs(400), finished.recv()).await;
 
         assert!(matches!(reported, Ok(Some(ref done)) if done.result.is_ok()), "no successful result");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_that_has_not_started_is_not_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String, _: Progress| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+            }
+        };
+        let gate = gate_wanting("start.md", &sha);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(400),
+            download_file(&dir.path().join("start.md"), "start.md", &sha, "ticket", &gate, fetch),
+        )
+        .await;
+
+        assert!(result.is_ok_and(|result| result.is_ok()), "the fetch was cut before it started");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_setup_with_no_byte_is_not_cut_before_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "slow".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String, _: Progress| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(100)).await;
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        let reported = tokio::time::timeout(Duration::from_secs(200), finished.recv()).await;
+
+        assert!(matches!(reported, Ok(Some(ref done)) if done.result.is_ok()), "no successful result");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
