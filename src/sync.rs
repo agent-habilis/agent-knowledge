@@ -97,6 +97,8 @@ pub async fn run(
         consumer: Arc::new(Consumer::new()),
     };
 
+    // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
+    // newer remote version. It is pre-existing, and it is not fixed here.
     folder.reconcile().await;
     folder.publish_local().await;
 
@@ -424,15 +426,21 @@ impl Downloads {
     }
 
     /// The disk files that `publish_local` publishes. A download's own write waits for its result. An untracked file
-    /// waits while the document names other content for its path, so it does not replace that content.
+    /// waits while the document names a copy for its path. Its download publishes the file when it lands, so the file
+    /// is not published twice, and it does not replace the document's copy.
+    /// Open item: a local file at a path that the document names with other content is replaced by the download, with
+    /// no conflict copy. That is part of the last-write-wins design, not this change.
     fn publishable(&self, disk: &BTreeMap<String, String>, known: &HashMap<String, String>) -> Vec<(String, String)> {
         disk.iter()
             .filter(|&(path, sha)| {
                 if known.get(path) == Some(sha) || self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
                     return false;
                 }
-                let untracked = !known.contains_key(path);
-                !(untracked && self.gate.wanted_sha(path).is_some_and(|wanted| &wanted != sha))
+                let held = !known.contains_key(path) && self.gate.wanted_sha(path).is_some();
+                if held {
+                    tracing::debug!(path = %path, "holding a local file: the document names a copy for its path");
+                }
+                !held
             })
             .map(|(path, sha)| (path.clone(), sha.clone()))
             .collect()
@@ -2251,12 +2259,35 @@ mod tests {
         let (done, _finished) = mpsc::unbounded_channel();
         let downloads = Downloads::new(dir.path().to_path_buf(), done);
         downloads.gate.set_wanted("start.md", &sha256_bytes(b"Y"), "ty");
-        let disk =
-            BTreeMap::from([("start.md".to_owned(), sha256_bytes(b"X")), ("new.md".to_owned(), sha256_bytes(b"Z"))]);
+        downloads.gate.set_wanted("same.md", &sha256_bytes(b"W"), "tw");
+        let disk = BTreeMap::from([
+            ("start.md".to_owned(), sha256_bytes(b"X")),
+            ("same.md".to_owned(), sha256_bytes(b"W")),
+            ("new.md".to_owned(), sha256_bytes(b"Z")),
+        ]);
 
         let publish = downloads.publishable(&disk, &HashMap::new());
 
         assert_eq!(publish, vec![("new.md".to_owned(), sha256_bytes(b"Z"))]);
+    }
+
+    #[test]
+    fn a_user_edit_back_to_a_landed_sha_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start.md");
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let known = HashMap::from([("start.md".to_owned(), sha256_bytes(b"X"))]);
+        std::fs::write(&path, "Y").unwrap();
+        downloads.gate.record_landed("start.md", &sha256_bytes(b"Y"));
+        downloads.claim_edits(&known).unwrap();
+        std::fs::write(&path, "W").unwrap();
+        downloads.claim_edits(&known).unwrap();
+        std::fs::write(&path, "Y").unwrap();
+
+        let disk = downloads.claim_edits(&known).unwrap();
+
+        assert_eq!(downloads.publishable(&disk, &known), vec![("start.md".to_owned(), sha256_bytes(b"Y"))]);
     }
 
     #[test]
