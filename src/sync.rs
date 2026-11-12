@@ -85,9 +85,7 @@ pub async fn run(
         }
     }
     folder.downloads.abort_all();
-    if let Some(endpoint) = folder.consumer.take().await {
-        endpoint.close().await;
-    }
+    folder.consumer.shutdown().await;
     folder.blobs.shutdown().await;
     membership::depart(folder.member.node).await.map_err(|error| anyhow!("{error}"))
 }
@@ -535,6 +533,8 @@ struct ConsumerState<E> {
     /// The leases that hold the endpoint of `generation`.
     leases: Arc<AtomicUsize>,
     last_failure: Option<(tokio::time::Instant, String)>,
+    /// Endpoints that stalled and are waiting for their leases to end. Shutdown closes them too.
+    retired: Vec<E>,
 }
 
 /// The endpoint a download uses. It counts as held until it is dropped.
@@ -556,6 +556,7 @@ impl<E: Clone + Closable + Send + 'static> Consumer<E> {
             endpoint: None,
             generation: 0,
             leases: Arc::new(AtomicUsize::new(0)),
+            retired: Vec::new(),
             last_failure: None,
         };
         Self { state: tokio::sync::Mutex::new(state), closed: AtomicBool::new(false) }
@@ -600,13 +601,22 @@ impl<E: Clone + Closable + Send + 'static> Consumer<E> {
             return;
         }
         if let Some(endpoint) = state.endpoint.take() {
+            state.retired.retain(|retired| !retired.closed());
+            state.retired.push(endpoint.clone());
             tokio::spawn(close_when_idle(endpoint, state.leases.clone()));
         }
     }
 
-    async fn take(&self) -> Option<E> {
+    /// Shutdown: no new endpoint is built, and every endpoint, current or retired, is closed before this returns.
+    async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.state.lock().await.endpoint.take()
+        let mut state = self.state.lock().await;
+        let mut endpoints: Vec<E> = state.retired.drain(..).collect();
+        endpoints.extend(state.endpoint.take());
+        drop(state);
+        for endpoint in endpoints {
+            endpoint.close_now().await;
+        }
     }
 }
 
@@ -1533,7 +1543,7 @@ mod tests {
         };
         consumer.get(build).await.unwrap();
 
-        consumer.take().await;
+        consumer.shutdown().await;
         let late = consumer.get(build).await;
 
         assert!(late.is_err());
@@ -1661,6 +1671,20 @@ mod tests {
         tokio::time::sleep(ATTEMPT_DEADLINE + Duration::from_secs(5)).await;
 
         assert!(endpoint.closed());
+        drop(lease);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_closes_a_retired_endpoint_at_once() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let build = || async { Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default()) };
+        let lease = consumer.get(build).await.unwrap();
+        let retired = lease.endpoint.clone();
+        consumer.stalled(lease.generation).await;
+
+        consumer.shutdown().await;
+
+        assert!(retired.closed());
         drop(lease);
     }
 
