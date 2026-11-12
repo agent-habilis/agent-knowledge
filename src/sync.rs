@@ -632,7 +632,7 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result
     let mut bytes = Vec::new();
     match fetch_with_endpoint(&lease.endpoint, &ticket, &mut bytes, None).await {
         Ok(()) => Ok(bytes),
-        // Checked before the error becomes a string. The endpoint stays open, so this download closes it.
+        // Checked before the error becomes a string, so the stall reaches the consumer, which retires its endpoint.
         Err(BlobError::HandshakeStalled) => {
             consumer.stalled(lease.generation).await;
             tracing::debug!(generation = lease.generation, "blob handshake stalled; the next attempt builds an endpoint");
@@ -1632,6 +1632,22 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         assert!(endpoint.closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retired_endpoint_waits_for_its_own_leases_only() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let build = || async { Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default()) };
+        let old = consumer.get(build).await.unwrap();
+        let old_endpoint = old.endpoint.clone();
+        consumer.stalled(old.generation).await;
+        let new = consumer.get(build).await.unwrap();
+
+        drop(old);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert!(old_endpoint.closed());
+        assert!(!new.endpoint.closed());
     }
 
     #[tokio::test(start_paused = true)]
