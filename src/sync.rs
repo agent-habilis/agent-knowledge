@@ -2030,6 +2030,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_queued_download_is_not_retried_for_its_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (captured, _guard) = capture("agent_knowledge=debug");
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let hog_sha = sha256_bytes(b"hog");
+        let late_sha = sha256_bytes(b"late");
+        let hogs: Vec<Entry> =
+            (0..FETCH_SLOTS).map(|i| (format!("hog{i}.md"), hog_sha.clone(), format!("hog{i}"))).collect();
+        let fetch = |ticket: String, progress: Progress| async move {
+            if ticket.starts_with("hog") {
+                for _ in 0..25 {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    progress.record(1);
+                }
+                return Ok::<Vec<u8>, anyhow::Error>(b"hog".to_vec());
+            }
+            Ok(b"late".to_vec())
+        };
+
+        downloads.reconcile(&hogs, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut all = hogs.clone();
+        all.push(("late.md".to_owned(), late_sha, "late".to_owned()));
+        downloads.reconcile(&all, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("late.md")).unwrap(), b"late");
+        assert!(!captured.text().contains("retrying a blob fetch"), "{}", captured.text());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_transfer_is_cut_after_its_idle_limit() {
         let dir = tempfile::tempdir().unwrap();
         let (done, _finished) = mpsc::unbounded_channel();
