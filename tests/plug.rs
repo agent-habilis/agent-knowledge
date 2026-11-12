@@ -28,7 +28,8 @@ fn skills_dir_defaults_under_home() {
 
 #[test]
 fn skills_dir_honors_agent_config_env() {
-    let env = env_from(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/c"), ("CODEX_HOME", "/x"), ("PI_CODING_AGENT_DIR", "/p")]);
+    let env =
+        env_from(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/c"), ("CODEX_HOME", "/x"), ("PI_CODING_AGENT_DIR", "/p")]);
 
     assert_eq!(plug::skills_dir(Agent::ClaudeCode, &env).unwrap(), PathBuf::from("/c/skills"));
     assert_eq!(plug::skills_dir(Agent::Codex, &env).unwrap(), PathBuf::from("/x/skills"));
