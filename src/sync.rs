@@ -513,6 +513,64 @@ impl Closable for Endpoint {
     }
 }
 
+/// A build error that a hedged fetch can report. It carries only the message.
+#[derive(Debug)]
+struct BuildFailed(String);
+
+impl std::fmt::Display for BuildFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BuildFailed {}
+
+/// Holds a build's endpoint until the caller reads it. If the caller is gone first, the endpoint is closed here.
+struct Undelivered<E: Closable + Send + 'static>(Option<tokio::sync::oneshot::Receiver<Result<E, BuildFailed>>>);
+
+impl<E: Closable + Send + 'static> Undelivered<E> {
+    async fn wait(&mut self) -> Result<E, BuildFailed> {
+        let Some(receiver) = self.0.as_mut() else {
+            return Err(BuildFailed("the build was already read".to_owned()));
+        };
+        let received = receiver.await.unwrap_or_else(|_| Err(BuildFailed("the build task ended".to_owned())));
+        self.0 = None;
+        received
+    }
+}
+
+impl<E: Closable + Send + 'static> Drop for Undelivered<E> {
+    fn drop(&mut self) {
+        let Some(mut receiver) = self.0.take() else {
+            return;
+        };
+        // Stops a late send from landing unread: the sender then closes the endpoint itself.
+        receiver.close();
+        if let Ok(Ok(endpoint)) = receiver.try_recv() {
+            tokio::spawn(async move { endpoint.close_now().await });
+        }
+    }
+}
+
+/// Runs `build` in its own task. A caller that drops the returned future does not leave the built endpoint open:
+/// the task closes it. iroh logs an error for an endpoint dropped without a close, and a hedged fetch drops its losing build.
+async fn detach_build<E, Fut, Err>(build: Fut) -> Result<E, BuildFailed>
+where
+    E: Closable + Send + 'static,
+    Fut: Future<Output = Result<E, Err>> + Send + 'static,
+    Err: std::fmt::Display,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let built = build.await.map_err(|error| BuildFailed(error.to_string()));
+        // The receiver is gone when the caller was cancelled, so nobody will use this endpoint.
+        if let Err(Ok(endpoint)) = sender.send(built) {
+            endpoint.close_now().await;
+        }
+    });
+    Undelivered(Some(receiver)).wait().await
+}
+
 /// How long a failed endpoint build is remembered. The waiting downloads get the same error until then.
 const BUILD_RETRY_WAIT: Duration = Duration::from_secs(5);
 
@@ -1686,6 +1744,34 @@ mod tests {
 
         assert!(retired.closed());
         drop(lease);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_build_dropped_while_running_closes_its_endpoint() {
+        let endpoint = FakeEndpoint::default();
+        let built = endpoint.clone();
+        let build = async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<FakeEndpoint, anyhow::Error>(built)
+        };
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), detach_build(build)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert!(cancelled.is_err());
+        assert!(endpoint.closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_endpoint_sent_but_never_read_is_closed() {
+        let endpoint = FakeEndpoint::default();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let _ = sender.send(Ok::<FakeEndpoint, BuildFailed>(endpoint.clone()));
+
+        drop(Undelivered(Some(receiver)));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(endpoint.closed());
     }
 
     #[tokio::test]
