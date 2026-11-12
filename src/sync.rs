@@ -17,7 +17,7 @@ use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messag
 use habilis_network::net::direct::PayloadPath;
 use habilis_network::iroh::Endpoint;
 use habilis_network::net::build_peer_endpoint;
-use habilis_network::ops::blob::{BlobError, BlobServer, BlobTicket, ContentId, fetch_with_endpoint};
+use habilis_network::ops::blob::{BlobError, BlobServer, BlobTicket, ContentId, fetch_hedged};
 use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
@@ -698,7 +698,12 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result
         .get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(|error| anyhow!("{error}")) })
         .await?;
     let mut bytes = Vec::new();
-    match fetch_with_endpoint(&lease.endpoint, &ticket, &mut bytes, None).await {
+    let lookups = blob_lookups();
+    let build = || {
+        let lookups = lookups.clone();
+        detach_build(async move { build_peer_endpoint(&lookups).await })
+    };
+    match fetch_hedged(&lease.endpoint, build, &ticket, &mut bytes, None).await {
         Ok(()) => Ok(bytes),
         // Checked before the error becomes a string, so the stall reaches the consumer, which retires its endpoint.
         Err(BlobError::HandshakeStalled) => {
