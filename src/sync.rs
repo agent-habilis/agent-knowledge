@@ -7,9 +7,12 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +23,7 @@ use habilis_network::net::direct::PayloadPath;
 use habilis_network::ops::blob::{BlobError, BlobServer, BlobTicket, ContentId, fetch_hedged};
 use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
+use tokio::io::AsyncWrite;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::AbortHandle;
 
@@ -151,6 +155,39 @@ const FETCH_SLOTS: usize = 4;
 /// A fetch that runs this long is cut off, and the retry loop starts a new attempt. The dial is capped at 90 s.
 const ATTEMPT_DEADLINE: Duration = Duration::from_secs(180);
 
+/// How far one blob transfer has got, in bytes. The writer that collects the transfer records each write here.
+#[derive(Clone, Default)]
+struct Progress(Arc<std::sync::Mutex<u64>>);
+
+impl Progress {
+    fn record(&self, bytes: usize) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) += bytes as u64;
+    }
+}
+
+/// Collects a blob transfer, and records each write in its progress.
+struct Collected {
+    bytes: Vec<u8>,
+    progress: Progress,
+}
+
+impl AsyncWrite for Collected {
+    fn poll_write(self: Pin<&mut Self>, _: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        this.bytes.extend_from_slice(buf);
+        this.progress.record(buf.len());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Cancels the task it holds when dropped, so an aborted outer task takes its inner task with it.
 struct CancelOnDrop(AbortHandle);
 
@@ -211,7 +248,7 @@ impl Downloads {
     /// Each one reports back on the `done` channel. A download for a sha that the document no longer names is cancelled.
     fn reconcile<F, Fut>(&mut self, entries: &[Entry], known: &HashMap<String, String>, fetch: F)
     where
-        F: Fn(String) -> Fut + Clone + Send + 'static,
+        F: Fn(String, Progress) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send,
     {
         for (path, sha, ticket) in entries {
@@ -241,11 +278,11 @@ impl Downloads {
             };
             // A fetch takes a slot only while it runs, so a download that waits to retry holds none.
             let (slots, fetch_again) = (self.slots.clone(), fetch.clone());
-            let attempt = move |ticket: String| {
+            let attempt = move |ticket: String, progress: Progress| {
                 let (slots, fetch) = (slots.clone(), fetch_again.clone());
                 async move {
                     let _slot = slots.acquire_owned().await;
-                    tokio::time::timeout(ATTEMPT_DEADLINE, fetch(ticket))
+                    tokio::time::timeout(ATTEMPT_DEADLINE, fetch(ticket, progress))
                         .await
                         .unwrap_or_else(|_| Err(anyhow!("fetch timed out")))
                 }
@@ -413,7 +450,8 @@ impl Folder {
             })
             .collect();
         let consumer = self.consumer.clone();
-        self.downloads.reconcile(&entries, &self.known, move |ticket| fetch_blob(consumer.clone(), ticket));
+        self.downloads
+            .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
         self.downloads.prune(files);
         let gone = unnamed(self.known.keys().cloned().collect(), files);
         for path in gone {
@@ -471,7 +509,7 @@ async fn download_file<Fut>(
     sha: &str,
     ticket: &str,
     gate: &Gate,
-    mut fetch: impl FnMut(String) -> Fut,
+    mut fetch: impl FnMut(String, Progress) -> Fut,
 ) -> Result<(), Failure>
 where
     Fut: Future<Output = Result<Vec<u8>>>,
@@ -481,7 +519,7 @@ where
     }
     let mut attempt = 0;
     let bytes = loop {
-        match fetch(ticket.to_owned()).await {
+        match fetch(ticket.to_owned(), Progress::default()).await {
             Ok(bytes) => break bytes,
             Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
             Err(error) => {
@@ -729,19 +767,19 @@ async fn close_when_idle<E: Closable>(endpoint: E, leases: Arc<AtomicUsize>) {
     endpoint.close_now().await;
 }
 
-async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result<Vec<u8>> {
+async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress: Progress) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
     let lease = consumer
         .get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(|error| anyhow!("{error}")) })
         .await?;
-    let mut bytes = Vec::new();
+    let mut bytes = Collected { bytes: Vec::new(), progress };
     let lookups = blob_lookups();
     let build = || {
         let lookups = lookups.clone();
         detach_build(async move { build_peer_endpoint(&lookups).await })
     };
     match fetch_hedged(&lease.endpoint, build, &ticket, &mut bytes, None).await {
-        Ok(()) => Ok(bytes),
+        Ok(()) => Ok(bytes.bytes),
         // Checked before the error becomes a string, so the stall reaches the consumer, which retires its endpoint.
         Err(BlobError::HandshakeStalled) => {
             consumer.stalled(lease.generation).await;
@@ -880,7 +918,7 @@ mod tests {
         let bytes = b"from author";
         let sha = sha256_bytes(bytes);
 
-        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async {
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_, _| async {
             tokio::time::sleep(Duration::from_secs(40)).await;
             Ok(bytes.to_vec())
         })
@@ -901,7 +939,7 @@ mod tests {
             ("stuck.md".to_owned(), sha.clone(), "stuck".to_owned()),
             ("start.md".to_owned(), sha.clone(), "start".to_owned()),
         ];
-        let fetch = move |ticket: String| async move {
+        let fetch = move |ticket: String, _: Progress| async move {
             if ticket == "stuck" {
                 std::future::pending::<()>().await;
             }
@@ -924,7 +962,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -952,7 +990,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -978,7 +1016,7 @@ mod tests {
         let old_calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let old_calls = old_calls.clone();
-            move |ticket: String| {
+            move |ticket: String, _: Progress| {
                 let old_calls = old_calls.clone();
                 async move {
                     if ticket == "old" {
@@ -1013,7 +1051,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1037,7 +1075,7 @@ mod tests {
         std::fs::write(dir.path().join("start.md"), bytes).unwrap();
         let sha = sha256_bytes(bytes);
         let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
-        let fetch = |_: String| async { Ok::<Vec<u8>, anyhow::Error>(Vec::new()) };
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(Vec::new()) };
 
         downloads.reconcile(&entries, &HashMap::new(), fetch);
         let first = finished.recv().await.unwrap();
@@ -1060,7 +1098,7 @@ mod tests {
             ("stuck.md".to_owned(), sha.clone(), "stuck".to_owned()),
             ("start.md".to_owned(), sha.clone(), "start".to_owned()),
         ];
-        let fetch = move |ticket: String| async move {
+        let fetch = move |ticket: String, _: Progress| async move {
             if ticket == "stuck" {
                 std::future::pending::<()>().await;
             }
@@ -1084,7 +1122,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1122,9 +1160,14 @@ mod tests {
         let consumer = Arc::new(Consumer::<Endpoint>::new());
         let outcome = tokio::time::timeout(
             Duration::from_secs(3600),
-            download_file(&local, "start.md", &sha, "not a ticket", &gate_wanting("start.md", &sha), move |ticket| {
-                fetch_blob(consumer.clone(), ticket)
-            }),
+            download_file(
+                &local,
+                "start.md",
+                &sha,
+                "not a ticket",
+                &gate_wanting("start.md", &sha),
+                move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress),
+            ),
         )
         .await;
 
@@ -1138,7 +1181,7 @@ mod tests {
         let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
         let bytes = b"from author";
         let sha = sha256_bytes(bytes);
-        let fetch = move |ticket: String| async move {
+        let fetch = move |ticket: String, _: Progress| async move {
             if ticket == "dead" {
                 std::future::pending::<()>().await;
             }
@@ -1182,7 +1225,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(3600),
-            download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async {
+            download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_, _| async {
                 Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
             }),
         )
@@ -1198,7 +1241,7 @@ mod tests {
         let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
         let sha = sha256_bytes(b"from author");
         let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
-        let fetch = |_: String| async {
+        let fetch = |_: String, _: Progress| async {
             panic!("the fetch broke");
             #[allow(unreachable_code)]
             Ok::<Vec<u8>, anyhow::Error>(Vec::new())
@@ -1221,7 +1264,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1305,7 +1348,7 @@ mod tests {
         let bytes = b"from author";
         let sha = sha256_bytes(bytes);
         let mut calls = 0;
-        let fetch = |_: String| {
+        let fetch = |_: String, _: Progress| {
             calls += 1;
             let attempt = calls;
             async move {
@@ -1371,7 +1414,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1421,7 +1464,7 @@ mod tests {
         let bytes = b"from author";
         let sha = sha256_bytes(bytes);
         let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
-        let fetch = |_: String| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) };
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) };
 
         downloads.reconcile(&entries, &HashMap::new(), fetch);
         let first = finished.recv().await.unwrap();
@@ -1441,7 +1484,7 @@ mod tests {
         let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
         let bytes = b"from author";
         let sha = sha256_bytes(bytes);
-        let fetch = move |ticket: String| async move {
+        let fetch = move |ticket: String, _: Progress| async move {
             match ticket.as_str() {
                 "slow" => {
                     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1470,7 +1513,7 @@ mod tests {
         let old_calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let old_calls = old_calls.clone();
-            move |ticket: String| {
+            move |ticket: String, _: Progress| {
                 let old_calls = old_calls.clone();
                 async move {
                     if ticket == "old" {
@@ -1506,7 +1549,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1539,7 +1582,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = calls.clone();
-            move |_: String| {
+            move |_: String, _: Progress| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1568,7 +1611,7 @@ mod tests {
         let old_calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let old_calls = old_calls.clone();
-            move |ticket: String| {
+            move |ticket: String, _: Progress| {
                 let old_calls = old_calls.clone();
                 async move {
                     if ticket == "old" {
@@ -1845,7 +1888,7 @@ mod tests {
         std::fs::write(&local, bytes).unwrap();
         let sha = sha256_bytes(bytes);
 
-        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async {
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_, _| async {
             Ok(Vec::new())
         })
         .await;
@@ -1862,7 +1905,7 @@ mod tests {
         let mut calls = 0;
 
         let started = tokio::time::Instant::now();
-        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| {
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_, _| {
             calls += 1;
             let attempt = calls;
             async move {
