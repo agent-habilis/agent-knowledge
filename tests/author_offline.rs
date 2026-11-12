@@ -4,10 +4,8 @@ use agent_knowledge::sync;
 use common::wait_for;
 use tokio::sync::{oneshot, watch};
 
-fn stopped(mut stop: watch::Receiver<()>) -> impl Future<Output = ()> {
-    async move {
-        let _ = stop.changed().await;
-    }
+async fn stopped(mut stop: watch::Receiver<()>) {
+    let _ = stop.changed().await;
 }
 
 /// A file must reach a new mount after its author left, because the peers that hold it serve it.
@@ -21,18 +19,18 @@ async fn a_new_mount_gets_a_file_after_its_author_left() {
     let (author_stop, author_stop_rx) = watch::channel(());
     let (hash_tx, hash_rx) = oneshot::channel();
     let author = tokio::spawn(sync::run(
-        author_dir.path().to_path_buf(),
-        None,
-        move |hash: &str| hash_tx.send(hash.to_owned()).unwrap(),
+        common::options(author_dir.path(), None, None),
+        move |ready: &sync::Ready| hash_tx.send(ready.mesh.clone()).unwrap(),
+        |_| {},
         stopped(author_stop_rx),
     ));
     let hash = hash_rx.await.unwrap();
 
     let (rest_stop, rest_stop_rx) = watch::channel(());
     let first = tokio::spawn(sync::run(
-        first_dir.path().to_path_buf(),
-        Some(hash.clone()),
-        |_: &str| {},
+        common::options(first_dir.path(), Some(hash.clone()), None),
+        |_: &sync::Ready| {},
+        |_| {},
         stopped(rest_stop_rx.clone()),
     ));
     wait_for(&first_dir.path().join("start.md"), Some("from author")).await;
@@ -40,7 +38,12 @@ async fn a_new_mount_gets_a_file_after_its_author_left() {
     author_stop.send(()).unwrap();
     author.await.unwrap().unwrap();
 
-    let late = tokio::spawn(sync::run(late_dir.path().to_path_buf(), Some(hash), |_: &str| {}, stopped(rest_stop_rx)));
+    let late = tokio::spawn(sync::run(
+        common::options(late_dir.path(), Some(hash), None),
+        |_: &sync::Ready| {},
+        |_| {},
+        stopped(rest_stop_rx),
+    ));
     wait_for(&late_dir.path().join("start.md"), Some("from author")).await;
 
     rest_stop.send(()).unwrap();

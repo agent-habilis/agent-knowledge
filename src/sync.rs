@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
-use habilis_network::net::direct::PayloadPath;
 use habilis_network::iroh::Endpoint;
+use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
 use habilis_network::net::build_peer_endpoint;
+use habilis_network::net::direct::PayloadPath;
 use habilis_network::ops::blob::{BlobError, BlobServer, BlobTicket, ContentId, fetch_hedged};
 use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
@@ -216,7 +216,10 @@ impl Downloads {
     {
         for (path, sha, ticket) in entries {
             self.gate.set_wanted(path, sha, ticket);
-            if known.get(path) == Some(sha) || self.failed.get(path) == Some(&(sha.clone(), ticket.clone())) || self.waiting_to_retry(path, sha) {
+            if known.get(path) == Some(sha)
+                || self.failed.get(path) == Some(&(sha.clone(), ticket.clone()))
+                || self.waiting_to_retry(path, sha)
+            {
                 continue;
             }
             let key = (path.clone(), ticket.clone());
@@ -249,7 +252,8 @@ impl Downloads {
             };
             let done = self.done.clone();
             let (path_owned, sha_owned, ticket_owned) = (path.clone(), sha.clone(), ticket.clone());
-            let (path_for_fetch, sha_for_fetch, ticket_for_fetch) = (path.clone(), sha_owned.clone(), ticket_owned.clone());
+            let (path_for_fetch, sha_for_fetch, ticket_for_fetch) =
+                (path.clone(), sha_owned.clone(), ticket_owned.clone());
             let gate = self.gate.clone();
             let task = tokio::spawn(async move {
                 // The download runs in an inner task, so a panic in it still reports back as a failure.
@@ -307,9 +311,7 @@ impl Downloads {
 
     /// Whether the write for this entry failed, and its wait is not over yet.
     fn waiting_to_retry(&self, path: &str, sha: &str) -> bool {
-        self.local_retry.get(path).is_some_and(|retry| {
-            retry.sha == sha && tokio::time::Instant::now() < retry.at
-        })
+        self.local_retry.get(path).is_some_and(|retry| retry.sha == sha && tokio::time::Instant::now() < retry.at)
     }
 
     /// Stop everything for a path that the document no longer names.
@@ -665,7 +667,9 @@ impl<E: Clone + Closable + Send + 'static> Consumer<E> {
         if let Some(endpoint) = state.endpoint.as_ref().filter(|endpoint| !endpoint.closed()) {
             return Ok(lease_of(&state, endpoint.clone()));
         }
-        if let Some((failed_at, message)) = &state.last_failure && failed_at.elapsed() < BUILD_RETRY_WAIT {
+        if let Some((failed_at, message)) = &state.last_failure
+            && failed_at.elapsed() < BUILD_RETRY_WAIT
+        {
             bail!("{message}");
         }
         match build().await {
@@ -741,7 +745,10 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result
         // Checked before the error becomes a string, so the stall reaches the consumer, which retires its endpoint.
         Err(BlobError::HandshakeStalled) => {
             consumer.stalled(lease.generation).await;
-            tracing::debug!(generation = lease.generation, "blob handshake stalled; the next attempt builds an endpoint");
+            tracing::debug!(
+                generation = lease.generation,
+                "blob handshake stalled; the next attempt builds an endpoint"
+            );
             Err(anyhow!("blob handshake stalled"))
         }
         Err(error) => Err(anyhow!("{error}")),
@@ -758,12 +765,19 @@ struct Gate {
 
 impl Gate {
     fn set_wanted(&self, path: &str, sha: &str, ticket: &str) {
-        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), (sha.to_owned(), ticket.to_owned()));
+        self.wanted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_owned(), (sha.to_owned(), ticket.to_owned()));
     }
 
     /// Whether the document still names this entry, and not another ticket for the same content.
     fn is_latest(&self, path: &str, sha: &str, ticket: &str) -> bool {
-        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).get(path).is_some_and(|(s, t)| s == sha && t == ticket)
+        self.wanted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .is_some_and(|(s, t)| s == sha && t == ticket)
     }
 
     fn unwant(&self, path: &str) {
@@ -866,17 +880,10 @@ mod tests {
         let bytes = b"from author";
         let sha = sha256_bytes(bytes);
 
-        let result = download_file(
-            &local,
-            "start.md",
-            &sha,
-            "ticket",
-            &gate_wanting("start.md", &sha),
-            |_| async {
-                tokio::time::sleep(Duration::from_secs(40)).await;
-                Ok(bytes.to_vec())
-            },
-        )
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async {
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            Ok(bytes.to_vec())
+        })
         .await;
 
         assert!(result.is_ok(), "{result:?}");
@@ -1061,7 +1068,8 @@ mod tests {
         };
 
         downloads.reconcile(&entries, &HashMap::new(), fetch);
-        let first = tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.expect("a result").expect("open");
+        let first =
+            tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.expect("a result").expect("open");
 
         assert_eq!(first.path, "start.md");
     }
@@ -1174,7 +1182,9 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(3600),
-            download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) }),
+            download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async {
+                Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+            }),
         )
         .await;
 
@@ -1835,7 +1845,10 @@ mod tests {
         std::fs::write(&local, bytes).unwrap();
         let sha = sha256_bytes(bytes);
 
-        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async { Ok(Vec::new()) }).await;
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| async {
+            Ok(Vec::new())
+        })
+        .await;
 
         assert!(result.is_ok(), "{result:?}");
     }
@@ -1849,23 +1862,16 @@ mod tests {
         let mut calls = 0;
 
         let started = tokio::time::Instant::now();
-        let result = download_file(
-            &local,
-            "start.md",
-            &sha,
-            "ticket",
-            &gate_wanting("start.md", &sha),
-            |_| {
-                calls += 1;
-                let attempt = calls;
-                async move {
-                    if attempt < 3 {
-                        bail!("dead source");
-                    }
-                    Ok(bytes.to_vec())
+        let result = download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), |_| {
+            calls += 1;
+            let attempt = calls;
+            async move {
+                if attempt < 3 {
+                    bail!("dead source");
                 }
-            },
-        )
+                Ok(bytes.to_vec())
+            }
+        })
         .await;
 
         assert!(result.is_ok(), "{result:?}");
