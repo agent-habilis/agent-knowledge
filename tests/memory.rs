@@ -21,7 +21,8 @@ fn dead_pid() -> u32 {
 
 #[test]
 fn session_id_comes_from_the_agent_env() {
-    let all = [("CLAUDE_CODE_SESSION_ID", "claude-1"), ("CODEX_THREAD_ID", "codex-1"), ("AGENT_KNOWLEDGE_SESSION", "own-1")];
+    let all =
+        [("CLAUDE_CODE_SESSION_ID", "claude-1"), ("CODEX_THREAD_ID", "codex-1"), ("AGENT_KNOWLEDGE_SESSION", "own-1")];
 
     assert_eq!(memory::session_id(env_from(&all)).unwrap(), "claude-1");
     assert_eq!(memory::session_id(env_from(&all[1..])).unwrap(), "codex-1");
