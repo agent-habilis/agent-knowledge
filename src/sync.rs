@@ -17,7 +17,7 @@ use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messag
 use habilis_network::net::direct::PayloadPath;
 use habilis_network::iroh::Endpoint;
 use habilis_network::net::build_peer_endpoint;
-use habilis_network::ops::blob::{BlobServer, BlobTicket, ContentId, fetch_with_endpoint};
+use habilis_network::ops::blob::{BlobError, BlobServer, BlobTicket, ContentId, fetch_with_endpoint};
 use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
@@ -513,7 +513,8 @@ impl Closable for Endpoint {
 /// How long a failed endpoint build is remembered. The waiting downloads get the same error until then.
 const BUILD_RETRY_WAIT: Duration = Duration::from_secs(5);
 
-/// The endpoint that the blob fetches of one folder use. It is built on first use, and again only after it closes.
+/// The endpoint that the blob fetches of one folder use. It is built on first use, and again only after it closes
+/// or stalls.
 struct Consumer<E> {
     state: tokio::sync::Mutex<ConsumerState<E>>,
     /// Set on shutdown. A download that starts after it must not build an endpoint.
@@ -522,16 +523,24 @@ struct Consumer<E> {
 
 struct ConsumerState<E> {
     endpoint: Option<E>,
+    /// Counts the builds. A stall reports the generation it used, so only the first stall of an endpoint replaces it.
+    generation: u64,
     last_failure: Option<(tokio::time::Instant, String)>,
+}
+
+/// The endpoint a download uses, with the generation it was built in.
+struct Lease<E> {
+    endpoint: E,
+    generation: u64,
 }
 
 impl<E: Clone + Closable> Consumer<E> {
     fn new() -> Self {
-        let state = ConsumerState { endpoint: None, last_failure: None };
+        let state = ConsumerState { endpoint: None, generation: 0, last_failure: None };
         Self { state: tokio::sync::Mutex::new(state), closed: AtomicBool::new(false) }
     }
 
-    async fn get<Fut>(&self, build: impl FnOnce() -> Fut) -> Result<E>
+    async fn get<Fut>(&self, build: impl FnOnce() -> Fut) -> Result<Lease<E>>
     where
         Fut: Future<Output = Result<E>>,
     {
@@ -541,24 +550,33 @@ impl<E: Clone + Closable> Consumer<E> {
             bail!("the folder is shutting down");
         }
         if let Some(endpoint) = state.endpoint.as_ref().filter(|endpoint| !endpoint.closed()) {
-            return Ok(endpoint.clone());
+            return Ok(Lease { endpoint: endpoint.clone(), generation: state.generation });
         }
-        if let Some((failed_at, message)) = &state.last_failure {
-            if failed_at.elapsed() < BUILD_RETRY_WAIT {
-                bail!("{message}");
-            }
+        if let Some((failed_at, message)) = &state.last_failure && failed_at.elapsed() < BUILD_RETRY_WAIT {
+            bail!("{message}");
         }
         match build().await {
             Ok(endpoint) => {
+                state.generation += 1;
                 state.endpoint = Some(endpoint.clone());
                 state.last_failure = None;
-                Ok(endpoint)
+                Ok(Lease { endpoint, generation: state.generation })
             }
             Err(error) => {
                 state.last_failure = Some((tokio::time::Instant::now(), format!("{error:#}")));
                 Err(error)
             }
         }
+    }
+
+    /// The endpoint of `generation` stalled. It is cleared, so the next get() builds a new one, and the caller closes it.
+    /// A stall from an older generation returns None: a newer endpoint is already in place.
+    async fn stalled(&self, generation: u64) -> Option<E> {
+        let mut state = self.state.lock().await;
+        if state.generation != generation {
+            return None;
+        }
+        state.endpoint.take()
     }
 
     async fn take(&self) -> Option<E> {
@@ -569,12 +587,22 @@ impl<E: Clone + Closable> Consumer<E> {
 
 async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
-    let endpoint = consumer
+    let lease = consumer
         .get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(|error| anyhow!("{error}")) })
         .await?;
     let mut bytes = Vec::new();
-    fetch_with_endpoint(&endpoint, &ticket, &mut bytes, None).await.map_err(|error| anyhow!("{error}"))?;
-    Ok(bytes)
+    match fetch_with_endpoint(&lease.endpoint, &ticket, &mut bytes, None).await {
+        Ok(()) => Ok(bytes),
+        // Checked before the error becomes a string. The endpoint stays open, so this download closes it.
+        Err(BlobError::HandshakeStalled) => {
+            if let Some(endpoint) = consumer.stalled(lease.generation).await {
+                endpoint.close().await;
+            }
+            tracing::debug!(generation = lease.generation, "blob handshake stalled; the next attempt builds an endpoint");
+            Err(anyhow!("blob handshake stalled"))
+        }
+        Err(error) => Err(anyhow!("{error}")),
+    }
 }
 
 /// The writes of one folder, and the sha that the document names for each path.
@@ -1447,7 +1475,7 @@ mod tests {
         };
 
         let first = consumer.get(build).await.unwrap();
-        first.0.store(true, Ordering::SeqCst);
+        first.endpoint.0.store(true, Ordering::SeqCst);
         consumer.get(build).await.unwrap();
         consumer.get(build).await.unwrap();
 
@@ -1501,6 +1529,42 @@ mod tests {
         assert!(consumer.get(build).await.is_err());
 
         assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_endpoint_is_replaced_once_for_all_slots() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default())
+        };
+        let first = consumer.get(build).await.unwrap();
+
+        assert!(consumer.stalled(first.generation).await.is_some());
+        assert!(consumer.stalled(first.generation).await.is_none());
+        consumer.get(build).await.unwrap();
+
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_late_stall_does_not_replace_a_newer_endpoint() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok::<FakeEndpoint, anyhow::Error>(FakeEndpoint::default())
+        };
+        let first = consumer.get(build).await.unwrap();
+        consumer.stalled(first.generation).await;
+        let second = consumer.get(build).await.unwrap();
+
+        assert!(consumer.stalled(first.generation).await.is_none());
+        consumer.get(build).await.unwrap();
+
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert_ne!(first.generation, second.generation);
     }
 
     #[tokio::test]
