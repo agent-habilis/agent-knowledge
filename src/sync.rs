@@ -535,10 +535,11 @@ impl<E: Clone + Closable> Consumer<E> {
     where
         Fut: Future<Output = Result<E>>,
     {
+        let mut state = self.state.lock().await;
+        // Read under the lock: take() sets the flag before it takes the lock, so a build here is never left unclosed.
         if self.closed.load(Ordering::SeqCst) {
             bail!("the folder is shutting down");
         }
-        let mut state = self.state.lock().await;
         if let Some(endpoint) = state.endpoint.as_ref().filter(|endpoint| !endpoint.closed()) {
             return Ok(endpoint.clone());
         }
@@ -1484,6 +1485,22 @@ mod tests {
 
         assert!(first.is_err() && second.is_err());
         assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_build_is_tried_again_after_its_window() {
+        let consumer = Consumer::<FakeEndpoint>::new();
+        let builds = AtomicUsize::new(0);
+        let build = || async {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Err::<FakeEndpoint, anyhow::Error>(anyhow!("offline"))
+        };
+        assert!(consumer.get(build).await.is_err());
+
+        tokio::time::sleep(BUILD_RETRY_WAIT + Duration::from_secs(1)).await;
+        assert!(consumer.get(build).await.is_err());
+
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
