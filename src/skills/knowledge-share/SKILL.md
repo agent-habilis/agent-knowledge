@@ -68,8 +68,8 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
    - the command a peer runs, in the peer's agent form: `/knowledge-mount <hash> <target>`
      (Claude Code), `$knowledge-mount <hash> <target>` (Codex), or
      `/skill:knowledge-mount <hash> <target>` (Pi),
-   - that the share keeps running in the background, and how to stop it (stop
-     the background task, or `kill <pid>`).
+   - that the share keeps running in the background, and how to stop it:
+     /knowledge-unmount (agent form), which leaves the mesh and keeps the files.
 
 7. **Relay join and leave notices.** While the share runs, the process prints
    `📚 <nick> joined` and `📚 <nick> left` on stdout as peers come and go.

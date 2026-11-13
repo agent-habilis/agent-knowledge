@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
@@ -31,7 +32,7 @@ enum Command {
         #[arg(long)]
         nickname: Option<String>,
     },
-    /// Copy the knowledge-share and knowledge-mount skills into each agent's skills folder.
+    /// Copy the knowledge skills into each agent's skills folder.
     Plug {
         /// Agent to plug into. Repeat for more than one. Default: every detected agent.
         #[arg(long = "agent", value_enum)]
@@ -39,10 +40,15 @@ enum Command {
     },
     /// Print the folder of this agent session's memory, or fail if it runs none.
     Status,
+    /// Stop this agent session's memory: it leaves the mesh, and its files stay as they are.
+    Unmount,
 }
 
 /// The project emoji. Every line printed for the chat starts with it.
 const EMOJI: &str = "📚";
+
+/// How long `unmount` waits for the memory to leave the mesh and exit.
+const UNMOUNT_WAIT: Duration = Duration::from_secs(15);
 
 /// The chat line for another peer joining or leaving.
 fn notice(presence: &Presence) -> String {
@@ -73,13 +79,58 @@ fn claim(kind: Kind, folder: &Path) -> anyhow::Result<Claim> {
     Claim::acquire(&memory::registry_dir(env)?, &memory::session_id(env)?, entry)
 }
 
-fn status() -> anyhow::Result<()> {
+/// The registry, this session, and the memory it runs. Fails if it runs none.
+fn running() -> anyhow::Result<(PathBuf, String, Memory)> {
+    let registry = memory::registry_dir(env)?;
     let session = memory::session_id(env)?;
-    let Some(running) = memory::current(&memory::registry_dir(env)?, &session)? else {
+    let Some(running) = memory::current(&registry, &session)? else {
         bail!("no memory bank in this session ({session}); start one with knowledge-share or knowledge-mount");
     };
+    Ok((registry, session, running))
+}
+
+fn status() -> anyhow::Result<()> {
+    let (_, _, running) = running()?;
     println!("{}", running.folder.display());
     Ok(())
+}
+
+fn unmount() -> anyhow::Result<()> {
+    let (registry, session, running) = running()?;
+    let (kind, folder) = (running.kind.as_str(), running.folder.display());
+    if !memory::stop(&registry, &session, &running, UNMOUNT_WAIT)? {
+        bail!(
+            "the {kind} at {folder} (pid {}) did not stop within {}s; `kill -9 {}` forces it, without a clean leave",
+            running.pid,
+            UNMOUNT_WAIT.as_secs(),
+            running.pid
+        );
+    }
+    println!("{EMOJI} left the {kind} at {folder}; files kept");
+    Ok(())
+}
+
+/// Resolves on Ctrl-C (SIGINT) or SIGTERM, so `kill <pid>` and a stopped background task also
+/// leave the mesh cleanly. The listeners register here, before the mesh join, so a signal that
+/// lands while the join is still running is kept rather than killing the process.
+#[cfg(unix)]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 
 fn run_plug(explicit: Vec<Agent>) -> anyhow::Result<()> {
@@ -107,12 +158,10 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "error".into()))
         .init();
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
     match Cli::parse().command {
         Command::Share { folder, nickname } => {
             let _claim = claim(Kind::Share, &folder)?;
+            let shutdown = shutdown_signal()?;
             let on_ready = |ready: &Ready| {
                 println!("{}", ready.mesh);
                 print_nickname(&ready.nick);
@@ -122,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Mount { hash, target, nickname } => {
             let _claim = claim(Kind::Mount, &target)?;
+            let shutdown = shutdown_signal()?;
             std::fs::create_dir_all(&target)?;
             let on_ready = |ready: &Ready| {
                 eprintln!("mounted at {}", target.display());
@@ -132,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Plug { agents } => run_plug(agents),
         Command::Status => status(),
+        Command::Unmount => unmount(),
     }
 }
 
