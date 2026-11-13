@@ -116,7 +116,8 @@ pub async fn run(
         index_tx,
         own,
         index_sha: None,
-        index_dirty: false,
+        // A restart may have turned files into tombstones, so the first pass publishes the index.
+        index_dirty: true,
         index_version: 0,
         winner_ts: HashMap::new(),
         index_written: None,
@@ -153,6 +154,7 @@ pub async fn run(
         folder.publish_index().await;
         folder.write_status().await;
     }
+    folder.save_own();
     folder.downloads.abort_all();
     folder.consumer.shutdown().await;
     folder.blobs.shutdown().await;
@@ -607,6 +609,7 @@ impl Folder {
             self.known.remove(&path);
             self.status.record("↑", &path, true);
         }
+        self.save_own();
         self.publish_index().await;
     }
 
@@ -828,7 +831,9 @@ impl Folder {
             // A served copy keeps the ts of the entry it came from, so an older copy never beats a newer edit.
             Ok(()) => {
                 let ts = self.winner_ts.get(&path).copied().unwrap_or_else(now_ms);
-                self.publish(&path, &sha, ts).await
+                let published = self.publish(&path, &sha, ts).await;
+                self.save_own();
+                published
             }
             Err(Failure::Transient(error) | Failure::Permanent(error) | Failure::LocalWrite(error)) => Err(error),
         };
@@ -2876,6 +2881,22 @@ mod tests {
         assert_eq!(cancels, vec!["a".to_owned()], "the older fetch was not cancelled");
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].2, sha256_bytes(b"{}"));
+    }
+
+    #[test]
+    fn the_own_index_file_is_never_published_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(INDEX_FILE), "{}").unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+
+        let disk = scan::scan(dir.path()).unwrap();
+        assert!(!disk.contains_key(INDEX_FILE), "the index file was scanned");
+        let publish = downloads.publishable(&disk, &HashMap::new());
+        assert!(publish.iter().all(|(path, _)| path != INDEX_FILE), "the index file would be published");
+
+        downloads.remove_dropped(&serde_json::Map::new(), &mut HashMap::new(), |local| std::fs::remove_file(local));
+        assert!(dir.path().join(INDEX_FILE).exists(), "the index file was removed");
     }
 
     #[test]

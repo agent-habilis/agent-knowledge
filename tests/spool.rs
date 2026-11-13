@@ -16,6 +16,42 @@ fn spool_of_this_process() -> (usize, usize) {
     (dirs, files)
 }
 
+/// The index blobs in the spools of this process: each spool file that is a JSON object of entries with a sha256.
+fn index_blobs_of_this_process() -> usize {
+    let prefix = format!("agent-knowledge-{}-", std::process::id());
+    let mut index_blobs = 0;
+    for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            index_blobs += count_index_blobs(&entry.path());
+        }
+    }
+    index_blobs
+}
+
+fn count_index_blobs(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        return count_index_blobs(&path);
+                    }
+                    let index = std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                    usize::from(index.is_some_and(|value| {
+                        value
+                            .as_object()
+                            .is_some_and(|entries| entries.values().any(|entry| entry.get("sha256").is_some()))
+                    }))
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn count_files(dir: &Path) -> usize {
     std::fs::read_dir(dir)
         .map(|entries| {
@@ -41,8 +77,11 @@ async fn the_spool_does_not_grow_with_each_index() {
         wait_for(&mount_dir.path().join("a.md"), Some(&format!("v{n}"))).await;
     }
     let (dirs_after, files_after) = spool_of_this_process();
+    let index_blobs = index_blobs_of_this_process();
     pair.stop().await;
 
     assert!(dirs_after <= dirs_before + 2, "spool directories grew from {dirs_before} to {dirs_after}");
+    // One own index per peer stays: the one the pointer names. The one before it was evicted.
+    assert!(index_blobs <= 2, "{index_blobs} index blobs stayed in the spool");
     assert!(files_after <= files_before + 2 * 20 + 4, "spool files grew from {files_before} to {files_after}");
 }
