@@ -87,7 +87,8 @@ pub async fn run(
     let ready = wait_ready(&mut events).await?;
     on_ready(&ready);
 
-    let blobs = BlobServer::start(blob_lookups(), spool_dir(), None, PayloadPath::RelayAllowed)
+    let spool = spool_dir();
+    let blobs = BlobServer::start(blob_lookups(), spool.clone(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
@@ -105,11 +106,14 @@ pub async fn run(
         status_file,
         indexes: Indexes::default(),
         index_pending: HashSet::new(),
+        index_tasks: HashMap::new(),
         index_tx,
         own: BTreeMap::new(),
         index_sha: None,
         index_dirty: false,
         index_version: 0,
+        index_written: None,
+        spool,
     };
 
     // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
@@ -164,6 +168,8 @@ struct Folder {
     indexes: Indexes,
     /// The index fetches under way, by author and sha256, so each one starts once.
     index_pending: HashSet<(String, String)>,
+    /// The index fetch under way for each author, with its handle to cancel it.
+    index_tasks: HashMap<String, (String, AbortHandle)>,
     index_tx: mpsc::UnboundedSender<IndexDone>,
     /// This peer's own entries: one per file it publishes, and a tombstone per file it deleted.
     own: BTreeMap<String, Value>,
@@ -171,6 +177,10 @@ struct Folder {
     index_sha: Option<String>,
     index_dirty: bool,
     index_version: u64,
+    /// When the own index was last written. A pointer write waits for `INDEX_INTERVAL` after it.
+    index_written: Option<tokio::time::Instant>,
+    /// The directory that the blob store keeps its spool in, the one the index is written into.
+    spool: PathBuf,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -632,7 +642,7 @@ impl Folder {
     /// Write the own index as one blob, point the own slice at it, and evict the index it replaces. A failure is logged,
     /// and the index stays dirty, so the next tick tries again.
     async fn publish_index(&mut self) {
-        if !self.index_dirty {
+        if !self.index_dirty || self.index_written.is_some_and(|at| at.elapsed() < INDEX_INTERVAL) {
             return;
         }
         let bytes = match serde_json::to_vec(&self.own) {
@@ -647,7 +657,7 @@ impl Folder {
         let sha = sha256_bytes(&bytes);
         self.index_version += 1;
         // A unique name per version, never edited in place. The spool keeps its own link, so this copy goes.
-        let spool = spool_dir();
+        let spool = self.spool.clone();
         let temp = spool.join(format!("index-{}-{}.json", std::process::id(), self.index_version));
         let registered = match std::fs::create_dir_all(&spool).and_then(|()| std::fs::write(&temp, &bytes)) {
             Ok(()) => self.blobs.register(&temp, ContentId::new(&sha)).await.map_err(|error| anyhow!("{error}")),
@@ -658,6 +668,7 @@ impl Folder {
             Ok(ticket) => ticket,
             Err(error) => return self.failed(&format!("own index blob failed, will retry: {error:#}")),
         };
+        self.index_written = Some(tokio::time::Instant::now());
         match self.merge(json!({ "index": { "ticket": ticket.encode(), "sha256": sha, "ts": now_ms() } })).await {
             Ok(()) => {
                 self.index_dirty = false;
@@ -674,21 +685,33 @@ impl Folder {
     /// Fetch the index of each author whose pointer is new. Until it lands, the author contributes no entries, so no
     /// file it lists is dropped.
     fn fetch_indexes(&mut self, document: &Value) {
-        for (author, ticket, sha) in pointers_to_fetch(document, &self.indexes) {
-            if !self.index_pending.insert((author.clone(), sha.clone())) {
-                continue;
+        let running: HashMap<String, String> =
+            self.index_tasks.iter().map(|(a, (sha, _))| (a.clone(), sha.clone())).collect();
+        let (starts, cancels) = fetch_plan(document, &self.indexes, &running);
+        for author in cancels {
+            if let Some((sha, handle)) = self.index_tasks.remove(&author) {
+                handle.abort();
+                self.index_pending.remove(&(author.clone(), sha));
             }
+        }
+        for (author, ticket, sha) in starts {
+            self.index_pending.insert((author.clone(), sha.clone()));
             let (consumer, tx) = (self.consumer.clone(), self.index_tx.clone());
-            tokio::spawn(async move {
-                let result = fetch_index(consumer, &ticket, &sha).await.map_err(|error| format!("{error:#}"));
-                let _ = tx.send(IndexDone { author, sha, result });
+            let (fetch_author, fetch_sha) = (author.clone(), sha.clone());
+            let task = tokio::spawn(async move {
+                let result = fetch_index(consumer, &ticket, &fetch_sha).await.map_err(|error| format!("{error:#}"));
+                let _ = tx.send(IndexDone { author: fetch_author, sha: fetch_sha, result });
             });
+            self.index_tasks.insert(author, (sha, task.abort_handle()));
         }
     }
 
     /// Take the end of one index fetch. A landed index is cached, and the view is read again. A failed one is logged.
     async fn index_done(&mut self, done: IndexDone) {
         self.index_pending.remove(&(done.author.clone(), done.sha.clone()));
+        if self.index_tasks.get(&done.author).is_some_and(|(sha, _)| *sha == done.sha) {
+            self.index_tasks.remove(&done.author);
+        }
         match done.result {
             Ok(entries) => {
                 self.indexes.0.insert(done.author, (done.sha, entries));
@@ -849,6 +872,8 @@ fn fetch_error(error: BlobError) -> anyhow::Error {
 const INDEX_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// How many times an index fetch is retried before it is given up for now. The pointer stays, so it is tried again.
 const INDEX_ATTEMPTS: u32 = 6;
+/// The least time between two own index writes. Many edits in this time give one index, and one pointer write.
+const INDEX_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The entries of each author's index, with the sha256 of the index they came from.
 #[derive(Default)]
@@ -867,6 +892,28 @@ fn pointers_to_fetch(document: &Value, indexes: &Indexes) -> Vec<(String, String
             (!fetched).then(|| (author.clone(), ticket.to_owned(), sha.to_owned()))
         })
         .collect()
+}
+
+/// The index fetches to start, and the authors whose running fetch is cancelled. A running fetch that is for the
+/// author's current pointer stays. A fetch for an older pointer is cancelled, and the new one starts at once.
+fn fetch_plan(
+    document: &Value,
+    indexes: &Indexes,
+    running: &HashMap<String, String>,
+) -> (Vec<(String, String, String)>, Vec<String>) {
+    let mut starts = Vec::new();
+    let mut cancels = Vec::new();
+    for (author, ticket, sha) in pointers_to_fetch(document, indexes) {
+        match running.get(&author) {
+            Some(running_sha) if *running_sha == sha => {}
+            Some(_) => {
+                cancels.push(author.clone());
+                starts.push((author, ticket, sha));
+            }
+            None => starts.push((author, ticket, sha)),
+        }
+    }
+    (starts, cancels)
 }
 
 /// The entries of an index blob, checked against its sha256 and the cap.
@@ -2751,6 +2798,18 @@ mod tests {
 
         assert_eq!(pointers_to_fetch(&document, &Indexes::default()).len(), 1);
         assert!(pointers_to_fetch(&document, &indexes).is_empty());
+    }
+
+    #[test]
+    fn a_pointer_change_cancels_the_older_fetch() {
+        let (document, _) = pointed(&[("a", serde_json::json!({}))]);
+        let running = HashMap::from([("a".to_owned(), "older".to_owned())]);
+
+        let (starts, cancels) = fetch_plan(&document, &Indexes::default(), &running);
+
+        assert_eq!(cancels, vec!["a".to_owned()], "the older fetch was not cancelled");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].2, sha256_bytes(b"{}"));
     }
 
     #[test]
