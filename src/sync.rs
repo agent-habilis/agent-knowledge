@@ -175,7 +175,12 @@ impl Folder {
             self.status.peers = status::peers_from_roster(&roster);
         }
         self.status.files = self.known.len();
-        self.status.bytes = self.known.keys().filter_map(|rel| std::fs::metadata(self.root.join(rel)).ok()).map(|meta| meta.len()).sum();
+        self.status.bytes = self
+            .known
+            .keys()
+            .filter_map(|rel| std::fs::metadata(self.root.join(rel)).ok())
+            .map(|meta| meta.len())
+            .sum();
         self.status.written_at = status::now();
         if let Err(error) = self.status.write(path) {
             eprintln!("{error:#}");

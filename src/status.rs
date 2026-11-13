@@ -96,7 +96,8 @@ impl Status {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
         };
-        let value: Value = serde_json::from_str(&text).with_context(|| format!("bad status file {}", path.display()))?;
+        let value: Value =
+            serde_json::from_str(&text).with_context(|| format!("bad status file {}", path.display()))?;
         Ok(Some(from_json(&value)))
     }
 }
@@ -260,8 +261,15 @@ mod tests {
             changes: VecDeque::new(),
             written_at: 1000,
         };
-        status.changes.push_back(Change { arrow: "↑".to_owned(), path: "log.md".to_owned(), deleted: false, at: 980 });
-        status.changes.push_back(Change { arrow: "↓".to_owned(), path: "concepts/peer.md".to_owned(), deleted: false, at: 996 });
+        status
+            .changes
+            .push_back(Change { arrow: "↑".to_owned(), path: "log.md".to_owned(), deleted: false, at: 980 });
+        status.changes.push_back(Change {
+            arrow: "↓".to_owned(),
+            path: "concepts/peer.md".to_owned(),
+            deleted: false,
+            at: 996,
+        });
         status
     }
 
@@ -289,7 +297,8 @@ mod tests {
 
     #[test]
     fn an_alone_peer_with_nothing_synced_says_so() {
-        let status = Status { mesh: "H".to_owned(), nick: "a".to_owned(), folder: PathBuf::from("/f"), ..Status::default() };
+        let status =
+            Status { mesh: "H".to_owned(), nick: "a".to_owned(), folder: PathBuf::from("/f"), ..Status::default() };
 
         let block = render(&status, "share", 5);
 
@@ -328,10 +337,13 @@ mod tests {
 
         let peers = peers_from_roster(&roster);
 
-        assert_eq!(peers, [
-            Peer { nick: "bob".to_owned(), path: "unicast".to_owned(), last_seen_secs: Some(2), quiet: false },
-            Peer { nick: "carol".to_owned(), path: "relay-only".to_owned(), last_seen_secs: None, quiet: true },
-        ]);
+        assert_eq!(
+            peers,
+            [
+                Peer { nick: "bob".to_owned(), path: "unicast".to_owned(), last_seen_secs: Some(2), quiet: false },
+                Peer { nick: "carol".to_owned(), path: "relay-only".to_owned(), last_seen_secs: None, quiet: true },
+            ]
+        );
         assert!(peers_from_roster(&json!({})).is_empty());
     }
 

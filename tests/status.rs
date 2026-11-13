@@ -31,10 +31,13 @@ async fn each_side_sees_the_other_peer_and_the_synced_file() {
     let mount_status = registry.path().join("mount.status.json");
     std::fs::write(share_dir.path().join("note.md"), "hello").unwrap();
 
-    let share_options = sync::Options { status_file: Some(share_status.clone()), ..options(share_dir.path(), None, Some("alice")) };
+    let share_options =
+        sync::Options { status_file: Some(share_status.clone()), ..options(share_dir.path(), None, Some("alice")) };
     let share = Peer::start_with(share_options, |_| {}).await;
-    let mount_options =
-        sync::Options { status_file: Some(mount_status.clone()), ..options(mount_dir.path(), Some(share.ready.mesh.clone()), Some("bob")) };
+    let mount_options = sync::Options {
+        status_file: Some(mount_status.clone()),
+        ..options(mount_dir.path(), Some(share.ready.mesh.clone()), Some("bob"))
+    };
     let mount = Peer::start_with(mount_options, |_| {}).await;
     wait_for(&mount_dir.path().join("note.md"), Some("hello")).await;
 
