@@ -94,6 +94,12 @@ pub async fn run(
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
+    let saved = std::fs::read(root.join(INDEX_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, Value>>(&bytes).ok())
+        .unwrap_or_default();
+    let disk = scan::scan(&root).unwrap_or_default();
+    let own = own_after_restart(saved, &disk, now_ms());
     let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
     let mut folder = Folder {
         root: root.clone(),
@@ -108,10 +114,11 @@ pub async fn run(
         index_pending: HashSet::new(),
         index_tasks: HashMap::new(),
         index_tx,
-        own: BTreeMap::new(),
+        own,
         index_sha: None,
         index_dirty: false,
         index_version: 0,
+        winner_ts: HashMap::new(),
         index_written: None,
         spool,
     };
@@ -177,6 +184,8 @@ struct Folder {
     index_sha: Option<String>,
     index_dirty: bool,
     index_version: u64,
+    /// The ts of the winning entry of each path in the view, which a served copy keeps.
+    winner_ts: HashMap<String, u64>,
     /// When the own index was last written. A pointer write waits for `INDEX_INTERVAL` after it.
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
@@ -581,7 +590,7 @@ impl Folder {
             Err(error) => return eprintln!("scan failed: {error}"),
         };
         for (path, sha) in self.downloads.publishable(&disk, &self.known) {
-            match self.publish(&path, &sha).await {
+            match self.publish(&path, &sha, now_ms()).await {
                 Ok(()) => {
                     eprintln!("↑ {path}");
                     self.known.insert(path.clone(), sha.clone());
@@ -628,13 +637,13 @@ impl Folder {
         }
     }
 
-    async fn publish(&mut self, path: &str, sha: &str) -> Result<()> {
+    async fn publish(&mut self, path: &str, sha: &str, ts: u64) -> Result<()> {
         let ticket = self
             .blobs
             .register(&self.root.join(path), ContentId::new(sha))
             .await
             .map_err(|error| anyhow!("{error}"))?;
-        self.own.insert(path.to_owned(), json!({ "sha256": sha, "ticket": ticket.encode(), "ts": now_ms() }));
+        self.own.insert(path.to_owned(), json!({ "sha256": sha, "ticket": ticket.encode(), "ts": ts }));
         self.index_dirty = true;
         Ok(())
     }
@@ -672,6 +681,7 @@ impl Folder {
         match self.merge(json!({ "index": { "ticket": ticket.encode(), "sha256": sha, "ts": now_ms() } })).await {
             Ok(()) => {
                 self.index_dirty = false;
+                self.save_own();
                 if let Some(previous) = self.index_sha.replace(sha.clone())
                     && previous != sha
                 {
@@ -679,6 +689,19 @@ impl Folder {
                 }
             }
             Err(error) => self.failed(&format!("own index pointer failed, will retry: {error:#}")),
+        }
+    }
+
+    /// Keep the own entries in the hidden index file, so a restart keeps its tombstones. A failure is logged only.
+    fn save_own(&self) {
+        let temp = self.root.join(format!("{INDEX_FILE}.tmp"));
+        let saved = serde_json::to_vec(&self.own).map_err(anyhow::Error::from).and_then(|bytes| {
+            std::fs::write(&temp, bytes)?;
+            std::fs::rename(&temp, self.root.join(INDEX_FILE))?;
+            Ok(())
+        });
+        if let Err(error) = saved {
+            eprintln!("own index not kept for a restart: {error:#}");
         }
     }
 
@@ -742,7 +765,24 @@ impl Folder {
 
     /// Make the disk match the document, for every path the document or `known` names.
     fn apply(&mut self, document: &Value) {
+        // The own slice is this peer's own truth. Its fetched index can lag the own publishes, so the own entries
+        // are read from `own` instead, and the older copy never wins over a newer own edit.
+        if let Some(sha) = self.index_sha.clone()
+            && let Some(author) = document.as_object().and_then(|slices| {
+                slices.iter().find_map(|(author, slice)| {
+                    let pointer = slice.get("index")?.get("sha256")?.as_str()?;
+                    (pointer == sha).then(|| author.clone())
+                })
+            })
+        {
+            let entries = self.own.iter().map(|(path, entry)| (path.clone(), entry.clone())).collect();
+            self.indexes.0.insert(author, (sha, entries));
+        }
         let view = view_of(document, &self.indexes);
+        self.winner_ts = view
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
+            .collect();
         let tracked: Vec<String> = self
             .known
             .keys()
@@ -785,7 +825,11 @@ impl Folder {
         }
         let published = match result {
             // Serve the file too, so a peer can still get it after its author left.
-            Ok(()) => self.publish(&path, &sha).await,
+            // A served copy keeps the ts of the entry it came from, so an older copy never beats a newer edit.
+            Ok(()) => {
+                let ts = self.winner_ts.get(&path).copied().unwrap_or_else(now_ms);
+                self.publish(&path, &sha, ts).await
+            }
             Err(Failure::Transient(error) | Failure::Permanent(error) | Failure::LocalWrite(error)) => Err(error),
         };
         if published.is_ok() {
@@ -867,6 +911,28 @@ where
 fn fetch_error(error: BlobError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
+
+/// The own entries after a restart: the saved ones, with each file that is gone from disk turned into a tombstone.
+/// A tombstone is kept, so a file deleted before the restart stays deleted for the mesh.
+fn own_after_restart(
+    saved: BTreeMap<String, Value>,
+    disk: &BTreeMap<String, String>,
+    now: u64,
+) -> BTreeMap<String, Value> {
+    saved
+        .into_iter()
+        .map(|(path, entry)| {
+            if is_tombstone(&entry) || disk.contains_key(&path) {
+                (path, entry)
+            } else {
+                (path, json!({ "deleted": true, "ts": now }))
+            }
+        })
+        .collect()
+}
+
+/// The own index is kept here between runs, as a hidden file, which the scan skips.
+const INDEX_FILE: &str = ".agent-knowledge-index.json";
 
 /// The largest index blob that is fetched or published. A larger one is refused with an error, never truncated.
 const INDEX_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -2810,6 +2876,36 @@ mod tests {
         assert_eq!(cancels, vec!["a".to_owned()], "the older fetch was not cancelled");
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].2, sha256_bytes(b"{}"));
+    }
+
+    #[test]
+    fn a_restart_keeps_its_tombstones() {
+        let saved = BTreeMap::from([("gone.md".to_owned(), serde_json::json!({ "deleted": true, "ts": 5 }))]);
+
+        let own = own_after_restart(saved, &BTreeMap::new(), 9);
+
+        assert_eq!(own["gone.md"]["deleted"], true);
+        assert_eq!(own["gone.md"]["ts"], 5);
+    }
+
+    #[test]
+    fn a_restart_turns_a_file_deleted_while_stopped_into_a_tombstone() {
+        let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
+
+        let own = own_after_restart(saved, &BTreeMap::new(), 9);
+
+        assert_eq!(own["a.md"]["deleted"], true, "a file gone while stopped was not tombstoned: {own:?}");
+        assert_eq!(own["a.md"]["ts"], 9);
+    }
+
+    #[test]
+    fn a_restart_keeps_a_file_still_on_disk() {
+        let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
+        let disk = BTreeMap::from([("a.md".to_owned(), "x".to_owned())]);
+
+        let own = own_after_restart(saved, &disk, 9);
+
+        assert_eq!(own["a.md"]["sha256"], "x");
     }
 
     #[test]
