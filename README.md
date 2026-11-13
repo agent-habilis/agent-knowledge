@@ -159,6 +159,8 @@ cargo test --workspace --no-fail-fast                                    # test
 ### Limits
 
 - Hidden files and folders (`.git`, `.DS_Store`) do not sync.
+- Symlinks, unreadable files, and paths that are not valid UTF-8 do not sync.
+- `.gitignore` is not read: every other file in the folder syncs.
 - Empty folders do not sync.
 - A rename syncs as a delete plus a create.
-- Each side keeps a full copy of the folder.
+- Each side keeps a full copy of the folder. Stopping a share or mount does not delete the copies that peers already have.
