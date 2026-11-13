@@ -665,7 +665,7 @@ where
             Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
             Err(error) => {
                 let wait = backoff(attempt);
-                tracing::debug!(path = %local.display(), attempt = attempt.saturating_add(1), wait = ?wait, error = %error, "retrying a blob fetch");
+                tracing::debug!(path = %local.display(), attempt = attempt.saturating_add(1), wait = ?wait, error = %error_text(&error), "retrying a blob fetch");
                 tokio::time::sleep(wait).await;
                 // A newer ticket for this sha has its own download, so this one stops before its next attempt.
                 if !gate.is_latest(path, sha, ticket) {
@@ -685,9 +685,19 @@ where
     Ok(())
 }
 
-/// The wait before retry `attempt`: 2 s, doubling up to 60 s, plus up to half of that as jitter.
+/// The text of a fetch error with its whole chain: each cause follows the one before it after ": ".
+fn error_text(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+/// The first blob retry waits this long. Each retry doubles the wait, up to `BLOB_RETRY_CAP`.
+const BLOB_RETRY_BASE: Duration = Duration::from_secs(1);
+/// The longest wait between two blob retries, before jitter.
+const BLOB_RETRY_CAP: Duration = Duration::from_secs(10);
+
+/// The wait before retry `attempt`: `BLOB_RETRY_BASE` doubling up to `BLOB_RETRY_CAP`, plus up to half of that as jitter.
 fn backoff(attempt: u32) -> Duration {
-    let base = Duration::from_secs(2).saturating_mul(2u32.saturating_pow(attempt)).min(Duration::from_secs(60));
+    let base = BLOB_RETRY_BASE.saturating_mul(2u32.saturating_pow(attempt)).min(BLOB_RETRY_CAP);
     let half_ms = u64::try_from((base / 2).as_millis()).unwrap_or(u64::MAX);
     let nanos = u64::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos());
     base + Duration::from_millis(nanos % (half_ms + 1))
@@ -929,7 +939,7 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress:
             );
             Err(anyhow!("blob handshake stalled"))
         }
-        Err(error) => Err(anyhow!("{error}")),
+        Err(error) => Err(anyhow::Error::new(error)),
     }
 }
 
@@ -2384,6 +2394,42 @@ mod tests {
         assert!(known.is_empty());
     }
 
+    #[test]
+    fn a_retry_log_shows_the_whole_error_chain() {
+        let error = anyhow::Error::from(io::Error::other("connection lost")).context("blob fetch");
+
+        assert_eq!(error_text(&error), "blob fetch: connection lost");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn six_retries_finish_within_the_retry_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("start.md");
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let calls = calls.clone();
+            move |_: String, _: Progress| {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) < 6 {
+                        return Err(anyhow!("connection lost"));
+                    }
+                    Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+                }
+            }
+        };
+        let started = tokio::time::Instant::now();
+
+        download_file(&local, "start.md", &sha, "ticket", &gate_wanting("start.md", &sha), fetch).await.unwrap();
+
+        // The waits are 1, 2, 4, 8, 10 and 10 s, and jitter adds up to half of each: 35 s to 52.5 s.
+        let elapsed = started.elapsed();
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert!(elapsed <= Duration::from_secs(53), "six retries took {elapsed:?}");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_tracked_local_edit_is_not_overwritten_by_an_older_download() {
         // The baseline is known, so the edit is kept. A file with no baseline is replaced instead; see `claim_edits`.
@@ -2446,8 +2492,9 @@ mod tests {
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(calls, 3);
-        // Two waits, at least 2 s and 4 s, so a dropped sleep fails here.
-        assert!(started.elapsed() >= Duration::from_secs(6), "elapsed {:?}", started.elapsed());
+        // Two waits, at least BLOB_RETRY_BASE and twice that, so a dropped sleep fails here.
+        let minimum = BLOB_RETRY_BASE * 3;
+        assert!(started.elapsed() >= minimum, "elapsed {:?}", started.elapsed());
         assert_eq!(std::fs::read(&local).unwrap(), bytes);
     }
 }
