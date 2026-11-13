@@ -545,7 +545,7 @@ impl Folder {
         }
         let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
         for path in gone {
-            match self.merge(json!({ "files": { &path: null } })).await {
+            match self.merge(json!({ "files": { &path: { "deleted": true, "ts": now_ms() } } })).await {
                 Ok(()) => {
                     eprintln!("↑ deleted {path}");
                     self.known.remove(&path);
@@ -561,7 +561,7 @@ impl Folder {
             .register(&self.root.join(path), ContentId::new(sha))
             .await
             .map_err(|error| anyhow!("{error}"))?;
-        self.merge(json!({ "files": { path: { "sha256": sha, "ticket": ticket.encode() } } })).await
+        self.merge(json!({ "files": { path: { "sha256": sha, "ticket": ticket.encode(), "ts": now_ms() } } })).await
     }
 
     async fn merge(&self, merge: Value) -> Result<()> {
@@ -583,9 +583,21 @@ impl Folder {
 
     /// Make the disk match the document, for every path the document or `known` names.
     fn apply(&mut self, document: &Value) {
-        let empty = serde_json::Map::new();
-        let files = document.get("files").and_then(Value::as_object).unwrap_or(&empty);
-        let entries: Vec<Entry> = files
+        let view = view_of(document);
+        let tracked: Vec<String> = self
+            .known
+            .keys()
+            .cloned()
+            .chain(self.downloads.gate.wanted_paths())
+            .chain(self.downloads.gate.landed_paths())
+            .collect();
+        let removed = removed_by_tombstone(document, &tracked);
+        // The paths that the view names, plus each tracked path that was not removed. The removal helpers read this map.
+        let mut named = view.clone();
+        for path in tracked.iter().filter(|path| !removed.contains(path)) {
+            named.entry(path.clone()).or_insert(Value::Null);
+        }
+        let entries: Vec<Entry> = view
             .iter()
             .filter_map(|(path, entry)| {
                 let (Some(sha), Some(ticket)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
@@ -597,8 +609,8 @@ impl Folder {
         let consumer = self.consumer.clone();
         self.downloads
             .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
-        self.downloads.prune(files);
-        self.downloads.remove_dropped(files, &mut self.known, |local| std::fs::remove_file(local));
+        self.downloads.prune(&named);
+        self.downloads.remove_dropped(&named, &mut self.known, |local| std::fs::remove_file(local));
     }
 
     /// Take the end of one download. A sha that the document no longer names is dropped.
@@ -622,6 +634,48 @@ impl Folder {
 /// The paths in `tracked` that the document does not name.
 fn unnamed(tracked: Vec<String>, files: &serde_json::Map<String, Value>) -> Vec<String> {
     tracked.into_iter().filter(|path| !files.contains_key(path)).collect()
+}
+
+/// The winning entry of each path across the live slices. An entry is a file or a tombstone (`deleted: true`). The larger
+/// `ts` wins, and a tie goes to the larger author key. An entry with no `ts` counts as 0.
+fn winners_of(document: &Value) -> serde_json::Map<String, Value> {
+    let mut best: HashMap<String, (u64, String, Value)> = HashMap::new();
+    for (author, files) in live_slices(document) {
+        for (path, entry) in files {
+            let ts = entry.get("ts").and_then(Value::as_u64).unwrap_or(0);
+            let beats = best
+                .get(path)
+                .is_none_or(|(old_ts, old_author, _)| (ts, author.as_str()) > (*old_ts, old_author.as_str()));
+            if beats {
+                best.insert(path.clone(), (ts, author.clone(), entry.clone()));
+            }
+        }
+    }
+    best.into_iter().map(|(path, (_, _, entry))| (path, entry)).collect()
+}
+
+/// The files that the document names: the winners that are not tombstones.
+fn view_of(document: &Value) -> serde_json::Map<String, Value> {
+    winners_of(document).into_iter().filter(|(_, entry)| !is_tombstone(entry)).collect()
+}
+
+fn is_tombstone(entry: &Value) -> bool {
+    entry.get("deleted").and_then(Value::as_bool) == Some(true)
+}
+
+/// The author slices that hold a `files` map. A null slice, or one with no `files`, holds no data.
+fn live_slices(document: &Value) -> impl Iterator<Item = (&String, &serde_json::Map<String, Value>)> {
+    document
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(author, slice)| Some((author, slice.get("files")?.as_object()?)))
+}
+
+/// The tracked paths whose winning entry is a tombstone. A path that no live slice lists is kept.
+fn removed_by_tombstone(document: &Value, tracked: &[String]) -> Vec<String> {
+    let winners = winners_of(document);
+    tracked.iter().filter(|path| winners.get(*path).is_some_and(is_tombstone)).cloned().collect()
 }
 
 /// Record a landed file in `known`, so the next reconcile does not fetch it again.
@@ -688,6 +742,11 @@ where
 /// A failed fetch, which keeps the cause chain of its blob error.
 fn fetch_error(error: BlobError) -> anyhow::Error {
     anyhow::Error::new(error)
+}
+
+/// The wall clock in milliseconds since the epoch: the `ts` of an entry.
+fn now_ms() -> u64 {
+    u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The text of a fetch error with its whole chain: each cause follows the one before it after ": ".
@@ -2418,6 +2477,91 @@ mod tests {
         let cause = BlobError::Internal(Box::new(ConnectionLost(io::Error::other("reset by peer"))));
 
         assert_eq!(error_text(&fetch_error(cause)), "connection lost: reset by peer");
+    }
+
+    #[test]
+    fn the_view_of_one_author_key_names_its_files() {
+        let document = serde_json::json!({ "c925": { "files": { "sub/start.md": { "sha256": "a", "ticket": "t" } } } });
+
+        assert!(view_of(&document).contains_key("sub/start.md"), "the view lost the file");
+    }
+
+    #[test]
+    fn two_slices_the_newer_entry_wins() {
+        let document = serde_json::json!({
+            "a": { "files": { "p": { "sha256": "old", "ticket": "t1", "ts": 1 } } },
+            "b": { "files": { "p": { "sha256": "new", "ticket": "t2", "ts": 2 } } },
+        });
+
+        assert_eq!(view_of(&document)["p"]["sha256"], "new");
+    }
+
+    #[test]
+    fn a_path_nobody_tombstoned_is_not_dropped() {
+        let document = serde_json::json!({ "a": { "files": { "q": { "sha256": "y", "ticket": "u", "ts": 1 } } } });
+
+        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn an_empty_slice_is_no_data_and_drops_nothing() {
+        let document = serde_json::json!({ "a": { "files": {} } });
+
+        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn an_author_that_deletes_a_path_drops_it() {
+        let document = serde_json::json!({ "a": { "files": { "p": { "deleted": true, "ts": 2 } } } });
+
+        assert_eq!(removed_by_tombstone(&document, &["p".to_owned()]), vec!["p".to_owned()]);
+    }
+
+    #[test]
+    fn a_null_slice_keeps_its_file() {
+        let document = serde_json::json!({
+            "a": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 1 } } },
+            "b": null,
+        });
+
+        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn an_empty_view_drops_nothing() {
+        let document = serde_json::json!({ "c925": { "files": {} } });
+
+        assert!(removed_by_tombstone(&document, &["sub/start.md".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn a_tombstone_newer_than_a_listing_drops_the_file() {
+        let document = serde_json::json!({
+            "a": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 1 } } },
+            "b": { "files": { "p": { "deleted": true, "ts": 2 } } },
+        });
+
+        assert_eq!(removed_by_tombstone(&document, &["p".to_owned()]), vec!["p".to_owned()]);
+    }
+
+    #[test]
+    fn a_listing_newer_than_a_tombstone_keeps_the_file() {
+        let document = serde_json::json!({
+            "a": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 2 } } },
+            "b": { "files": { "p": { "deleted": true, "ts": 1 } } },
+        });
+
+        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn a_tombstone_older_than_a_listing_keeps_the_file() {
+        let document = serde_json::json!({
+            "a": { "files": { "p": { "deleted": true, "ts": 1 } } },
+            "b": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 2 } } },
+        });
+
+        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
     }
 
     #[test]
