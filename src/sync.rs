@@ -108,6 +108,14 @@ pub async fn run(
             (disk.get(path).map(String::as_str) == Some(sha)).then(|| (path.clone(), sha.to_owned()))
         })
         .collect();
+    // A kept file has no ticket of this run, so it is registered below. Its ts stays, so a restart is not a new edit.
+    let kept: Vec<(String, String, u64)> = known
+        .iter()
+        .map(|(path, sha)| {
+            let ts = own.get(path).and_then(|entry| entry.get("ts")).and_then(Value::as_u64).unwrap_or(0);
+            (path.clone(), sha.clone(), ts)
+        })
+        .collect();
     let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
     let mut folder = Folder {
         root: root.clone(),
@@ -121,7 +129,8 @@ pub async fn run(
         mesh,
         pointers: HashMap::new(),
         own_saved: Vec::new(),
-        index_refused_len: None,
+        index_refused_at: None,
+        own_version: 0,
         indexes: Indexes::default(),
         index_pending: HashSet::new(),
         index_tasks: HashMap::new(),
@@ -135,6 +144,12 @@ pub async fn run(
         index_written: None,
         spool,
     };
+
+    for (path, sha, ts) in kept {
+        if let Err(error) = folder.publish(&path, &sha, ts).await {
+            folder.failed(&format!("kept file {path} failed to register: {error:#}"));
+        }
+    }
 
     // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
     // newer remote version. It is pre-existing, and it is not fixed here.
@@ -207,8 +222,10 @@ struct Folder {
     pointers: HashMap<String, String>,
     /// The saved index as last written, so an idle peer writes nothing.
     own_saved: Vec<u8>,
-    /// The size of the own index that was last refused for the cap, so the refusal is logged once per size.
-    index_refused_len: Option<usize>,
+    /// The `own_version` at which the own index was refused for the cap. It is not serialized again until own changes.
+    index_refused_at: Option<u64>,
+    /// Counts each change to `own`, so a refused index is retried only after a change.
+    own_version: u64,
     /// The ts of the winning entry of each path in the view, which a served copy keeps.
     winner_ts: HashMap<String, u64>,
     /// When the own index was last written. A pointer write waits for `INDEX_INTERVAL` after it.
@@ -628,7 +645,7 @@ impl Folder {
         for path in gone {
             eprintln!("↑ deleted {path}");
             self.own.insert(path.clone(), json!({ "deleted": true, "ts": now_ms() }));
-            self.index_dirty = true;
+            self.own_changed();
             self.known.remove(&path);
             self.status.record("↑", &path, true);
         }
@@ -637,6 +654,11 @@ impl Folder {
     }
 
     /// Log a failed transfer and count it for `status`.
+    fn own_changed(&mut self) {
+        self.index_dirty = true;
+        self.own_version += 1;
+    }
+
     fn failed(&mut self, message: &str) {
         eprintln!("{message}");
         self.status.failed += 1;
@@ -670,14 +692,17 @@ impl Folder {
             .await
             .map_err(|error| anyhow!("{error}"))?;
         self.own.insert(path.to_owned(), json!({ "sha256": sha, "ticket": ticket.encode(), "ts": ts }));
-        self.index_dirty = true;
+        self.own_changed();
         Ok(())
     }
 
     /// Write the own index as one blob, point the own slice at it, and evict the index it replaces. A failure is logged,
     /// and the index stays dirty, so the next tick tries again.
     async fn publish_index(&mut self) {
-        if !self.index_dirty || self.index_written.is_some_and(|at| at.elapsed() < INDEX_INTERVAL) {
+        if !self.index_dirty
+            || self.index_refused_at == Some(self.own_version)
+            || self.index_written.is_some_and(|at| at.elapsed() < INDEX_INTERVAL)
+        {
             return;
         }
         let bytes = match serde_json::to_vec(&self.own) {
@@ -686,8 +711,8 @@ impl Folder {
         };
         if bytes.len() > INDEX_MAX_BYTES {
             // Kept dirty and not truncated: the entries stay, and the log names the size once.
-            if self.index_refused_len != Some(bytes.len()) {
-                self.index_refused_len = Some(bytes.len());
+            if self.index_refused_at != Some(self.own_version) {
+                self.index_refused_at = Some(self.own_version);
                 eprintln!("own index refused: {} bytes is over the {INDEX_MAX_BYTES}-byte cap", bytes.len());
             }
             return;
@@ -824,9 +849,7 @@ impl Folder {
         let view = view_of(document, &self.indexes);
         self.winner_ts = view
             .iter()
-            .map(|(path, entry)| {
-                (path.clone(), clamp_ts(entry.get("ts").and_then(Value::as_u64).unwrap_or(0), now_ms()))
-            })
+            .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
             .collect();
         let tracked: Vec<String> = self
             .known
@@ -842,7 +865,7 @@ impl Folder {
                 && self.own.get(path) != Some(tombstone)
             {
                 self.own.insert(path.clone(), tombstone.clone());
-                self.index_dirty = true;
+                self.own_changed();
             }
         }
         // The paths that the view names, plus each tracked path that was not removed. The removal helpers read this map.
@@ -998,10 +1021,8 @@ fn load_saved(bytes: &[u8], mesh: &str) -> BTreeMap<String, Value> {
     saved.get("own").cloned().and_then(|own| serde_json::from_value(own).ok()).unwrap_or_default()
 }
 
-/// A remote ts, held to `now` plus ten minutes, so a clock far ahead cannot win every path. The limit is in the commit.
-fn clamp_ts(ts: u64, now: u64) -> u64 {
-    ts.min(now + 10 * 60 * 1000)
-}
+/// How far a remote ts may run ahead of the local clock. An entry past it is ignored until the clock reaches it.
+const TS_REACH: u64 = 10 * 60 * 1000;
 
 /// Whether `sha` is the pointer that `author` has now.
 fn current_pointer(pointers: &HashMap<String, String>, author: &str, sha: &str) -> bool {
@@ -1090,9 +1111,13 @@ fn live_slices<'a>(
 /// `ts` wins, and a tie goes to the larger author key. An entry with no `ts` counts as 0.
 fn winners_of(document: &Value, indexes: &Indexes) -> serde_json::Map<String, Value> {
     let mut best: HashMap<String, (u64, String, Value)> = HashMap::new();
+    let reach = now_ms() + TS_REACH;
     for (author, entries) in live_slices(document, indexes) {
         for (path, entry) in entries {
-            let ts = clamp_ts(entry.get("ts").and_then(Value::as_u64).unwrap_or(0), now_ms());
+            let ts = entry.get("ts").and_then(Value::as_u64).unwrap_or(0);
+            if ts > reach {
+                continue;
+            }
             let beats = best
                 .get(path)
                 .is_none_or(|(old_ts, old_author, _)| (ts, author.as_str()) > (*old_ts, old_author.as_str()));
@@ -2979,10 +3004,31 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_ts_far_ahead_is_clamped() {
-        let now = 1_000_000;
+    fn a_ts_far_ahead_does_not_beat_a_later_honest_edit() {
+        let now = now_ms();
+        let (document, indexes) = pointed(&[
+            ("bad", serde_json::json!({ "p": { "sha256": "bad", "ticket": "t1", "ts": u64::MAX } })),
+            ("good", serde_json::json!({ "p": { "sha256": "good", "ticket": "t2", "ts": now } })),
+        ]);
 
-        assert_eq!(clamp_ts(now + 3_600_000, now), now + 600_000);
+        assert_eq!(view_of(&document, &indexes)["p"]["sha256"], "good");
+    }
+
+    #[test]
+    fn the_order_of_ts_is_the_same_on_every_peer() {
+        let now = now_ms();
+        let minute = 60_000;
+        let (document, indexes) = pointed(&[
+            ("a", serde_json::json!({ "p": { "sha256": "early", "ticket": "t1", "ts": now + 8 * minute } })),
+            ("b", serde_json::json!({ "p": { "sha256": "late", "ticket": "t2", "ts": now + 9 * minute } })),
+        ]);
+        assert_eq!(view_of(&document, &indexes)["p"]["sha256"], "late");
+
+        let (document, indexes) = pointed(&[
+            ("a", serde_json::json!({ "p": { "sha256": "a", "ticket": "t1", "ts": now + 30 * minute } })),
+            ("b", serde_json::json!({ "p": { "sha256": "b", "ticket": "t2", "ts": now + 20 * minute } })),
+        ]);
+        assert!(view_of(&document, &indexes).get("p").is_none(), "an entry past the reach must not win");
     }
 
     #[test]
