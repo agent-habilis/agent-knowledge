@@ -1,9 +1,11 @@
 //! Two-way live sync of one folder with every other member of a mesh.
 //!
-//! The mesh `state` document is the file list: `{"files": {"<rel/path>": {"sha256", "ticket"}}}`.
-//! It is an automerge CRDT, so concurrent writes from both sides merge, and the last write to one
-//! path wins. File bytes do not fit in a gossip frame, so each entry holds a blob ticket that a
-//! peer redeems against the author's blob server.
+//! The mesh `state` document holds one slice per author. Each slice is a pointer to that author's
+//! index blob, `{"index": {"ticket", "sha256", "ts"}}`. An index is a map from path to an entry:
+//! `{"sha256", "ticket", "ts"}` for a file, or `{"deleted": true, "ts"}` for a delete. The entry with
+//! the larger `ts` wins a path, and a winning tombstone removes the local copy. File bytes do not fit
+//! in a gossip frame, so each entry holds a blob ticket that a peer redeems against the author's
+//! blob server.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -94,22 +96,32 @@ pub async fn run(
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
-    let saved = std::fs::read(root.join(INDEX_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, Value>>(&bytes).ok())
-        .unwrap_or_default();
+    let mesh = ready.mesh.clone();
+    let saved = std::fs::read(root.join(INDEX_FILE)).ok().map(|bytes| load_saved(&bytes, &mesh)).unwrap_or_default();
     let disk = scan::scan(&root).unwrap_or_default();
     let own = own_after_restart(saved, &disk, now_ms());
+    // A disk file whose sha is its saved entry is not an edit made while stopped, so it is not published again.
+    let known: HashMap<String, String> = own
+        .iter()
+        .filter_map(|(path, entry)| {
+            let sha = entry.get("sha256")?.as_str()?;
+            (disk.get(path).map(String::as_str) == Some(sha)).then(|| (path.clone(), sha.to_owned()))
+        })
+        .collect();
     let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
     let mut folder = Folder {
         root: root.clone(),
         member,
         blobs,
-        known: HashMap::new(),
+        known,
         downloads: Downloads::new(root, done),
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
+        mesh,
+        pointers: HashMap::new(),
+        own_saved: Vec::new(),
+        index_refused_len: None,
         indexes: Indexes::default(),
         index_pending: HashSet::new(),
         index_tasks: HashMap::new(),
@@ -154,6 +166,9 @@ pub async fn run(
         folder.publish_index().await;
         folder.write_status().await;
     }
+    for (_, (_, handle)) in folder.index_tasks.drain() {
+        handle.abort();
+    }
     folder.save_own();
     folder.downloads.abort_all();
     folder.consumer.shutdown().await;
@@ -186,6 +201,14 @@ struct Folder {
     index_sha: Option<String>,
     index_dirty: bool,
     index_version: u64,
+    /// The mesh this peer is in, which its saved index is bound to.
+    mesh: String,
+    /// The pointer that each author's slice had when the document was last read.
+    pointers: HashMap<String, String>,
+    /// The saved index as last written, so an idle peer writes nothing.
+    own_saved: Vec<u8>,
+    /// The size of the own index that was last refused for the cap, so the refusal is logged once per size.
+    index_refused_len: Option<usize>,
     /// The ts of the winning entry of each path in the view, which a served copy keeps.
     winner_ts: HashMap<String, u64>,
     /// When the own index was last written. A pointer write waits for `INDEX_INTERVAL` after it.
@@ -662,9 +685,12 @@ impl Folder {
             Err(error) => return self.failed(&format!("own index failed to serialize: {error}")),
         };
         if bytes.len() > INDEX_MAX_BYTES {
-            self.index_dirty = false;
-            return self
-                .failed(&format!("own index refused: {} bytes is over the {INDEX_MAX_BYTES}-byte cap", bytes.len()));
+            // Kept dirty and not truncated: the entries stay, and the log names the size once.
+            if self.index_refused_len != Some(bytes.len()) {
+                self.index_refused_len = Some(bytes.len());
+                eprintln!("own index refused: {} bytes is over the {INDEX_MAX_BYTES}-byte cap", bytes.len());
+            }
+            return;
         }
         let sha = sha256_bytes(&bytes);
         self.index_version += 1;
@@ -696,21 +722,33 @@ impl Folder {
     }
 
     /// Keep the own entries in the hidden index file, so a restart keeps its tombstones. A failure is logged only.
-    fn save_own(&self) {
+    fn save_own(&mut self) {
+        let bytes = match serde_json::to_vec(&json!({ "mesh": self.mesh, "own": self.own })) {
+            Ok(bytes) => bytes,
+            Err(error) => return eprintln!("own index not kept for a restart: {error}"),
+        };
+        if bytes == self.own_saved {
+            return;
+        }
         let temp = self.root.join(format!("{INDEX_FILE}.tmp"));
-        let saved = serde_json::to_vec(&self.own).map_err(anyhow::Error::from).and_then(|bytes| {
-            std::fs::write(&temp, bytes)?;
-            std::fs::rename(&temp, self.root.join(INDEX_FILE))?;
-            Ok(())
-        });
-        if let Err(error) = saved {
-            eprintln!("own index not kept for a restart: {error:#}");
+        let saved = std::fs::write(&temp, &bytes).and_then(|()| std::fs::rename(&temp, self.root.join(INDEX_FILE)));
+        match saved {
+            Ok(()) => self.own_saved = bytes,
+            Err(error) => eprintln!("own index not kept for a restart: {error}"),
         }
     }
 
     /// Fetch the index of each author whose pointer is new. Until it lands, the author contributes no entries, so no
     /// file it lists is dropped.
     fn fetch_indexes(&mut self, document: &Value) {
+        self.pointers = document
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(author, slice)| {
+                Some((author.clone(), slice.get("index")?.get("sha256")?.as_str()?.to_owned()))
+            })
+            .collect();
         let running: HashMap<String, String> =
             self.index_tasks.iter().map(|(a, (sha, _))| (a.clone(), sha.clone())).collect();
         let (starts, cancels) = fetch_plan(document, &self.indexes, &running);
@@ -739,10 +777,12 @@ impl Folder {
             self.index_tasks.remove(&done.author);
         }
         match done.result {
-            Ok(entries) => {
+            Ok(entries) if current_pointer(&self.pointers, &done.author, &done.sha) => {
                 self.indexes.0.insert(done.author, (done.sha, entries));
                 self.reconcile().await;
             }
+            // The pointer moved on, and the fetch of the newer pointer is the one that lands.
+            Ok(_) => {}
             Err(error) => self.failed(&format!("index of {} failed: {error}", done.author)),
         }
     }
@@ -784,7 +824,9 @@ impl Folder {
         let view = view_of(document, &self.indexes);
         self.winner_ts = view
             .iter()
-            .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
+            .map(|(path, entry)| {
+                (path.clone(), clamp_ts(entry.get("ts").and_then(Value::as_u64).unwrap_or(0), now_ms()))
+            })
             .collect();
         let tracked: Vec<String> = self
             .known
@@ -794,6 +836,15 @@ impl Folder {
             .chain(self.downloads.gate.landed_paths())
             .collect();
         let removed = removed_by_tombstone(document, &self.indexes, &tracked);
+        let winners = winners_of(document, &self.indexes);
+        for path in &removed {
+            if let Some(tombstone) = winners.get(path)
+                && self.own.get(path) != Some(tombstone)
+            {
+                self.own.insert(path.clone(), tombstone.clone());
+                self.index_dirty = true;
+            }
+        }
         // The paths that the view names, plus each tracked path that was not removed. The removal helpers read this map.
         let mut named = view.clone();
         for path in tracked.iter().filter(|path| !removed.contains(path)) {
@@ -936,6 +987,27 @@ fn own_after_restart(
         .collect()
 }
 
+/// The own entries in a saved index file, when it belongs to `mesh`. A file of another mesh is ignored.
+fn load_saved(bytes: &[u8], mesh: &str) -> BTreeMap<String, Value> {
+    let Ok(Value::Object(saved)) = serde_json::from_slice::<Value>(bytes) else {
+        return BTreeMap::new();
+    };
+    if saved.get("mesh").and_then(Value::as_str) != Some(mesh) {
+        return BTreeMap::new();
+    }
+    saved.get("own").cloned().and_then(|own| serde_json::from_value(own).ok()).unwrap_or_default()
+}
+
+/// A remote ts, held to `now` plus ten minutes, so a clock far ahead cannot win every path. The limit is in the commit.
+fn clamp_ts(ts: u64, now: u64) -> u64 {
+    ts.min(now + 10 * 60 * 1000)
+}
+
+/// Whether `sha` is the pointer that `author` has now.
+fn current_pointer(pointers: &HashMap<String, String>, author: &str, sha: &str) -> bool {
+    pointers.get(author).is_some_and(|current| current == sha)
+}
+
 /// The own index is kept here between runs, as a hidden file, which the scan skips.
 const INDEX_FILE: &str = ".agent-knowledge-index.json";
 
@@ -1020,7 +1092,7 @@ fn winners_of(document: &Value, indexes: &Indexes) -> serde_json::Map<String, Va
     let mut best: HashMap<String, (u64, String, Value)> = HashMap::new();
     for (author, entries) in live_slices(document, indexes) {
         for (path, entry) in entries {
-            let ts = entry.get("ts").and_then(Value::as_u64).unwrap_or(0);
+            let ts = clamp_ts(entry.get("ts").and_then(Value::as_u64).unwrap_or(0), now_ms());
             let beats = best
                 .get(path)
                 .is_none_or(|(old_ts, old_author, _)| (ts, author.as_str()) > (*old_ts, old_author.as_str()));
@@ -2897,6 +2969,27 @@ mod tests {
 
         downloads.remove_dropped(&serde_json::Map::new(), &mut HashMap::new(), |local| std::fs::remove_file(local));
         assert!(dir.path().join(INDEX_FILE).exists(), "the index file was removed");
+    }
+
+    #[test]
+    fn a_saved_index_of_another_mesh_is_ignored() {
+        let bytes = br#"{"mesh":"other","own":{"a.md":{"deleted":true,"ts":5}}}"#;
+
+        assert!(load_saved(bytes, "this").is_empty());
+    }
+
+    #[test]
+    fn a_remote_ts_far_ahead_is_clamped() {
+        let now = 1_000_000;
+
+        assert_eq!(clamp_ts(now + 3_600_000, now), now + 600_000);
+    }
+
+    #[test]
+    fn an_index_that_is_no_longer_the_pointer_is_not_cached() {
+        let pointers = HashMap::from([("a".to_owned(), "new".to_owned())]);
+
+        assert!(!current_pointer(&pointers, "a", "old"));
     }
 
     #[test]
