@@ -685,6 +685,11 @@ where
     Ok(())
 }
 
+/// A failed fetch, which keeps the cause chain of its blob error.
+fn fetch_error(error: BlobError) -> anyhow::Error {
+    anyhow::Error::new(error)
+}
+
 /// The text of a fetch error with its whole chain: each cause follows the one before it after ": ".
 fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}")
@@ -919,9 +924,8 @@ async fn close_when_idle<E: Closable>(endpoint: E, leases: Arc<AtomicUsize>) {
 
 async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress: Progress) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
-    let lease = consumer
-        .get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(|error| anyhow!("{error}")) })
-        .await?;
+    let lease =
+        consumer.get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(anyhow::Error::new) }).await?;
     let mut bytes = Collected { bytes: Vec::new(), progress };
     let lookups = blob_lookups();
     let build = || {
@@ -939,7 +943,7 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress:
             );
             Err(anyhow!("blob handshake stalled"))
         }
-        Err(error) => Err(anyhow::Error::new(error)),
+        Err(error) => Err(fetch_error(error)),
     }
 }
 
@@ -2392,6 +2396,28 @@ mod tests {
         downloads.remove_dropped(&serde_json::Map::new(), &mut known, |local| std::fs::remove_file(local));
         assert!(!dir.path().join("gone.md").exists(), "the retry did not remove the file");
         assert!(known.is_empty());
+    }
+
+    #[derive(Debug)]
+    struct ConnectionLost(io::Error);
+
+    impl std::fmt::Display for ConnectionLost {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("connection lost")
+        }
+    }
+
+    impl std::error::Error for ConnectionLost {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn a_blob_error_keeps_its_cause_when_it_is_a_fetch_error() {
+        let cause = BlobError::Internal(Box::new(ConnectionLost(io::Error::other("reset by peer"))));
+
+        assert_eq!(error_text(&fetch_error(cause)), "connection lost: reset by peer");
     }
 
     #[test]
