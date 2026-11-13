@@ -67,9 +67,9 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
    - the `📚 joined as <nick>` line, as printed,
    - where the folder is mounted, and how many files have arrived so far,
    - that edits on either side sync within a few seconds, deletes included,
-   - that the mount keeps running in the background, and how to stop it (stop
-     the background task, or `kill <pid>`). Stopping leaves the
-     files in place; it only stops syncing.
+   - that the mount keeps running in the background, and how to stop it:
+     /knowledge-unmount (agent form). It leaves the mesh and keeps the files in
+     place; they only stop syncing.
 
 7. **Relay join and leave notices.** While the mount runs, the process prints
    `📚 <nick> joined` and `📚 <nick> left` on stdout as peers come and go.

@@ -7,6 +7,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
@@ -77,6 +78,34 @@ pub fn current(dir: &Path, session: &str) -> anyhow::Result<Option<Memory>> {
     Ok(read_entry(&entry_path(dir, session))?.filter(|memory| is_alive(memory.pid)))
 }
 
+/// Ask `memory`, the running memory of `session`, to stop, and wait up to `within` for it to go.
+/// Returns whether it went in time.
+///
+/// The memory treats SIGINT as Ctrl-C: it leaves the mesh, then drops its [`Claim`]. So it has
+/// gone once the entry no longer names its pid. That also holds while a dead process waits for
+/// its parent to reap it, which `kill -0` would still count as alive.
+pub fn stop(dir: &Path, session: &str, memory: &Memory, within: Duration) -> anyhow::Result<bool> {
+    // pid 0 would signal this whole process group.
+    if memory.pid == 0 || !kill(&["-INT", &memory.pid.to_string()]) {
+        bail!("cannot signal pid {}", memory.pid);
+    }
+    let path = entry_path(dir, session);
+    let deadline = Instant::now() + within;
+    loop {
+        let ours = matches!(read_entry(&path)?, Some(entry) if entry.pid == memory.pid);
+        if !ours || !is_alive(memory.pid) {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(STOP_POLL);
+    }
+}
+
+/// How often [`stop`] checks whether the memory has gone.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
 /// The registry entry of a running memory. Dropping it removes the entry.
 #[derive(Debug)]
 pub struct Claim {
@@ -146,10 +175,10 @@ fn parse_entry(text: &str) -> anyhow::Result<Memory> {
 /// Whether a process with `pid` exists. `kill -0` sends no signal; it only checks.
 fn is_alive(pid: u32) -> bool {
     // pid 0 would address the whole process group, not one process.
-    pid != 0
-        && Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+    pid != 0 && kill(&["-0", &pid.to_string()])
+}
+
+/// Run `kill <args>` and return whether it succeeded.
+fn kill(args: &[&str]) -> bool {
+    Command::new("kill").args(args).stderr(Stdio::null()).status().is_ok_and(|status| status.success())
 }

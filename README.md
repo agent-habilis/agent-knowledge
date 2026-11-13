@@ -1,3 +1,4 @@
+| `/knowledge-unmount` | Runs `unmount`: the session's share or mount leaves the mesh, and its files stay. Errors if there is none. |
 # agent-knowledge
 
 Share a folder with live two-way sync over
@@ -8,7 +9,20 @@ agent-knowledge share <folder> [--nickname <nick>]          # prints a hash
 agent-knowledge mount <hash> <target> [--nickname <nick>]   # keeps <target> in sync with <folder>
 agent-knowledge plug                                        # installs the skills into Claude Code, Codex, and Pi
 agent-knowledge status                                      # prints this session's memory bank folder
+agent-knowledge unmount                                     # stops this session's share or mount; keeps the files
 ```
+
+### Unmount
+
+`agent-knowledge unmount` stops the share or mount of this session (see One
+memory per session). The process leaves the mesh, so the other peers print
+`📚 <nick> left`, then exits and removes its registry entry. The folder and its
+files stay; they only stop syncing. It prints
+`📚 left the <kind> at <folder>; files kept`, or fails if the session runs no
+memory or the memory does not stop within 15 seconds.
+
+Ctrl-C and `kill <pid>` (SIGINT or SIGTERM) stop it the same clean way. Only
+`kill -9` skips the leave.
 
 ### Nicknames and notices
 
@@ -52,7 +66,7 @@ recorded in `~/.agent-knowledge/sessions/<session>.json` (or under
 The table uses the Claude Code form. In Codex, a skill command starts with `$`
 (`$knowledge-share`). In Pi, it starts with `/skill:` (`/skill:knowledge-share`).
 
-`plug` writes the 4 skills into each agent that it finds on this machine, and
+`plug` writes the 5 skills into each agent that it finds on this machine, and
 replaces older copies:
 
 | Agent | Skills folder | Override | Skill command |
@@ -137,11 +151,12 @@ cargo test --workspace --no-fail-fast                                    # test
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
 - `tests/presence.rs` starts 2 peers with nicknames. The first peer must see the second join, then leave. It also checks the random nickname, a refused nickname, and the 📚 line format.
 - `tests/relay_only.rs` blocks every direct path, so 2 peers sync only through the public relay. It needs internet access.
+- `tests/unmount.rs` runs the binary: `unmount` and a plain SIGTERM each stop a `share` cleanly (exit 0, registry entry gone, files kept), and `unmount` with no memory fails.
 
 ### Code map
 
-- `src/main.rs`: the CLI, with the `share`, `mount`, and `plug` commands.
-- `src/memory.rs`: the one-memory-per-session registry behind `share`, `mount`, and `status`.
+- `src/main.rs`: the CLI, with the `share`, `mount`, `plug`, `status`, and `unmount` commands.
+- `src/memory.rs`: the one-memory-per-session registry behind `share`, `mount`, `status`, and `unmount`.
 - `src/plug.rs`: embeds `src/skills/*/SKILL.md` in the binary and writes them to an agent's skills folder.
 - `src/skills/`: the skills that `plug` installs. Edit them here, then rebuild.
 - `src/sync.rs`: the sync loop. Both commands run it.

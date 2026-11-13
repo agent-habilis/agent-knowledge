@@ -14,9 +14,9 @@ Use only `agent-knowledge share <folder>` and
 `agent-knowledge mount <hash> <target>`. If the binary is unavailable, use
 `cargo run -- share <folder>` or `cargo run -- mount <hash> <target>` from the
 agent-knowledge repository if buildable; otherwise explain the prerequisite.
-There are no dry-run, exclude, read-only, or unmount commands or flags.
+There are no dry-run, exclude, or read-only commands or flags. `agent-knowledge unmount` stops the session's share or mount and keeps the files.
 
-Both commands run until Ctrl-C and sync edits and deletions in both directions.
+Both commands run until Ctrl-C, `kill`, or `unmount`, and sync edits and deletions in both directions.
 The hash is a mesh identifier, not an immutable content digest. Keep the process
 in a managed terminal/session and report how to stop it; never silently detach
 it. An identifier or `mounted at` message announces mesh readiness before file

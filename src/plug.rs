@@ -16,6 +16,7 @@ pub const SKILLS: &[Skill] = &[
     Skill { name: "knowledge-mount", body: include_str!("skills/knowledge-mount/SKILL.md") },
     Skill { name: "knowledge-write", body: include_str!("skills/knowledge-write/SKILL.md") },
     Skill { name: "knowledge-read", body: include_str!("skills/knowledge-read/SKILL.md") },
+    Skill { name: "knowledge-unmount", body: include_str!("skills/knowledge-unmount/SKILL.md") },
 ];
 
 /// A coding agent that loads `SKILL.md` skills from a user-level folder.
