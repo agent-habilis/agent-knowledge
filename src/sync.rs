@@ -5,7 +5,7 @@
 //! path wins. File bytes do not fit in a gossip frame, so each entry holds a blob ticket that a
 //! peer redeems against the author's blob server.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -92,6 +92,7 @@ pub async fn run(
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
+    let (index_tx, mut index_done) = mpsc::unbounded_channel();
     let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
     let mut folder = Folder {
         root: root.clone(),
@@ -102,6 +103,13 @@ pub async fn run(
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
+        indexes: Indexes::default(),
+        index_pending: HashSet::new(),
+        index_tx,
+        own: BTreeMap::new(),
+        index_sha: None,
+        index_dirty: false,
+        index_version: 0,
     };
 
     // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
@@ -128,8 +136,10 @@ pub async fn run(
                 }
             }
             Some(done) = finished.recv() => folder.finish(done).await,
+            Some(done) = index_done.recv() => folder.index_done(done).await,
             _ = every.tick() => folder.reconcile().await,
         }
+        folder.publish_index().await;
         folder.write_status().await;
     }
     folder.downloads.abort_all();
@@ -150,6 +160,17 @@ struct Folder {
     /// What `agent-knowledge status` shows, kept up to date as the folder syncs.
     status: Status,
     status_file: Option<PathBuf>,
+    /// The entries of each author's fetched index.
+    indexes: Indexes,
+    /// The index fetches under way, by author and sha256, so each one starts once.
+    index_pending: HashSet<(String, String)>,
+    index_tx: mpsc::UnboundedSender<IndexDone>,
+    /// This peer's own entries: one per file it publishes, and a tombstone per file it deleted.
+    own: BTreeMap<String, Value>,
+    /// The sha256 of the own index now published, and whether the own index changed since.
+    index_sha: Option<String>,
+    index_dirty: bool,
+    index_version: u64,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -561,15 +582,13 @@ impl Folder {
         }
         let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
         for path in gone {
-            match self.merge(json!({ "files": { &path: { "deleted": true, "ts": now_ms() } } })).await {
-                Ok(()) => {
-                    eprintln!("↑ deleted {path}");
-                    self.known.remove(&path);
-                    self.status.record("↑", &path, true);
-                }
-                Err(error) => self.failed(&format!("delete {path} failed: {error:#}")),
-            }
+            eprintln!("↑ deleted {path}");
+            self.own.insert(path.clone(), json!({ "deleted": true, "ts": now_ms() }));
+            self.index_dirty = true;
+            self.known.remove(&path);
+            self.status.record("↑", &path, true);
         }
+        self.publish_index().await;
     }
 
     /// Log a failed transfer and count it for `status`.
@@ -599,13 +618,84 @@ impl Folder {
         }
     }
 
-    async fn publish(&self, path: &str, sha: &str) -> Result<()> {
+    async fn publish(&mut self, path: &str, sha: &str) -> Result<()> {
         let ticket = self
             .blobs
             .register(&self.root.join(path), ContentId::new(sha))
             .await
             .map_err(|error| anyhow!("{error}"))?;
-        self.merge(json!({ "files": { path: { "sha256": sha, "ticket": ticket.encode(), "ts": now_ms() } } })).await
+        self.own.insert(path.to_owned(), json!({ "sha256": sha, "ticket": ticket.encode(), "ts": now_ms() }));
+        self.index_dirty = true;
+        Ok(())
+    }
+
+    /// Write the own index as one blob, point the own slice at it, and evict the index it replaces. A failure is logged,
+    /// and the index stays dirty, so the next tick tries again.
+    async fn publish_index(&mut self) {
+        if !self.index_dirty {
+            return;
+        }
+        let bytes = match serde_json::to_vec(&self.own) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.failed(&format!("own index failed to serialize: {error}")),
+        };
+        if bytes.len() > INDEX_MAX_BYTES {
+            self.index_dirty = false;
+            return self
+                .failed(&format!("own index refused: {} bytes is over the {INDEX_MAX_BYTES}-byte cap", bytes.len()));
+        }
+        let sha = sha256_bytes(&bytes);
+        self.index_version += 1;
+        // A unique name per version, never edited in place. The spool keeps its own link, so this copy goes.
+        let spool = spool_dir();
+        let temp = spool.join(format!("index-{}-{}.json", std::process::id(), self.index_version));
+        let registered = match std::fs::create_dir_all(&spool).and_then(|()| std::fs::write(&temp, &bytes)) {
+            Ok(()) => self.blobs.register(&temp, ContentId::new(&sha)).await.map_err(|error| anyhow!("{error}")),
+            Err(error) => Err(error.into()),
+        };
+        let _ = std::fs::remove_file(&temp);
+        let ticket = match registered {
+            Ok(ticket) => ticket,
+            Err(error) => return self.failed(&format!("own index blob failed, will retry: {error:#}")),
+        };
+        match self.merge(json!({ "index": { "ticket": ticket.encode(), "sha256": sha, "ts": now_ms() } })).await {
+            Ok(()) => {
+                self.index_dirty = false;
+                if let Some(previous) = self.index_sha.replace(sha.clone())
+                    && previous != sha
+                {
+                    let _ = self.blobs.evict_content(&ContentId::new(&previous)).await;
+                }
+            }
+            Err(error) => self.failed(&format!("own index pointer failed, will retry: {error:#}")),
+        }
+    }
+
+    /// Fetch the index of each author whose pointer is new. Until it lands, the author contributes no entries, so no
+    /// file it lists is dropped.
+    fn fetch_indexes(&mut self, document: &Value) {
+        for (author, ticket, sha) in pointers_to_fetch(document, &self.indexes) {
+            if !self.index_pending.insert((author.clone(), sha.clone())) {
+                continue;
+            }
+            let (consumer, tx) = (self.consumer.clone(), self.index_tx.clone());
+            tokio::spawn(async move {
+                let result = fetch_index(consumer, &ticket, &sha).await.map_err(|error| format!("{error:#}"));
+                let _ = tx.send(IndexDone { author, sha, result });
+            });
+        }
+    }
+
+    /// Take the end of one index fetch. A landed index is cached, and the view is read again. A failed one is logged.
+    async fn index_done(&mut self, done: IndexDone) {
+        self.index_pending.remove(&(done.author.clone(), done.sha.clone()));
+        match done.result {
+            Ok(entries) => {
+                self.indexes.0.insert(done.author, (done.sha, entries));
+                self.reconcile().await;
+            }
+            Err(error) => self.failed(&format!("index of {} failed: {error}", done.author)),
+        }
     }
 
     async fn merge(&self, merge: Value) -> Result<()> {
@@ -621,6 +711,7 @@ impl Folder {
             return;
         };
         if let Ok(document) = serde_json::from_str::<Value>(&text) {
+            self.fetch_indexes(&document);
             self.apply(&document);
             self.status.synced_at = Some(status::now());
         }
@@ -628,7 +719,7 @@ impl Folder {
 
     /// Make the disk match the document, for every path the document or `known` names.
     fn apply(&mut self, document: &Value) {
-        let view = view_of(document);
+        let view = view_of(document, &self.indexes);
         let tracked: Vec<String> = self
             .known
             .keys()
@@ -636,7 +727,7 @@ impl Folder {
             .chain(self.downloads.gate.wanted_paths())
             .chain(self.downloads.gate.landed_paths())
             .collect();
-        let removed = removed_by_tombstone(document, &tracked);
+        let removed = removed_by_tombstone(document, &self.indexes, &tracked);
         // The paths that the view names, plus each tracked path that was not removed. The removal helpers read this map.
         let mut named = view.clone();
         for path in tracked.iter().filter(|path| !removed.contains(path)) {
@@ -686,48 +777,6 @@ impl Folder {
 /// The paths in `tracked` that the document does not name.
 fn unnamed(tracked: Vec<String>, files: &serde_json::Map<String, Value>) -> Vec<String> {
     tracked.into_iter().filter(|path| !files.contains_key(path)).collect()
-}
-
-/// The winning entry of each path across the live slices. An entry is a file or a tombstone (`deleted: true`). The larger
-/// `ts` wins, and a tie goes to the larger author key. An entry with no `ts` counts as 0.
-fn winners_of(document: &Value) -> serde_json::Map<String, Value> {
-    let mut best: HashMap<String, (u64, String, Value)> = HashMap::new();
-    for (author, files) in live_slices(document) {
-        for (path, entry) in files {
-            let ts = entry.get("ts").and_then(Value::as_u64).unwrap_or(0);
-            let beats = best
-                .get(path)
-                .is_none_or(|(old_ts, old_author, _)| (ts, author.as_str()) > (*old_ts, old_author.as_str()));
-            if beats {
-                best.insert(path.clone(), (ts, author.clone(), entry.clone()));
-            }
-        }
-    }
-    best.into_iter().map(|(path, (_, _, entry))| (path, entry)).collect()
-}
-
-/// The files that the document names: the winners that are not tombstones.
-fn view_of(document: &Value) -> serde_json::Map<String, Value> {
-    winners_of(document).into_iter().filter(|(_, entry)| !is_tombstone(entry)).collect()
-}
-
-fn is_tombstone(entry: &Value) -> bool {
-    entry.get("deleted").and_then(Value::as_bool) == Some(true)
-}
-
-/// The author slices that hold a `files` map. A null slice, or one with no `files`, holds no data.
-fn live_slices(document: &Value) -> impl Iterator<Item = (&String, &serde_json::Map<String, Value>)> {
-    document
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(author, slice)| Some((author, slice.get("files")?.as_object()?)))
-}
-
-/// The tracked paths whose winning entry is a tombstone. A path that no live slice lists is kept.
-fn removed_by_tombstone(document: &Value, tracked: &[String]) -> Vec<String> {
-    let winners = winners_of(document);
-    tracked.iter().filter(|path| winners.get(*path).is_some_and(is_tombstone)).cloned().collect()
 }
 
 /// Record a landed file in `known`, so the next reconcile does not fetch it again.
@@ -794,6 +843,121 @@ where
 /// A failed fetch, which keeps the cause chain of its blob error.
 fn fetch_error(error: BlobError) -> anyhow::Error {
     anyhow::Error::new(error)
+}
+
+/// The largest index blob that is fetched or published. A larger one is refused with an error, never truncated.
+const INDEX_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// How many times an index fetch is retried before it is given up for now. The pointer stays, so it is tried again.
+const INDEX_ATTEMPTS: u32 = 6;
+
+/// The entries of each author's index, with the sha256 of the index they came from.
+#[derive(Default)]
+struct Indexes(HashMap<String, (String, serde_json::Map<String, Value>)>);
+
+/// The index that an author's own slice points at, as (author, ticket, sha256), when it is not fetched yet.
+fn pointers_to_fetch(document: &Value, indexes: &Indexes) -> Vec<(String, String, String)> {
+    document
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(author, slice)| {
+            let pointer = slice.get("index")?;
+            let (ticket, sha) = (pointer.get("ticket")?.as_str()?, pointer.get("sha256")?.as_str()?);
+            let fetched = indexes.0.get(author).is_some_and(|(fetched, _)| fetched == sha);
+            (!fetched).then(|| (author.clone(), ticket.to_owned(), sha.to_owned()))
+        })
+        .collect()
+}
+
+/// The entries of an index blob, checked against its sha256 and the cap.
+fn check_index(bytes: &[u8], sha: &str) -> Result<serde_json::Map<String, Value>> {
+    if bytes.len() > INDEX_MAX_BYTES {
+        bail!("index refused: {} bytes is over the {INDEX_MAX_BYTES}-byte cap", bytes.len());
+    }
+    if sha256_bytes(bytes) != sha {
+        bail!("index refused: its content does not match its sha256");
+    }
+    match serde_json::from_slice::<Value>(bytes)? {
+        Value::Object(entries) => Ok(entries),
+        _ => bail!("index refused: it is not an object"),
+    }
+}
+
+/// The entries of each author slice whose index is fetched and matches the pointer. A slice with no fetched index
+/// holds no data.
+fn live_slices<'a>(
+    document: &'a Value,
+    indexes: &'a Indexes,
+) -> impl Iterator<Item = (&'a String, &'a serde_json::Map<String, Value>)> + 'a {
+    document.as_object().into_iter().flatten().filter_map(move |(author, slice)| {
+        let pointer = slice.get("index")?.get("sha256")?.as_str()?;
+        let (fetched, entries) = indexes.0.get(author)?;
+        (fetched == pointer).then_some((author, entries))
+    })
+}
+
+/// The winning entry of each path across the live slices. An entry is a file or a tombstone (`deleted: true`). The larger
+/// `ts` wins, and a tie goes to the larger author key. An entry with no `ts` counts as 0.
+fn winners_of(document: &Value, indexes: &Indexes) -> serde_json::Map<String, Value> {
+    let mut best: HashMap<String, (u64, String, Value)> = HashMap::new();
+    for (author, entries) in live_slices(document, indexes) {
+        for (path, entry) in entries {
+            let ts = entry.get("ts").and_then(Value::as_u64).unwrap_or(0);
+            let beats = best
+                .get(path)
+                .is_none_or(|(old_ts, old_author, _)| (ts, author.as_str()) > (*old_ts, old_author.as_str()));
+            if beats {
+                best.insert(path.clone(), (ts, author.clone(), entry.clone()));
+            }
+        }
+    }
+    best.into_iter().map(|(path, (_, _, entry))| (path, entry)).collect()
+}
+
+/// The files that the document names: the winners that are not tombstones.
+fn view_of(document: &Value, indexes: &Indexes) -> serde_json::Map<String, Value> {
+    winners_of(document, indexes).into_iter().filter(|(_, entry)| !is_tombstone(entry)).collect()
+}
+
+fn is_tombstone(entry: &Value) -> bool {
+    entry.get("deleted").and_then(Value::as_bool) == Some(true)
+}
+
+/// The tracked paths whose winning entry is a tombstone. A path that no live slice lists is kept.
+fn removed_by_tombstone(document: &Value, indexes: &Indexes, tracked: &[String]) -> Vec<String> {
+    let winners = winners_of(document, indexes);
+    tracked.iter().filter(|path| winners.get(*path).is_some_and(is_tombstone)).cloned().collect()
+}
+
+/// One index fetch that ended: the author, the sha256 it was pointed at, and its entries or the reason it failed.
+struct IndexDone {
+    author: String,
+    sha: String,
+    result: Result<serde_json::Map<String, Value>, String>,
+}
+
+/// Fetch an index blob, and check it. A fetch that fails is retried with the same backoff as a file.
+async fn fetch_index(
+    consumer: Arc<Consumer<Endpoint>>,
+    ticket: &str,
+    sha: &str,
+) -> Result<serde_json::Map<String, Value>> {
+    let mut attempt = 0;
+    loop {
+        let fetched = tokio::time::timeout(
+            ATTEMPT_DEADLINE,
+            fetch_blob(consumer.clone(), ticket.to_owned(), Progress::default()),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(bytes)) => return check_index(&bytes, sha),
+            Ok(Err(error)) if error.is::<BadTicket>() => return Err(error),
+            _ if attempt >= INDEX_ATTEMPTS => bail!("index fetch gave up after {attempt} retries"),
+            _ => {}
+        }
+        tokio::time::sleep(backoff(attempt)).await;
+        attempt += 1;
+    }
 }
 
 /// The wall clock in milliseconds since the epoch: the `ts` of an entry.
@@ -2531,89 +2695,83 @@ mod tests {
         assert_eq!(error_text(&fetch_error(cause)), "connection lost: reset by peer");
     }
 
-    #[test]
-    fn the_view_of_one_author_key_names_its_files() {
-        let document = serde_json::json!({ "c925": { "files": { "sub/start.md": { "sha256": "a", "ticket": "t" } } } });
-
-        assert!(view_of(&document).contains_key("sub/start.md"), "the view lost the file");
+    /// A document of pointers, and the indexes those pointers name, as the sync reads them.
+    fn pointed(slices: &[(&str, serde_json::Value)]) -> (serde_json::Value, Indexes) {
+        let mut document = serde_json::Map::new();
+        let mut indexes = Indexes::default();
+        for (author, entries) in slices {
+            let sha = sha256_bytes(entries.to_string().as_bytes());
+            let pointer = serde_json::json!({ "index": { "ticket": "t", "sha256": sha, "ts": 1 } });
+            document.insert(author.to_string(), pointer);
+            indexes.0.insert(author.to_string(), (sha, entries.as_object().unwrap().clone()));
+        }
+        (serde_json::Value::Object(document), indexes)
     }
 
     #[test]
-    fn two_slices_the_newer_entry_wins() {
-        let document = serde_json::json!({
-            "a": { "files": { "p": { "sha256": "old", "ticket": "t1", "ts": 1 } } },
-            "b": { "files": { "p": { "sha256": "new", "ticket": "t2", "ts": 2 } } },
-        });
+    fn two_authors_with_different_ts_give_the_newer() {
+        let (document, indexes) = pointed(&[
+            ("a", serde_json::json!({ "p": { "sha256": "old", "ticket": "t1", "ts": 1 } })),
+            ("b", serde_json::json!({ "p": { "sha256": "new", "ticket": "t2", "ts": 2 } })),
+        ]);
 
-        assert_eq!(view_of(&document)["p"]["sha256"], "new");
+        assert_eq!(view_of(&document, &indexes)["p"]["sha256"], "new");
     }
 
     #[test]
-    fn a_path_nobody_tombstoned_is_not_dropped() {
-        let document = serde_json::json!({ "a": { "files": { "q": { "sha256": "y", "ticket": "u", "ts": 1 } } } });
+    fn a_winning_tombstone_in_another_index_drops_the_file() {
+        let (document, indexes) = pointed(&[
+            ("a", serde_json::json!({ "p": { "sha256": "x", "ticket": "t", "ts": 1 } })),
+            ("b", serde_json::json!({ "p": { "deleted": true, "ts": 2 } })),
+        ]);
 
-        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
-    }
-
-    #[test]
-    fn an_empty_slice_is_no_data_and_drops_nothing() {
-        let document = serde_json::json!({ "a": { "files": {} } });
-
-        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
-    }
-
-    #[test]
-    fn an_author_that_deletes_a_path_drops_it() {
-        let document = serde_json::json!({ "a": { "files": { "p": { "deleted": true, "ts": 2 } } } });
-
-        assert_eq!(removed_by_tombstone(&document, &["p".to_owned()]), vec!["p".to_owned()]);
+        assert_eq!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]), vec!["p".to_owned()]);
     }
 
     #[test]
     fn a_null_slice_keeps_its_file() {
-        let document = serde_json::json!({
-            "a": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 1 } } },
-            "b": null,
-        });
+        let (mut document, indexes) =
+            pointed(&[("a", serde_json::json!({ "p": { "sha256": "x", "ticket": "t", "ts": 1 } }))]);
+        document["b"] = serde_json::Value::Null;
 
-        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+        assert!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]).is_empty());
+        assert!(view_of(&document, &indexes).contains_key("p"));
     }
 
     #[test]
-    fn an_empty_view_drops_nothing() {
-        let document = serde_json::json!({ "c925": { "files": {} } });
+    fn a_failed_index_fetch_drops_nothing() {
+        let (document, _) = pointed(&[("a", serde_json::json!({ "p": { "deleted": true, "ts": 2 } }))]);
 
-        assert!(removed_by_tombstone(&document, &["sub/start.md".to_owned()]).is_empty());
+        assert!(removed_by_tombstone(&document, &Indexes::default(), &["p".to_owned()]).is_empty());
     }
 
     #[test]
-    fn a_tombstone_newer_than_a_listing_drops_the_file() {
-        let document = serde_json::json!({
-            "a": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 1 } } },
-            "b": { "files": { "p": { "deleted": true, "ts": 2 } } },
-        });
+    fn the_pointer_change_makes_a_fetch() {
+        let (document, indexes) = pointed(&[("a", serde_json::json!({}))]);
 
-        assert_eq!(removed_by_tombstone(&document, &["p".to_owned()]), vec!["p".to_owned()]);
+        assert_eq!(pointers_to_fetch(&document, &Indexes::default()).len(), 1);
+        assert!(pointers_to_fetch(&document, &indexes).is_empty());
     }
 
     #[test]
-    fn a_listing_newer_than_a_tombstone_keeps_the_file() {
-        let document = serde_json::json!({
-            "a": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 2 } } },
-            "b": { "files": { "p": { "deleted": true, "ts": 1 } } },
-        });
+    fn a_sha256_mismatch_of_the_index_is_refused() {
+        let wrong = "0".repeat(64);
 
-        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+        assert!(check_index(b"{}", &wrong).is_err());
+        assert!(check_index(b"{}", &sha256_bytes(b"{}")).is_ok());
     }
 
     #[test]
-    fn a_tombstone_older_than_a_listing_keeps_the_file() {
-        let document = serde_json::json!({
-            "a": { "files": { "p": { "deleted": true, "ts": 1 } } },
-            "b": { "files": { "p": { "sha256": "x", "ticket": "t", "ts": 2 } } },
-        });
+    fn an_index_over_the_cap_is_refused() {
+        // A valid object, so only the cap can refuse it.
+        let mut bytes = b"{".to_vec();
+        bytes.resize(INDEX_MAX_BYTES, b' ');
+        bytes.push(b'}');
+        assert!(bytes.len() > INDEX_MAX_BYTES);
 
-        assert!(removed_by_tombstone(&document, &["p".to_owned()]).is_empty());
+        let refused = check_index(&bytes, &sha256_bytes(&bytes));
+
+        assert!(refused.is_err_and(|error| format!("{error}").contains("cap")));
     }
 
     #[test]
