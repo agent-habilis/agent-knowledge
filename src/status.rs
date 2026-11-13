@@ -166,11 +166,17 @@ pub fn render(status: &Status, kind: &str, now: u64) -> String {
     format!("{}\n\n{}", render_mesh(status, kind, now), render_docs(status, now))
 }
 
+/// The header leads with what a user asks first: how many others are connected, the hash to give
+/// a peer, and the local folder. `connected` counts the other peers, not this one.
 fn render_mesh(status: &Status, kind: &str, now: u64) -> String {
-    let members = status.peers.len() + 1;
-    let noun = if members == 1 { "peer" } else { "peers" };
     let since_write = now.saturating_sub(status.written_at);
-    let mut out = format!("📚 {kind} · {members} {noun} · mesh `{}` · you {}\n\n", status.mesh, status.nick);
+    let mut out = format!(
+        "📚 {kind} · {} connected · hash `{}` · path `{}` · you {}\n\n",
+        status.peers.len(),
+        status.mesh,
+        status.folder.display(),
+        status.nick
+    );
     out.push_str("| peer | path | last seen |\n| ---- | ---- | --------- |\n");
     out.push_str(&format!("| {} (you) | — | — |\n", status.nick));
     for peer in &status.peers {
@@ -184,8 +190,7 @@ fn render_mesh(status: &Status, kind: &str, now: u64) -> String {
 fn render_docs(status: &Status, now: u64) -> String {
     let synced = status.synced_at.map_or("never".to_owned(), |at| format!("synced {}", ago(now.saturating_sub(at))));
     let mut out = format!(
-        "📚 docs · `{}` · {} · {} · {synced} · {} failed",
-        status.folder.display(),
+        "📚 docs · {} · {} · {synced} · {} failed",
         plural(status.files, "file"),
         size(status.bytes),
         status.failed
@@ -266,10 +271,10 @@ mod tests {
 
         assert_eq!(
             block,
-            "📚 share · 3 peers · mesh `HASH` · you alice\n\n\
+            "📚 share · 2 connected · hash `HASH` · path `/abs/folder` · you alice\n\n\
              | peer | path | last seen |\n| ---- | ---- | --------- |\n\
              | alice (you) | — | — |\n| bob | unicast | 2s ago |\n| carol | relay-only | quiet · 95s ago |\n\n\
-             📚 docs · `/abs/folder` · 42 files · 1.3 MB · synced 4s ago · 0 failed\n\n\
+             📚 docs · 42 files · 1.3 MB · synced 4s ago · 0 failed\n\n\
              | change | file | when |\n| ------ | ---- | ---- |\n\
              | ↓ | concepts/peer.md | 4s ago |\n| ↑ | log.md | 20s ago |"
         );
@@ -288,8 +293,8 @@ mod tests {
 
         let block = render(&status, "share", 5);
 
-        assert!(block.starts_with("📚 share · 1 peer · mesh `H` · you a"), "{block}");
-        assert!(block.ends_with("📚 docs · `/f` · 0 files · 0 B · never · 0 failed"), "{block}");
+        assert!(block.starts_with("📚 share · 0 connected · hash `H` · path `/f` · you a"), "{block}");
+        assert!(block.ends_with("📚 docs · 0 files · 0 B · never · 0 failed"), "{block}");
     }
 
     #[test]

@@ -35,7 +35,7 @@ other peer that joins or leaves. Each line starts with 📚:
 | `/knowledge-mount <hash> <target> [--nickname <nick>]` | Runs `mount` in the background and relays the 📚 lines. The target is the memory bank. |
 | `/knowledge-write <what>` | Writes an [OKF](https://github.com/GoogleCloudPlatform/open-knowledge-format) concept to the session's memory bank. Errors if there is none. |
 | `/knowledge-read [question]` | Answers from the session's memory bank. Errors if there is none. |
-| `/knowledge-status` | Shows the mesh (kind, hash, your nickname, each peer's path and last seen) and the docs (file count, size, last sync, failed transfers, last 5 changes). Errors if there is no memory bank. |
+| `/knowledge-status` | Shows how many peers are connected, the hash, the folder path, your nickname, each peer's path and last seen, and the docs (file count, size, last sync, failed transfers, last 5 changes). Errors if there is no memory bank. |
 
 ### One memory per session
 

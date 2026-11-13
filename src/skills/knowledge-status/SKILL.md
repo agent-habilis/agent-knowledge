@@ -46,7 +46,7 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
      the skill again in a few seconds.
 
 3. **Point out problems, in one line each, only if there are any:**
-   - `1 peer`: no one else is in the mesh. Share the hash with a peer.
+   - `0 connected`: no one else is in the mesh. Share the hash with a peer.
    - A peer marked `quiet`: it has not been heard from for a while, and may
      have left.
    - A `failed` count above 0: some transfers failed. Set `RUST_LOG=info`
