@@ -833,6 +833,9 @@ impl Folder {
 
     /// Make the disk match the document, for every path the document or `known` names.
     fn apply(&mut self, document: &Value) {
+        if stamp_own(&mut self.own, now_ms()) {
+            self.own_changed();
+        }
         // The own slice is this peer's own truth. Its fetched index can lag the own publishes, so the own entries
         // are read from `own` instead, and the older copy never wins over a newer own edit.
         if let Some(sha) = self.index_sha.clone()
@@ -1023,6 +1026,19 @@ fn load_saved(bytes: &[u8], mesh: &str) -> BTreeMap<String, Value> {
 
 /// How far a remote ts may run ahead of the local clock. An entry past it is ignored until the clock reaches it.
 const TS_REACH: u64 = 10 * 60 * 1000;
+
+/// Stamp each own entry whose ts is past the reach with `now`. This peer made that edit with a clock that was ahead, so
+/// the entry is an edit of its own, and it must not be ignored. Returns whether an entry changed.
+fn stamp_own(own: &mut BTreeMap<String, Value>, now: u64) -> bool {
+    let mut changed = false;
+    for entry in own.values_mut() {
+        if entry.get("ts").and_then(Value::as_u64).is_some_and(|ts| ts > now + TS_REACH) {
+            entry["ts"] = json!(now);
+            changed = true;
+        }
+    }
+    changed
+}
 
 /// Whether `sha` is the pointer that `author` has now.
 fn current_pointer(pointers: &HashMap<String, String>, author: &str, sha: &str) -> bool {
@@ -3001,6 +3017,18 @@ mod tests {
         let bytes = br#"{"mesh":"other","own":{"a.md":{"deleted":true,"ts":5}}}"#;
 
         assert!(load_saved(bytes, "this").is_empty());
+    }
+
+    #[test]
+    fn a_clock_set_back_while_running_restamps_the_own_edit() {
+        let now = 1_000_000_000;
+        let mut own = BTreeMap::from([(
+            "a.md".to_owned(),
+            serde_json::json!({ "sha256": "mine", "ticket": "t", "ts": now + 3_600_000 }),
+        )]);
+
+        assert!(stamp_own(&mut own, now));
+        assert_eq!(own["a.md"]["ts"], now);
     }
 
     #[test]
