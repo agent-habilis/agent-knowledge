@@ -568,7 +568,7 @@ impl Folder {
         self.member
             .request(|reply| Request::Messaging(Messaging::StateMerge { merge, reply }))
             .await
-            .and_then(|sent| sent)
+            .and_then(|sent| sent.map_err(|error| error.to_string()))
             .map_err(|error| anyhow!("{error}"))
     }
 
