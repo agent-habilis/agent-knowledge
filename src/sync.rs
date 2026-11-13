@@ -28,6 +28,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::AbortHandle;
 
 use crate::scan::{self, resolve, sha256_bytes};
+use crate::status::{self, Status};
 use crate::watch::watch;
 
 const MESH_NAME: &str = "agent-knowledge";
@@ -42,6 +43,8 @@ pub struct Options {
     pub mesh: Option<String>,
     /// This peer's nickname, or `None` for the mesh to mint a random one.
     pub nickname: Option<String>,
+    /// Where to keep this memory's [`Status`] for `agent-knowledge status`, or `None` for nowhere.
+    pub status_file: Option<PathBuf>,
 }
 
 /// The mesh is up.
@@ -69,7 +72,7 @@ pub async fn run(
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname } = options;
+    let Options { root, mesh, nickname, status_file } = options;
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -81,13 +84,15 @@ pub async fn run(
         // other through the relay but never link, because the relay is kept for lookup alone.
         .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
-    on_ready(&wait_ready(&mut events).await?);
+    let ready = wait_ready(&mut events).await?;
+    on_ready(&ready);
 
     let blobs = BlobServer::start(blob_lookups(), spool_dir(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
+    let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
     let mut folder = Folder {
         root: root.clone(),
         member,
@@ -95,12 +100,15 @@ pub async fn run(
         known: HashMap::new(),
         downloads: Downloads::new(root, done),
         consumer: Arc::new(Consumer::new()),
+        status,
+        status_file,
     };
 
     // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
     // newer remote version. It is pre-existing, and it is not fixed here.
     folder.reconcile().await;
     folder.publish_local().await;
+    folder.write_status().await;
 
     let mut every = tokio::time::interval(RECONCILE_EVERY);
     tokio::pin!(shutdown);
@@ -122,6 +130,7 @@ pub async fn run(
             Some(done) = finished.recv() => folder.finish(done).await,
             _ = every.tick() => folder.reconcile().await,
         }
+        folder.write_status().await;
     }
     folder.downloads.abort_all();
     folder.consumer.shutdown().await;
@@ -138,6 +147,9 @@ struct Folder {
     known: HashMap<String, String>,
     downloads: Downloads,
     consumer: Arc<Consumer<Endpoint>>,
+    /// What `agent-knowledge status` shows, kept up to date as the folder syncs.
+    status: Status,
+    status_file: Option<PathBuf>,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -475,7 +487,8 @@ impl Downloads {
         files: &serde_json::Map<String, Value>,
         known: &mut HashMap<String, String>,
         remove: impl Fn(&Path) -> io::Result<()>,
-    ) {
+    ) -> Vec<String> {
+        let mut deleted = Vec::new();
         for (path, copy) in self.drop_unnamed(files, known) {
             if let Some(local) = &copy {
                 // A file that is already gone counts as removed.
@@ -488,9 +501,11 @@ impl Downloads {
                     continue;
                 }
                 eprintln!("↓ deleted {path}");
+                deleted.push(path.clone());
             }
             self.drop_record(&path, known);
         }
+        deleted
     }
 
     /// Forgets a path that the document no longer names, once its local copy is gone or kept.
@@ -539,8 +554,9 @@ impl Folder {
                 Ok(()) => {
                     eprintln!("↑ {path}");
                     self.known.insert(path.clone(), sha.clone());
+                    self.status.record("↑", &path, false);
                 }
-                Err(error) => eprintln!("publish {path} failed: {error:#}"),
+                Err(error) => self.failed(&format!("publish {path} failed: {error:#}")),
             }
         }
         let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
@@ -549,9 +565,37 @@ impl Folder {
                 Ok(()) => {
                     eprintln!("↑ deleted {path}");
                     self.known.remove(&path);
+                    self.status.record("↑", &path, true);
                 }
-                Err(error) => eprintln!("delete {path} failed: {error:#}"),
+                Err(error) => self.failed(&format!("delete {path} failed: {error:#}")),
             }
+        }
+    }
+
+    /// Log a failed transfer and count it for `status`.
+    fn failed(&mut self, message: &str) {
+        eprintln!("{message}");
+        self.status.failed += 1;
+    }
+
+    /// Refresh the peers and the file totals, then write the status file, if there is one.
+    async fn write_status(&mut self) {
+        let Some(path) = &self.status_file else { return };
+        if let Ok(roster) = self.member.request(|reply| Request::Inspect(Inspect::Peers { reply })).await
+            && let Ok(roster) = serde_json::from_str::<Value>(&roster)
+        {
+            self.status.peers = status::peers_from_roster(&roster);
+        }
+        self.status.files = self.known.len();
+        self.status.bytes = self
+            .known
+            .keys()
+            .filter_map(|rel| std::fs::metadata(self.root.join(rel)).ok())
+            .map(|meta| meta.len())
+            .sum();
+        self.status.written_at = status::now();
+        if let Err(error) = self.status.write(path) {
+            eprintln!("{error:#}");
         }
     }
 
@@ -578,6 +622,7 @@ impl Folder {
         };
         if let Ok(document) = serde_json::from_str::<Value>(&text) {
             self.apply(&document);
+            self.status.synced_at = Some(status::now());
         }
     }
 
@@ -610,7 +655,9 @@ impl Folder {
         self.downloads
             .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
         self.downloads.prune(&named);
-        self.downloads.remove_dropped(&named, &mut self.known, |local| std::fs::remove_file(local));
+        for path in self.downloads.remove_dropped(&named, &mut self.known, |local| std::fs::remove_file(local)) {
+            self.status.record("↓", &path, true);
+        }
     }
 
     /// Take the end of one download. A sha that the document no longer names is dropped.
@@ -627,6 +674,11 @@ impl Folder {
             Ok(()) => self.publish(&path, &sha).await,
             Err(Failure::Transient(error) | Failure::Permanent(error) | Failure::LocalWrite(error)) => Err(error),
         };
+        if published.is_ok() {
+            self.status.record("↓", &path, false);
+        } else {
+            self.status.failed += 1;
+        }
         mark_landed(&mut self.known, path, sha, published);
     }
 }
