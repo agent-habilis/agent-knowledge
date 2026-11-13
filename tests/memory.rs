@@ -62,6 +62,33 @@ fn claim_makes_the_memory_current_and_drop_releases_it() {
 }
 
 #[test]
+fn the_status_file_sits_beside_the_entry_and_goes_with_the_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let claim = Claim::acquire(dir.path(), "s1", live(Kind::Share, "/bank")).unwrap();
+    assert_eq!(claim.status_path(), dir.path().join("s1.status.json"));
+    assert_eq!(memory::status_path(dir.path(), "s1"), claim.status_path());
+    std::fs::write(claim.status_path(), "{}").unwrap();
+
+    drop(claim);
+
+    assert!(!memory::status_path(dir.path(), "s1").exists());
+}
+
+#[test]
+fn a_dead_process_claim_leaves_the_newer_status_file_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let stale = Memory { pid: dead_pid(), kind: Kind::Share, folder: PathBuf::from("/old") };
+    let stale = Claim::acquire(dir.path(), "s1", stale).unwrap();
+    let fresh = Claim::acquire(dir.path(), "s1", live(Kind::Mount, "/new")).unwrap();
+    std::fs::write(fresh.status_path(), "{}").unwrap();
+
+    // The stale claim no longer owns the entry, so it must not delete the new status file.
+    drop(stale);
+
+    assert!(fresh.status_path().exists());
+}
+
+#[test]
 fn second_live_memory_in_one_session_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let _first = Claim::acquire(dir.path(), "s1", live(Kind::Share, "/first")).unwrap();

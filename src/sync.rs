@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::scan::{self, resolve, sha256_bytes};
+use crate::status::{self, Status};
 use crate::watch::watch;
 
 const MESH_NAME: &str = "agent-knowledge";
@@ -35,6 +36,8 @@ pub struct Options {
     pub mesh: Option<String>,
     /// This peer's nickname, or `None` for the mesh to mint a random one.
     pub nickname: Option<String>,
+    /// Where to keep this memory's [`Status`] for `agent-knowledge status`, or `None` for nowhere.
+    pub status_file: Option<PathBuf>,
 }
 
 /// The mesh is up.
@@ -62,7 +65,7 @@ pub async fn run(
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname } = options;
+    let Options { root, mesh, nickname, status_file } = options;
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -74,16 +77,19 @@ pub async fn run(
         // other through the relay but never link, because the relay is kept for lookup alone.
         .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
-    on_ready(&wait_ready(&mut events).await?);
+    let ready = wait_ready(&mut events).await?;
+    on_ready(&ready);
 
     let blobs = BlobServer::start(LookupOpts::public_preset(), spool_dir(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let (_watcher, mut ticks) = watch(&root)?;
-    let mut folder = Folder { root, member, blobs, known: HashMap::new() };
+    let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
+    let mut folder = Folder { root, member, blobs, known: HashMap::new(), status, status_file };
 
     folder.reconcile().await;
     folder.publish_local().await;
+    folder.write_status().await;
 
     let mut every = tokio::time::interval(RECONCILE_EVERY);
     tokio::pin!(shutdown);
@@ -104,6 +110,7 @@ pub async fn run(
             }
             _ = every.tick() => folder.reconcile().await,
         }
+        folder.write_status().await;
     }
     folder.blobs.shutdown().await;
     membership::depart(folder.member.node).await.map_err(|error| anyhow!("{error}"))
@@ -116,6 +123,9 @@ struct Folder {
     /// The sha256 of each path as both the disk and the document last agreed on it.
     /// A watcher tick or a document entry that matches it is our own echo, and is skipped.
     known: HashMap<String, String>,
+    /// What `agent-knowledge status` shows, kept up to date as the folder syncs.
+    status: Status,
+    status_file: Option<PathBuf>,
 }
 
 impl Folder {
@@ -132,8 +142,9 @@ impl Folder {
                 Ok(()) => {
                     eprintln!("↑ {path}");
                     self.known.insert(path.clone(), sha.clone());
+                    self.status.record("↑", path, false);
                 }
-                Err(error) => eprintln!("publish {path} failed: {error:#}"),
+                Err(error) => self.failed(&format!("publish {path} failed: {error:#}")),
             }
         }
         let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
@@ -142,9 +153,37 @@ impl Folder {
                 Ok(()) => {
                     eprintln!("↑ deleted {path}");
                     self.known.remove(&path);
+                    self.status.record("↑", &path, true);
                 }
-                Err(error) => eprintln!("delete {path} failed: {error:#}"),
+                Err(error) => self.failed(&format!("delete {path} failed: {error:#}")),
             }
+        }
+    }
+
+    /// Log a failed transfer and count it for `status`.
+    fn failed(&mut self, message: &str) {
+        eprintln!("{message}");
+        self.status.failed += 1;
+    }
+
+    /// Refresh the peers and the file totals, then write the status file, if there is one.
+    async fn write_status(&mut self) {
+        let Some(path) = &self.status_file else { return };
+        if let Ok(roster) = self.member.request(|reply| Request::Inspect(Inspect::Peers { reply })).await
+            && let Ok(roster) = serde_json::from_str::<Value>(&roster)
+        {
+            self.status.peers = status::peers_from_roster(&roster);
+        }
+        self.status.files = self.known.len();
+        self.status.bytes = self
+            .known
+            .keys()
+            .filter_map(|rel| std::fs::metadata(self.root.join(rel)).ok())
+            .map(|meta| meta.len())
+            .sum();
+        self.status.written_at = status::now();
+        if let Err(error) = self.status.write(path) {
+            eprintln!("{error:#}");
         }
     }
 
@@ -171,6 +210,7 @@ impl Folder {
         };
         if let Ok(document) = serde_json::from_str::<Value>(&text) {
             self.apply(&document).await;
+            self.status.synced_at = Some(status::now());
         }
     }
 
@@ -189,8 +229,9 @@ impl Folder {
                 Ok(()) => {
                     eprintln!("↓ {path}");
                     self.known.insert(path.clone(), sha.to_owned());
+                    self.status.record("↓", path, false);
                 }
-                Err(error) => eprintln!("download {path} failed: {error:#}"),
+                Err(error) => self.failed(&format!("download {path} failed: {error:#}")),
             }
         }
         let gone: Vec<String> = self.known.keys().filter(|path| !files.contains_key(*path)).cloned().collect();
@@ -201,6 +242,7 @@ impl Folder {
             if file_sha(&local).is_some() && file_sha(&local) == synced {
                 let _ = std::fs::remove_file(&local);
                 eprintln!("↓ deleted {path}");
+                self.status.record("↓", &path, true);
             }
         }
     }

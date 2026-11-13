@@ -77,10 +77,17 @@ pub fn current(dir: &Path, session: &str) -> anyhow::Result<Option<Memory>> {
     Ok(read_entry(&entry_path(dir, session))?.filter(|memory| is_alive(memory.pid)))
 }
 
-/// The registry entry of a running memory. Dropping it removes the entry.
+/// The status file of `session`'s memory, beside its entry: the running process writes it, and
+/// `agent-knowledge status` reads it.
+pub fn status_path(dir: &Path, session: &str) -> PathBuf {
+    dir.join(format!("{session}.status.json"))
+}
+
+/// The registry entry of a running memory. Dropping it removes the entry and its status file.
 #[derive(Debug)]
 pub struct Claim {
     path: PathBuf,
+    status: PathBuf,
     pid: u32,
 }
 
@@ -107,7 +114,12 @@ impl Claim {
             std::fs::write(&path, body.to_string())
         };
         write().with_context(|| format!("cannot write {}", path.display()))?;
-        Ok(Claim { path, pid: memory.pid })
+        Ok(Claim { path, status: status_path(dir, session), pid: memory.pid })
+    }
+
+    /// Where this memory writes its status.
+    pub fn status_path(&self) -> &Path {
+        &self.status
     }
 }
 
@@ -116,8 +128,15 @@ impl Drop for Claim {
         // A newer memory may have replaced this entry after this process died
         // and came back, so remove the entry only while it is still ours.
         let ours = matches!(read_entry(&self.path), Ok(Some(memory)) if memory.pid == self.pid);
-        if ours && let Err(err) = std::fs::remove_file(&self.path) {
-            eprintln!("warning: cannot remove {}: {err}", self.path.display());
+        if !ours {
+            return;
+        }
+        for path in [&self.status, &self.path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => eprintln!("warning: cannot remove {}: {err}", path.display()),
+            }
         }
     }
 }

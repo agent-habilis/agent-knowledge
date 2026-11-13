@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
+use agent_knowledge::status::{self, Status};
 use agent_knowledge::sync::{self, Options, Presence, Ready};
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -73,12 +74,18 @@ fn claim(kind: Kind, folder: &Path) -> anyhow::Result<Claim> {
     Claim::acquire(&memory::registry_dir(env)?, &memory::session_id(env)?, entry)
 }
 
+/// Print this session's memory folder on the first line, so the skills can read it there, then
+/// the `📚` status block once the running process has written one.
 fn status() -> anyhow::Result<()> {
     let session = memory::session_id(env)?;
-    let Some(running) = memory::current(&memory::registry_dir(env)?, &session)? else {
+    let registry = memory::registry_dir(env)?;
+    let Some(running) = memory::current(&registry, &session)? else {
         bail!("no memory bank in this session ({session}); start one with knowledge-share or knowledge-mount");
     };
     println!("{}", running.folder.display());
+    if let Some(state) = Status::read(&memory::status_path(&registry, &session))? {
+        println!("\n{}", status::render(&state, running.kind.as_str(), status::now()));
+    }
     Ok(())
 }
 
@@ -112,22 +119,24 @@ async fn main() -> anyhow::Result<()> {
     };
     match Cli::parse().command {
         Command::Share { folder, nickname } => {
-            let _claim = claim(Kind::Share, &folder)?;
+            let claim = claim(Kind::Share, &folder)?;
             let on_ready = |ready: &Ready| {
                 println!("{}", ready.mesh);
                 print_nickname(&ready.nick);
             };
-            let options = Options { root: folder, mesh: None, nickname };
+            let status_file = Some(claim.status_path().to_path_buf());
+            let options = Options { root: folder, mesh: None, nickname, status_file };
             sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Mount { hash, target, nickname } => {
-            let _claim = claim(Kind::Mount, &target)?;
+            let claim = claim(Kind::Mount, &target)?;
             std::fs::create_dir_all(&target)?;
             let on_ready = |ready: &Ready| {
                 eprintln!("mounted at {}", target.display());
                 print_nickname(&ready.nick);
             };
-            let options = Options { root: target.clone(), mesh: Some(hash), nickname };
+            let status_file = Some(claim.status_path().to_path_buf());
+            let options = Options { root: target.clone(), mesh: Some(hash), nickname, status_file };
             sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),
