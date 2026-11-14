@@ -75,11 +75,14 @@ The skills call `agent-knowledge` from `PATH`, so install the binary before
 you plug the skills:
 
 ```bash
+# Homebrew (macOS and Linux, arm64 and x86_64)
+brew install agent-habilis/tap/agent-knowledge
+
 # From a clone
 cargo install --path .
 
 # Without a clone
-cargo install --git https://github.com/caiogondim/agent-knowledge
+cargo install --git https://github.com/agent-habilis/agent-knowledge
 
 # Then plug the skills and restart Claude Code, Codex, or Pi
 agent-knowledge plug
@@ -87,6 +90,15 @@ agent-knowledge plug
 
 `cargo install` puts the binary in `~/.cargo/bin`. If the shell cannot find
 `agent-knowledge`, run `source ~/.cargo/env` or open a new terminal.
+
+The skills are embedded in the binary. After `brew upgrade`, run
+`agent-knowledge plug` again to update them.
+
+## License
+
+[Business Source License 1.1](LICENSE). You can use agent-knowledge in
+production if your company's annual gross revenue is at most 2,000,000 USD.
+Each release becomes MIT 4 years after its release date.
 
 ## Development
 
@@ -141,6 +153,24 @@ cargo test --workspace --no-fail-fast                                    # test
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It checks a create, an edit, and a delete in both directions. It takes about 10s.
 - `tests/presence.rs` starts 2 peers with nicknames. The first peer must see the second join, then leave. It also checks the random nickname, a refused nickname, and the 📚 line format.
 - `tests/relay_only.rs` blocks every direct path, so 2 peers sync only through the public relay. It needs internet access.
+
+### Release
+
+A merge to `main` releases if `.changeset/` holds a change file:
+
+1. Add a change file with `knope document-change`, or by hand as
+   `.changeset/<summary>.md` with `default: patch`, `minor`, or `major` in
+   the front matter. Use the key `default`, not the package name.
+2. Merge the PR. `auto-release.yml` runs knope. knope bumps the version,
+   writes `CHANGELOG.md`, and runs `scripts/update-license.ts`. That script
+   sets the version and the Change Date in `LICENSE`.
+3. knope pushes the bump to `main` and tags `v<version>`.
+4. `release.yml` builds 4 targets, uploads them, and bumps
+   `Formula/agent-knowledge.rb` in
+   [agent-habilis/homebrew-tap](https://github.com/agent-habilis/homebrew-tap).
+
+While the version is `0.x`, knope shifts each level down 1: `major` gives
+`0.2.0`, and `minor` or `patch` gives `0.1.1`.
 
 ### Code map
 
