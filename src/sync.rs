@@ -29,6 +29,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::AbortHandle;
 
+use crate::okf::RESEARCH_DIR;
 use crate::scan::{self, resolve, sha256_bytes};
 use crate::status::{self, Status};
 use crate::watch::watch;
@@ -58,16 +59,18 @@ pub struct Ready {
     pub nick: String,
 }
 
-/// Another peer joined or left the mesh, by nickname.
+/// A notice for the chat: another peer joined or left the mesh, by nickname, or a new research
+/// folder appeared in the bank, by topic.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Presence {
     Joined(String),
     Left(String),
+    Research(String),
 }
 
 /// Sync `options.root` until `shutdown` resolves. With `options.mesh` `None`, create a new mesh;
 /// else join it. `on_ready` gets the mesh id and this peer's nickname; `on_presence` gets each
-/// other peer that joins or leaves.
+/// other peer that joins or leaves, and each new research folder.
 pub async fn run(
     options: Options,
     on_ready: impl FnOnce(&Ready),
@@ -75,6 +78,9 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let Options { root, mesh, nickname, status_file } = options;
+    // A share's disk is the truth from the start. A mount first downloads what the mesh already
+    // holds, and that catch-up is not news.
+    let mut caught_up = mesh.is_none();
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -143,6 +149,7 @@ pub async fn run(
         winner_ts: HashMap::new(),
         index_written: None,
         spool,
+        has_synced: false,
     };
 
     for (path, sha, ts) in kept {
@@ -156,6 +163,8 @@ pub async fn run(
     folder.reconcile().await;
     folder.publish_local().await;
     folder.write_status().await;
+    // Folders already here at start are old news; only later ones get a notice.
+    let mut research = research_folders(&folder.root);
 
     let mut every = tokio::time::interval(RECONCILE_EVERY);
     tokio::pin!(shutdown);
@@ -180,6 +189,14 @@ pub async fn run(
         }
         folder.publish_index().await;
         folder.write_status().await;
+        if !caught_up {
+            caught_up = folder.has_synced && folder.downloads.running.is_empty();
+            research = research_folders(&folder.root);
+            continue;
+        }
+        for topic in new_research(&folder.root, &mut research) {
+            on_presence(Presence::Research(topic));
+        }
     }
     for (_, (_, handle)) in folder.index_tasks.drain() {
         handle.abort();
@@ -232,6 +249,8 @@ struct Folder {
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
     spool: PathBuf,
+    /// Whether a view with at least one file has been applied, so its downloads have started.
+    has_synced: bool,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -850,6 +869,7 @@ impl Folder {
             self.indexes.0.insert(author, (sha, entries));
         }
         let view = view_of(document, &self.indexes);
+        self.has_synced |= !view.is_empty();
         self.winner_ts = view
             .iter()
             .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
@@ -1584,6 +1604,26 @@ fn is_remote_state_change(event: &Value) -> bool {
     event["kind"] == "state_changed" && event["channel"] == "state" && event["is_self"] == false
 }
 
+/// The names of the visible folders directly under `<root>/research/`.
+fn research_folders(root: &Path) -> BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(root.join(RESEARCH_DIR)) else { return BTreeSet::new() };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| !name.starts_with('.'))
+        .collect()
+}
+
+/// The topic of each research folder not in `seen`, which then holds them all. A topic is its
+/// folder name with `-` as spaces.
+fn new_research(root: &Path, seen: &mut BTreeSet<String>) -> Vec<String> {
+    let now = research_folders(root);
+    let topics = now.difference(seen).map(|name| name.replace('-', " ")).collect();
+    *seen = now;
+    topics
+}
+
 fn spool_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let instance = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -1593,6 +1633,20 @@ fn spool_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_research_reports_each_new_folder_once() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("research/old")).unwrap();
+        let mut seen = research_folders(root.path());
+
+        std::fs::create_dir_all(root.path().join("research/rust-async")).unwrap();
+        std::fs::create_dir_all(root.path().join("research/.hidden")).unwrap();
+        std::fs::write(root.path().join("research/index.md"), "x").unwrap();
+
+        assert_eq!(new_research(root.path(), &mut seen), ["rust async"]);
+        assert!(new_research(root.path(), &mut seen).is_empty());
+    }
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test(start_paused = true)]

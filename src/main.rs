@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
+use agent_knowledge::research::{self, Effort};
 use agent_knowledge::status::{self, Status};
 use agent_knowledge::sync::{self, Options, Presence, Ready};
 use anyhow::{Context, bail};
@@ -40,16 +41,24 @@ enum Command {
     },
     /// Print the folder of this agent session's memory, or fail if it runs none.
     Status,
+    /// Research <topic> with the you.com Research API and save it in this session's memory bank.
+    Research {
+        topic: String,
+        /// How hard the API works on the answer.
+        #[arg(long, value_enum, default_value = "lite")]
+        effort: Effort,
+    },
 }
 
 /// The project emoji. Every line printed for the chat starts with it.
 const EMOJI: &str = "📚";
 
-/// The chat line for another peer joining or leaving.
+/// The chat line for another peer joining or leaving, or for a new research report.
 fn notice(presence: &Presence) -> String {
     match presence {
         Presence::Joined(nick) => format!("{EMOJI} {nick} joined"),
         Presence::Left(nick) => format!("{EMOJI} {nick} left"),
+        Presence::Research(topic) => format!("{EMOJI} a new research about {topic} is available"),
     }
 }
 
@@ -58,7 +67,7 @@ fn print_nickname(nick: &str) {
     println!("{EMOJI} joined as {nick}");
 }
 
-/// Print another peer's join or leave notice on stdout, for the skills to relay.
+/// Print a join, leave, or research notice on stdout, for the skills to relay.
 fn print_presence(presence: Presence) {
     println!("{}", notice(&presence));
 }
@@ -86,6 +95,21 @@ fn status() -> anyhow::Result<()> {
     if let Some(state) = Status::read(&memory::status_path(&registry, &session))? {
         println!("\n{}", status::render(&state, running.kind.as_str(), status::now()));
     }
+    Ok(())
+}
+
+/// Check the key first, then that a share or mount runs, then call the API.
+async fn run_research(topic: &str, effort: Effort) -> anyhow::Result<()> {
+    let key = research::api_key(env)?;
+    let session = memory::session_id(env)?;
+    let Some(running) = memory::current(&memory::registry_dir(env)?, &session)? else {
+        bail!(
+            "no agent-knowledge share or mount is running in this session ({session}); \
+             start one with knowledge-share or knowledge-mount, then research again"
+        );
+    };
+    let path = research::run(&running.folder, research::API_BASE, &key, topic, effort).await?;
+    println!("{}", path.display());
     Ok(())
 }
 
@@ -141,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Plug { agents } => run_plug(agents),
         Command::Status => status(),
+        Command::Research { topic, effort } => run_research(&topic, effort).await,
     }
 }
 
@@ -152,5 +177,9 @@ mod tests {
     fn notices_start_with_the_project_emoji() {
         assert_eq!(notice(&Presence::Joined("b".to_owned())), "📚 b joined");
         assert_eq!(notice(&Presence::Left("b".to_owned())), "📚 b left");
+        assert_eq!(
+            notice(&Presence::Research("rust async".to_owned())),
+            "📚 a new research about rust async is available"
+        );
     }
 }
