@@ -1,0 +1,122 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${TAG#v}"
+          manifest=$(cargo pkgid -p agent-knowledge | sed -E 's/.*[@#]//')
+          if [ "$tag" != "$manifest" ]; then
+            echo "Tag v$tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
+  create-release:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the GitHub Release (idempotent)
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  upload:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both Linux rows build on a runner of their own arch, so the C in
+          # the graph goes through the image's own gcc and no `cross` image is
+          # needed. The cost is a glibc floor of the runner's 2.39: a distro
+          # older than Ubuntu 24.04 / Debian 13 cannot run these binaries.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-26
+          # The runner is Apple silicon, so this one cross-compiles. Without
+          # it the formula has no `url` on an Intel Mac.
+          - target: x86_64-apple-darwin
+            os: macos-26
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: agent-knowledge
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ env.TAG }}
+          archive: $bin-$tag-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
+          include: LICENSE
+          # An `<archive>.sha256` sidecar per target lets update-formula read
+          # the checksums without a download of each tarball.
+          checksum: sha256
+
+  update-formula:
+    needs: upload
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The formula lives only in the org tap. GITHUB_TOKEN is scoped to this
+      # repo, so the push there goes through the release App.
+      - id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: homebrew-tap
+      - uses: actions/checkout@v5
+        with:
+          repository: agent-habilis/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+      - name: Bump Formula/agent-knowledge.rb to the released version + checksums
+        working-directory: tap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${TAG#v}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir /tmp --clobber
+          # perl, not `sed -i`: BSD and GNU sed take `-i` differently, and
+          # this step must also run on macOS.
+          perl -pi -e "s/^  version \"[^\"]*\"/  version \"$ver\"/" Formula/agent-knowledge.rb
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            sum=$(cut -d' ' -f1 "/tmp/agent-knowledge-v$ver-$target.sha256")
+            # Replace the sha256 line directly after this target's url line.
+            perl -0pi -e "s{(${target}\.tar\.gz\"\s*\n\s*sha256 \")[0-9a-f]{64}}{\${1}${sum}}g" Formula/agent-knowledge.rb
+          done
+      - name: Push the formula to the org tap
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/agent-knowledge.rb
+          git diff --cached --quiet || git commit -m "agent-knowledge ${TAG}"
+          git push
