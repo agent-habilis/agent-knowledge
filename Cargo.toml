@@ -1,6 +1,6 @@
 [package]
 name = "agent-knowledge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Share a folder over habilis-network with live two-way sync"
 license = "BUSL-1.1"

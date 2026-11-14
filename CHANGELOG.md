@@ -1,8 +1,8 @@
----
-default: minor
----
+## 0.1.1 (2026-11-14)
 
-# Release on Homebrew
+### Features
+
+#### Release on Homebrew
 
 Install with `brew install agent-habilis/tap/agent-knowledge`. Each release
 ships prebuilt binaries for macOS and Linux, on arm64 and x86_64.
