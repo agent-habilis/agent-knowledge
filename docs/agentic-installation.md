@@ -49,7 +49,7 @@ agent-knowledge plug
 
 This installs one skill per operation into every harness detected on the
 machine: `knowledge-share`, `knowledge-mount`, `knowledge-write`,
-`knowledge-read`, and `knowledge-status`. The skills are embedded in the
+`knowledge-read`, `knowledge-status`, and `knowledge-research`. The skills are embedded in the
 binary, so nothing is downloaded.
 
 An older binary embeds fewer skills. The report lists only the skills that

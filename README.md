@@ -135,6 +135,19 @@ holds. It never changes the memory bank.
 - The file count, the size, the last sync, the failed transfers, and the
   last 5 changes.
 
+<br>
+
+### `/knowledge-research`
+
+`/knowledge-research <topic> [--effort <effort>]` runs `research`. It asks the
+[you.com Research API](https://you.com/platform) about the topic and saves the
+report to the memory bank as an OKF concept in `research/<topic>/`. It also
+updates `research/index.md`, `index.md`, and `log.md`.
+- It needs a you.com API key in `$AGENT_KNOWLEDGE_YOUCOM_KEY`.
+- The effort is `lite` (the default), `standard`, `deep`, or `exhaustive`.
+- The folder and file names hold only lowercase letters, digits, and `-`. A
+  second research on the same topic replaces the report.
+
 The skills that use the memory bank stop with an error if the session has no
 memory bank.
 
@@ -172,7 +185,12 @@ other peer that joins or leaves:
 📚 joined as a
 📚 b joined
 📚 b left
+📚 a new research about rust async is available
 ```
+
+The research line appears on every peer when a new folder shows up under
+`research/` in the memory bank. A mount stays quiet about the folders it
+downloads when it first joins.
 
 `share` prints the hash first, on its own line, before these lines.
 

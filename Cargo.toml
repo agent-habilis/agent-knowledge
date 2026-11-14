@@ -15,9 +15,12 @@ tracing = "0.1"
 # habilis-network owns which iroh fork is in the graph.
 habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "311557e7f9eb3ee273afee2e1bc4c49dc8d2f453", features = ["blob"] }
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
 notify = "8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
