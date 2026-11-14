@@ -63,8 +63,8 @@ bun test scripts/                                                        # scrip
 - `tests/plug.rs` checks the embedded skills, the skills folder, the
   detection of each agent, and the install.
 - `tests/two_way.rs` runs a `share` loop and a `mount` loop in 1 process. It
-  checks a create, an edit, and a delete in both directions. It takes about
-  10s.
+  checks a create on each side, an edit on the share side, and a delete on
+  the mount side. It takes about 10s.
 - `tests/presence.rs` starts 2 peers with nicknames. The first peer must see
   the second join, then leave. It also checks the random nickname, a refused
   nickname, and the 📚 line format.
@@ -91,9 +91,13 @@ A merge to `main` releases if `.changeset/` holds a change file:
 While the version is `0.x`, knope shifts each level down 1. `major` bumps
 the minor number, and `minor` or `patch` bumps the patch number.
 
-If the bump reached `main` but the release failed, run
-`gh workflow run auto-release`. With no change file and no tag, it runs the
-knope `publish` workflow, which creates the missing tag and release.
+To recover a failed release, first check if the tag `v<version>` exists:
+
+- If the bump reached `main` but the tag does not exist, run
+  `gh workflow run auto-release`. With no change file and no tag, it runs the
+  knope `publish` workflow, which creates the missing tag and release.
+- If the tag exists, `auto-release` has nothing to do. Rerun the failed jobs
+  of the failed run with `gh run rerun <run-id> --failed`.
 
 ### Code map
 
@@ -128,7 +132,8 @@ knope `publish` workflow, which creates the missing tag and release.
 - **Echo stop:** each side keeps the last synced sha256 of each path. A
   change that matches it is the side's own echo, so the side skips it.
 - **Conflicts:** for each path, the entry with the larger timestamp wins. A
-  winning delete removes the local copy.
+  winning delete removes the local copy. The timestamp comes from the wall
+  clock of each peer.
 - **The status file:** the running process keeps its state in
   `<registry>/<session>.status.json`, beside its registry entry, and removes
   it when it stops.

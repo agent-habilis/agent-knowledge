@@ -64,11 +64,16 @@ brew install agent-habilis/tap/agent-knowledge && agent-knowledge plug
 cargo install --git https://github.com/agent-habilis/agent-knowledge && agent-knowledge plug
 ```
 
-After `brew upgrade`, run `agent-knowledge plug` again to update the skills.
+If you installed with `cargo install` before, run
+`cargo uninstall agent-knowledge` before the Homebrew install.
+`~/.cargo/bin` usually comes first in `PATH`, so the old copy hides the
+Homebrew one, and its `plug` writes old skills.
 
-If you installed with `cargo install` before, remove that copy with
-`cargo uninstall agent-knowledge`. `~/.cargo/bin` usually comes first in
-`PATH`, so the old copy hides the Homebrew one.
+`cargo install` writes to `~/.cargo/bin`. If the shell cannot find
+`agent-knowledge` after the install, add that folder to `PATH`, for example
+with `source ~/.cargo/env`. Then run `agent-knowledge plug`.
+
+After `brew upgrade`, run `agent-knowledge plug` again to update the skills.
 
 <br>
 
@@ -180,7 +185,9 @@ other peer that joins or leaves:
 - `.gitignore` is not read: every other file in the folder syncs.
 - Empty folders do not sync.
 - A rename syncs as a delete plus a create.
-- If 2 sides edit 1 file at the same time, the later write wins.
+- If 2 sides edit 1 file, the edit with the larger timestamp wins. Each peer
+  stamps an edit with its own clock, so if the clocks differ, an earlier
+  edit can win.
 - Each side keeps a full copy of the folder. If you stop a share or a mount,
   the copies that peers already have stay.
 

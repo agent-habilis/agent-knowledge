@@ -52,19 +52,23 @@ machine: `knowledge-share`, `knowledge-mount`, `knowledge-write`,
 `knowledge-read`, and `knowledge-status`. The skills are embedded in the
 binary, so nothing is downloaded.
 
-`plug` prints one line per harness. Read each line before you continue:
+An older binary embeds fewer skills. The report lists only the skills that
+`plug` wrote.
 
-- `installed <harness> <path>`: done.
-- `skipped <harness> not detected`: that harness has no config folder on
-  this machine. `plug` never creates one. Ignore the line, unless it is
-  **your own** harness. In that case, your harness keeps its config in
-  another folder. Set its override variable to that folder and run `plug`
-  again:
+`plug` prints one `installed <harness> <path>` line for each detected
+harness. It prints nothing for a harness that it does not detect. Find the
+line of **your own** harness before you continue:
+
+- If the line is there, go to step 3.
+- If `plug` prints `no agent detected`, no harness has a config folder on
+  this machine. Tell the user, and stop.
+- If your harness has no line, it keeps its config in another folder. Set
+  its override variable to that folder, and run `plug` again:
   - Claude Code: `CLAUDE_CONFIG_DIR`
   - Codex: `CODEX_HOME`
   - pi: `PI_CODING_AGENT_DIR`
-- `no agent detected`: no harness has a config folder on this machine. Tell
-  the user, and stop.
+
+  If your harness still has no line, tell the user, and stop.
 
 ## 3. Tell the user how to load the skills
 
@@ -76,18 +80,17 @@ your model: the harness is the product that hosts you, not the model vendor.
 
 - **Claude Code:** the skills are in `~/.claude/skills`. To load them, run
   `/reload-skills`. Commands look like `/knowledge-share`.
-- **pi:** the skills are in `~/.pi/agent/skills`. To load them, restart pi.
-  Commands look like `/skill:knowledge-share`.
+- **pi:** the skills are in `~/.pi/agent/skills`. To load them, run
+  `/reload`. Commands look like `/skill:knowledge-share`.
 - **Codex:** the skills are in `~/.codex/skills`. To load them, restart
   Codex. Commands look like `$knowledge-share`.
-
-Claude Code is the only one of these that can reload skills in place.
-Everywhere else, the session must start again.
 
 ---
 
 When you are done, report to the user. Fill in the real values, and use the
-command prefix of your harness from the list above. Write the report as
+command prefix of your harness from the list above. List only the skill
+folders that are in the skills path of your harness, for example
+`ls ~/.claude/skills | grep '^knowledge-'`. Write the report as
 plain Markdown. **The fence below only marks the template in this document.
 It is not part of the output.** Write the lines bare, never in a code fence:
 
@@ -101,11 +104,8 @@ It is not part of the output.** Write the lines bare, never in a code fence:
    <harness> · `<path>`
 
 ✅ new skills
-  `<knowledge-share>` · share a folder as the memory bank
-  `<knowledge-mount>` · mount a shared folder by its hash
-  `<knowledge-write>` · save knowledge to the memory bank
-  `<knowledge-read>` · answer from the memory bank
-  `<knowledge-status>` · show the mesh and the docs
+  `<skill-1>` · brief description
+  `<skill-2>` · brief description
 
 ⚡ <how to load them, from step 3>
 
