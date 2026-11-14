@@ -2,6 +2,12 @@
 name = "agent-knowledge"
 version = "0.1.0"
 edition = "2024"
+description = "Share a folder over habilis-network with live two-way sync"
+license = "BUSL-1.1"
+repository = "https://github.com/agent-habilis/agent-knowledge"
+homepage = "https://github.com/agent-habilis/agent-knowledge"
+rust-version = "1.95"
+publish = false
 
 [dependencies]
 tracing = "0.1"
@@ -23,3 +29,10 @@ tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 # Test hooks only: `block_ip_paths` takes every direct path away, so a test can force the relay.
 habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "311557e7f9eb3ee273afee2e1bc4c49dc8d2f453", features = ["blob", "iroh-test-utils"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
