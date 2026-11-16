@@ -38,6 +38,9 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PARALLEL_MANIFEST_FETCHES: usize = 8;
 /// How long a ticket that failed is left alone: a crashed peer's ticket stays in the state for a while.
 const FAILED_TICKET_PAUSE: Duration = Duration::from_secs(60);
+/// A manifest that cannot be fetched for this long no longer holds back the first publish of a file:
+/// the peer that wrote it crashed, and its slice stays in the state until it lapses.
+const UNREADABLE_AFTER: Duration = Duration::from_secs(180);
 /// A version that this peer took from another is written to its own manifest after this quiet
 /// time, so a burst of changes costs one write, and every peer does not fetch every other's copy.
 const ADOPT_DELAY: Duration = Duration::from_secs(3);
@@ -127,6 +130,20 @@ pub async fn run(
     membership::depart(folder.member.node).await.map_err(|error| anyhow!("{error}"))
 }
 
+/// What a cycle knows about the mesh as a whole.
+#[derive(Clone, Copy)]
+struct View {
+    may_publish: bool,
+    /// See [`Facts::view_complete`].
+    complete: bool,
+}
+
+enum Downloaded {
+    Written,
+    /// The disk copy changed after the scan. It is the sha256 now, or `None` if the file is gone.
+    Edited(Option<String>),
+}
+
 struct Folder {
     root: PathBuf,
     member: Membership,
@@ -144,8 +161,12 @@ struct Folder {
     manifests: HashMap<String, Manifest>,
     /// When each ticket last failed.
     failed: HashMap<String, Instant>,
+    /// When each manifest ticket first failed, while the mesh still points to it.
+    unreadable: HashMap<String, Instant>,
     /// The sha256 of the manifest that the own slice points to.
     pointer: Option<String>,
+    /// The sha256 of the last manifest that was over [`MAX_MANIFEST_BYTES`], so the refusal is reported once.
+    refused: Option<String>,
     /// The manifest versions that the blob server still holds, oldest first.
     held_versions: Vec<String>,
     /// A local change is in `mine` and not in the slice yet.
@@ -170,7 +191,9 @@ impl Folder {
             stamps: HashMap::new(),
             manifests: HashMap::new(),
             failed: HashMap::new(),
+            unreadable: HashMap::new(),
             pointer: None,
+            refused: None,
             held_versions: Vec::new(),
             local_dirty: false,
             adopted_since: None,
@@ -181,7 +204,7 @@ impl Folder {
     /// One pass: read the mesh, make the disk match the winning versions, publish the local changes.
     async fn cycle(&mut self) {
         self.failed.retain(|_, at| at.elapsed() < FAILED_TICKET_PAUSE);
-        let Some(authors) = self.read_view().await else { return };
+        let Some((authors, complete)) = self.read_view().await else { return };
         let disk = match scan::scan(&self.root) {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
@@ -192,19 +215,21 @@ impl Folder {
             self.hold_until = None;
         }
         let may_publish = self.hold_until.is_none_or(|until| Instant::now() >= until);
+        let view = View { may_publish, complete };
 
         let paths: BTreeSet<&String> = union.keys().chain(disk.keys()).chain(self.known.keys()).collect();
         let paths: Vec<String> = paths.into_iter().cloned().collect();
         for path in paths {
-            self.settle(&path, disk.get(&path), union.get(&path), may_publish, now).await;
+            self.settle(&path, disk.get(&path), union.get(&path), view, now).await;
         }
         self.flush_pointer().await;
         self.save_known();
     }
 
     /// The pointer of each author's manifest, with the manifest fetched, as `(author, sha256)`.
+    /// The flag says whether every manifest is there, except those that stayed unreadable for [`UNREADABLE_AFTER`].
     /// `None` if the mesh did not answer.
-    async fn read_view(&mut self) -> Option<Vec<(String, String)>> {
+    async fn read_view(&mut self) -> Option<(Vec<(String, String)>, bool)> {
         let text = self.member.request(|reply| Request::Inspect(Inspect::StateJson { reply })).await.ok()?;
         let document: Value = serde_json::from_str(&text).ok()?;
         let pointers = pointers(&document);
@@ -229,13 +254,20 @@ impl Folder {
                 }
                 Err(error) => {
                     eprintln!("manifest fetch failed: {error:#}");
+                    self.unreadable.entry(ticket.clone()).or_insert_with(Instant::now);
                     self.failed.insert(ticket, Instant::now());
                 }
             }
         }
         let current: BTreeSet<&String> = pointers.iter().map(|(_, sha, _)| sha).collect();
         self.manifests.retain(|sha, _| current.contains(sha));
-        Some(pointers.into_iter().filter(|(_, sha, _)| self.manifests.contains_key(sha)).map(|(author, sha, _)| (author, sha)).collect())
+        let tickets: BTreeSet<&String> = pointers.iter().map(|(_, _, ticket)| ticket).collect();
+        self.unreadable.retain(|ticket, _| tickets.contains(ticket));
+        let complete = pointers.iter().all(|(_, sha, ticket)| {
+            self.manifests.contains_key(sha) || self.unreadable.get(ticket).is_some_and(|since| since.elapsed() >= UNREADABLE_AFTER)
+        });
+        let fetched = pointers.into_iter().filter(|(_, sha, _)| self.manifests.contains_key(sha)).map(|(author, sha, _)| (author, sha)).collect();
+        Some((fetched, complete))
     }
 
     /// The winning version of each path over every fetched manifest and the own one, which is
@@ -253,54 +285,49 @@ impl Folder {
         manifest::resolve(&lists, now)
     }
 
-    /// Decide one path. A local change is published and not overwritten. Otherwise the winning
-    /// version of the mesh is taken. A path that no manifest names is published.
-    async fn settle(&mut self, path: &str, disk: Option<&String>, resolved: Option<&Resolved>, may_publish: bool, now: u64) {
+    /// Decide one path with [`decide`], then act. A local change is published and not overwritten.
+    /// Otherwise the winning version of the mesh is taken.
+    async fn settle(&mut self, path: &str, disk: Option<&String>, resolved: Option<&Resolved>, view: View, now: u64) {
         if resolve(&self.root, path).is_none() {
             return;
         }
-        let known = self.known.get(path).cloned();
-        if known.as_ref().is_some_and(|known| disk != Some(known)) {
-            if may_publish {
-                self.stage_local(path, disk, now).await;
-            }
-            return;
-        }
-        match (resolved, disk) {
-            (None, Some(_)) if may_publish => self.stage_local(path, disk, now).await,
-            (None, _) => {}
-            (Some(resolved), _) => match &resolved.winner {
-                Entry::Live { sha256, .. } => self.take_live(path, disk, sha256, resolved).await,
-                Entry::Gone { sha256, .. } => self.take_gone(path, disk, sha256, &resolved.winner, may_publish, now).await,
-            },
+        let facts = Facts {
+            known: self.known.get(path).map(String::as_str),
+            disk: disk.map(String::as_str),
+            winner: resolved.map(|resolved| &resolved.winner),
+            may_publish: view.may_publish,
+            view_complete: view.complete,
+            mine_holds_winner: resolved.is_some_and(|resolved| self.mine.get(path).is_some_and(|held| held.same_version(&resolved.winner))),
+        };
+        match (decide(&facts), resolved) {
+            (Action::Publish, _) => self.stage_local(path, disk, now).await,
+            (Action::TakeLive, Some(resolved)) => self.take_live(path, disk, resolved, now).await,
+            (Action::TakeGone, Some(resolved)) => self.take_gone(path, &resolved.winner).await,
+            _ => {}
         }
     }
 
-    async fn take_live(&mut self, path: &str, disk: Option<&String>, sha: &str, resolved: &Resolved) {
-        if disk.map(String::as_str) != Some(sha) {
-            if let Err(error) = self.download(path, sha, &resolved.tickets).await {
-                return eprintln!("download {path} failed: {error:#}");
+    async fn take_live(&mut self, path: &str, disk: Option<&String>, resolved: &Resolved, now: u64) {
+        let Entry::Live { sha256: sha, .. } = &resolved.winner else { return };
+        if disk.map(String::as_str) != Some(sha.as_str()) {
+            match self.download(path, sha, disk, &resolved.tickets).await {
+                Ok(Downloaded::Written) => eprintln!("↓ {path}"),
+                Ok(Downloaded::Edited(edited)) => return self.stage_local(path, edited.as_ref(), now).await,
+                Err(error) => return eprintln!("download {path} failed: {error:#}"),
             }
-            eprintln!("↓ {path}");
         }
-        self.known.insert(path.to_owned(), sha.to_owned());
+        self.known.insert(path.to_owned(), sha.clone());
         self.adopt(path, &resolved.winner).await;
     }
 
-    /// `gone_sha` is the content that the winning delete removed. The disk copy goes if it is the
-    /// copy that this peer synced, or if it has that content. A different file at the path is new.
-    async fn take_gone(&mut self, path: &str, disk: Option<&String>, gone_sha: &str, winner: &Entry, may_publish: bool, now: u64) {
-        if let Some(sha) = disk {
-            if self.known.contains_key(path) || sha == gone_sha {
-                if let Some(local) = resolve(&self.root, path) {
-                    let _ = std::fs::remove_file(local);
-                    eprintln!("↓ deleted {path}");
-                }
-            } else {
-                if may_publish {
-                    self.stage_local(path, disk, now).await;
-                }
-                return;
+    /// Remove the disk copy and take the tombstone. If the copy cannot be removed, this peer keeps
+    /// its `known` entry and does not take the tombstone, so the next cycle tries again.
+    async fn take_gone(&mut self, path: &str, winner: &Entry) {
+        if let Some(local) = resolve(&self.root, path) {
+            match std::fs::remove_file(&local) {
+                Ok(()) => eprintln!("↓ deleted {path}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return eprintln!("delete {path} failed: {error}"),
             }
         }
         self.known.remove(path);
@@ -373,6 +400,13 @@ impl Folder {
         }
         let bytes = manifest::encode(&self.mine);
         let sha = sha256_bytes(&bytes);
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            if self.refused.as_deref() != Some(sha.as_str()) {
+                eprintln!("folder too large to sync: its manifest is {} bytes, over the {MAX_MANIFEST_BYTES} byte limit; nothing more is published", bytes.len());
+                self.refused = Some(sha);
+            }
+            return;
+        }
         if self.pointer.as_deref() != Some(sha.as_str())
             && let Err(error) = self.write_pointer(&bytes, &sha).await
         {
@@ -409,7 +443,9 @@ impl Folder {
     }
 
     /// Fetch the file with the first ticket that serves content `sha`. A ticket that fails is left alone for a while.
-    async fn download(&mut self, path: &str, sha: &str, tickets: &[String]) -> Result<()> {
+    /// `scanned` is the sha256 of the disk copy that the pass decided on: if the copy is another by
+    /// the time the bytes arrive, the file is left alone, and the caller treats it as a local edit.
+    async fn download(&mut self, path: &str, sha: &str, scanned: Option<&String>, tickets: &[String]) -> Result<Downloaded> {
         let local = resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
         let mut last = anyhow!("no ticket that is not paused");
         for ticket in tickets {
@@ -418,10 +454,15 @@ impl Folder {
             }
             match fetch_file(ticket, sha).await {
                 Ok(bytes) => {
+                    let current = std::fs::read(&local).ok().map(|bytes| sha256_bytes(&bytes));
+                    if current.as_ref() != scanned {
+                        return Ok(Downloaded::Edited(current));
+                    }
                     if let Some(parent) = local.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
-                    return write_atomic(&local, &bytes).await;
+                    write_atomic(&local, &bytes).await?;
+                    return Ok(Downloaded::Written);
                 }
                 Err(error) => {
                     self.failed.insert(ticket.clone(), Instant::now());
@@ -549,4 +590,91 @@ fn spool_dir() -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let instance = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("agent-knowledge-{}-{instance}", std::process::id()))
+}
+
+/// What is known about one path when it is settled.
+struct Facts<'a> {
+    /// The sha256 that the disk and the mesh last agreed on.
+    known: Option<&'a str>,
+    /// The sha256 of the file on the disk now.
+    disk: Option<&'a str>,
+    /// The winning version in the mesh.
+    winner: Option<&'a Entry>,
+    may_publish: bool,
+    /// Every manifest that the mesh points to is fetched. Without it, a path that no fetched
+    /// manifest names can still be named by one that is missing.
+    view_complete: bool,
+    /// The own manifest already holds the winning version, so this peer wrote or took it.
+    mine_holds_winner: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Skip,
+    /// Put the disk state of the path into the own manifest as a new version.
+    Publish,
+    TakeLive,
+    TakeGone,
+}
+
+fn decide(facts: &Facts) -> Action {
+    let publish = if facts.may_publish { Action::Publish } else { Action::Skip };
+    if facts.known.is_some_and(|known| facts.disk != Some(known)) {
+        return publish;
+    }
+    match facts.winner {
+        None if facts.disk.is_some() && facts.may_publish && facts.view_complete => Action::Publish,
+        None => Action::Skip,
+        Some(Entry::Live { .. }) => Action::TakeLive,
+        Some(Entry::Gone { sha256, .. }) => match facts.disk {
+            None => Action::TakeGone,
+            Some(_) if facts.known.is_some() => Action::TakeGone,
+            Some(_) if facts.mine_holds_winner => publish,
+            Some(disk) if disk == sha256 => Action::TakeGone,
+            Some(_) => publish,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gone(sha: &str) -> Entry {
+        Entry::Gone { sha256: sha.to_owned(), ts_ms: 5 }
+    }
+
+    fn facts<'a>() -> Facts<'a> {
+        Facts { known: None, disk: None, winner: None, may_publish: true, view_complete: true, mine_holds_winner: false }
+    }
+
+    #[test]
+    fn a_new_file_is_published_only_when_the_view_is_complete() {
+        let new_file = Facts { disk: Some("aa"), ..facts() };
+        assert_eq!(decide(&new_file), Action::Publish);
+        assert_eq!(decide(&Facts { view_complete: false, ..new_file }), Action::Skip);
+    }
+
+    #[test]
+    fn a_file_recreated_after_this_peer_took_the_delete_is_published() {
+        let tombstone = gone("aa");
+        let stale = Facts { disk: Some("aa"), winner: Some(&tombstone), ..facts() };
+        assert_eq!(decide(&stale), Action::TakeGone);
+        assert_eq!(decide(&Facts { mine_holds_winner: true, ..stale }), Action::Publish);
+    }
+
+    #[test]
+    fn a_synced_copy_goes_with_the_delete_and_a_local_edit_does_not() {
+        let tombstone = gone("aa");
+        let synced = Facts { known: Some("aa"), disk: Some("aa"), winner: Some(&tombstone), ..facts() };
+        assert_eq!(decide(&synced), Action::TakeGone);
+        assert_eq!(decide(&Facts { disk: Some("bb"), ..synced }), Action::Publish);
+    }
+
+    #[test]
+    fn a_different_file_at_a_deleted_path_is_new() {
+        let tombstone = gone("aa");
+        let other = Facts { disk: Some("bb"), winner: Some(&tombstone), ..facts() };
+        assert_eq!(decide(&other), Action::Publish);
+    }
 }
