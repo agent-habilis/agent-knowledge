@@ -143,7 +143,7 @@ cargo clippy
 ### How it works
 
 - **The hash** is a habilis-network mesh id. The mesh uses all lookups: mDNS, DHT, and relay.
-- **The file list** is the mesh `state` document, an automerge CRDT (a data type that merges edits from many writers). Each entry holds the sha256 of a file and a blob ticket.
+- **The file list** is one manifest blob for each peer, which a pointer in the peer's own slice of the mesh state names. A manifest holds a version (`ts_ms`) and a blob ticket for each file, or a tombstone for a deleted file. The highest version of a path wins.
 - **The file bytes** go through the blob ticket, because a gossip frame holds at most 3840 bytes.
 - **Echo stop:** each side keeps the last synced sha256 of each path. A change that matches it is the side's own echo, so the side skips it.
 - **Conflicts:** if 2 sides edit 1 file at the same time, the last write wins.
