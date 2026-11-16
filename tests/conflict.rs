@@ -16,8 +16,8 @@ async fn converged(left: &Path, right: &Path, name: &str) -> String {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         let (a, b) = (read(&left.join(name)), read(&right.join(name)));
-        if a.is_some() && a == b {
-            return a.unwrap();
+        if let Some(content) = a.as_ref().filter(|_| a == b) {
+            return content.clone();
         }
         assert!(tokio::time::Instant::now() < deadline, "{name} never converged: {a:?} vs {b:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
