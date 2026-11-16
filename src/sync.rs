@@ -70,9 +70,10 @@ pub async fn run(
         .nick(nickname)
         .name(Some(MESH_NAME.to_owned()))
         .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
-        // The engine default plus `Relay`. Without it, 2 peers whose hole punch fails find each
-        // other through the relay but never link, because the relay is kept for lookup alone.
-        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
+        // The engine default. `Relay` is in the list because, without it, 2 peers whose hole punch
+        // fails find each other through the relay but never link, because the relay is kept for
+        // lookup alone.
+        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     on_ready(&wait_ready(&mut events).await?);
 
@@ -161,7 +162,7 @@ impl Folder {
         self.member
             .request(|reply| Request::Messaging(Messaging::StateMerge { merge, reply }))
             .await
-            .and_then(|sent| sent)
+            .map_err(|error| anyhow!("{error}"))?
             .map_err(|error| anyhow!("{error}"))
     }
 
