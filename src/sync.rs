@@ -399,14 +399,15 @@ impl Folder {
             return;
         }
         let bytes = manifest::encode(&self.mine);
-        let sha = sha256_bytes(&bytes);
-        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-            if self.refused.as_deref() != Some(sha.as_str()) {
-                eprintln!("folder too large to sync: its manifest is {} bytes, over the {MAX_MANIFEST_BYTES} byte limit; nothing more is published", bytes.len());
-                self.refused = Some(sha);
+        let sha = match check_size(&bytes, MAX_MANIFEST_BYTES, &mut self.refused) {
+            SizeCheck::Fits(sha) => sha,
+            SizeCheck::TooLarge { report } => {
+                if report {
+                    eprintln!("folder too large to sync: its manifest is {} bytes, over the {MAX_MANIFEST_BYTES} byte limit; nothing more is published", bytes.len());
+                }
+                return;
             }
-            return;
-        }
+        };
         if self.pointer.as_deref() != Some(sha.as_str())
             && let Err(error) = self.write_pointer(&bytes, &sha).await
         {
@@ -592,6 +593,25 @@ fn spool_dir() -> PathBuf {
     std::env::temp_dir().join(format!("agent-knowledge-{}-{instance}", std::process::id()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SizeCheck {
+    /// The manifest can be published. The sha256 is its name.
+    Fits(String),
+    /// The manifest is over the cap. `report` is true the first time for this manifest.
+    TooLarge { report: bool },
+}
+
+/// Whether the manifest `bytes` fit under `cap`. `refused` remembers the last manifest that did not.
+fn check_size(bytes: &[u8], cap: u64, refused: &mut Option<String>) -> SizeCheck {
+    let sha = sha256_bytes(bytes);
+    if bytes.len() as u64 <= cap {
+        return SizeCheck::Fits(sha);
+    }
+    let report = refused.as_deref() != Some(sha.as_str());
+    *refused = Some(sha);
+    SizeCheck::TooLarge { report }
+}
+
 /// What is known about one path when it is settled.
 struct Facts<'a> {
     /// The sha256 that the disk and the mesh last agreed on.
@@ -646,6 +666,24 @@ mod tests {
 
     fn facts<'a>() -> Facts<'a> {
         Facts { known: None, disk: None, winner: None, may_publish: true, view_complete: true, mine_holds_winner: false }
+    }
+
+    #[test]
+    fn a_manifest_over_the_cap_is_refused_and_reported_once() {
+        let mut refused = None;
+        let big = vec![b'x'; 11];
+        assert_eq!(check_size(&big, 10, &mut refused), SizeCheck::TooLarge { report: true });
+        assert_eq!(check_size(&big, 10, &mut refused), SizeCheck::TooLarge { report: false });
+        let other = vec![b'y'; 12];
+        assert_eq!(check_size(&other, 10, &mut refused), SizeCheck::TooLarge { report: true });
+    }
+
+    #[test]
+    fn a_manifest_at_the_cap_fits() {
+        let mut refused = None;
+        let exact = vec![b'x'; 10];
+        assert_eq!(check_size(&exact, 10, &mut refused), SizeCheck::Fits(sha256_bytes(&exact)));
+        assert_eq!(refused, None);
     }
 
     #[test]
