@@ -153,6 +153,8 @@ struct Folder {
     /// copy would publish the copy as a new edit.
     known: HashMap<String, String>,
     known_text: String,
+    /// For each path with a local change that is not published yet: what `known` held before it.
+    baseline: HashMap<String, Option<String>>,
     /// This peer's own manifest: the versions it wrote and the versions it took.
     mine: Manifest,
     /// The highest `ts_ms` seen for each path, so that a new local version is after every other.
@@ -180,13 +182,14 @@ struct Folder {
 impl Folder {
     fn new(root: PathBuf, member: Membership, blobs: BlobServer, joining: bool) -> Self {
         let known = load_known(&root);
-        let known_text = known_text(&known);
+        let known_text = known_text(&known, &HashMap::new());
         Self {
             root,
             member,
             blobs,
             known,
             known_text,
+            baseline: HashMap::new(),
             mine: Manifest::new(),
             stamps: HashMap::new(),
             manifests: HashMap::new(),
@@ -288,7 +291,7 @@ impl Folder {
     /// Decide one path with [`decide`], then act. A local change is published and not overwritten.
     /// Otherwise the winning version of the mesh is taken.
     async fn settle(&mut self, path: &str, disk: Option<&String>, resolved: Option<&Resolved>, view: View, now: u64) {
-        if resolve(&self.root, path).is_none() {
+        if safe_local(&self.root, path).is_none() {
             return;
         }
         let facts = Facts {
@@ -302,7 +305,7 @@ impl Folder {
         match (decide(&facts), resolved) {
             (Action::Publish, _) => self.stage_local(path, disk, now).await,
             (Action::TakeLive, Some(resolved)) => self.take_live(path, disk, resolved, now).await,
-            (Action::TakeGone, Some(resolved)) => self.take_gone(path, &resolved.winner).await,
+            (Action::TakeGone, Some(resolved)) => self.take_gone(path, disk, &resolved.winner, now).await,
             _ => {}
         }
     }
@@ -320,10 +323,14 @@ impl Folder {
         self.adopt(path, &resolved.winner).await;
     }
 
-    /// Remove the disk copy and take the tombstone. If the copy cannot be removed, this peer keeps
-    /// its `known` entry and does not take the tombstone, so the next cycle tries again.
-    async fn take_gone(&mut self, path: &str, winner: &Entry) {
-        if let Some(local) = resolve(&self.root, path) {
+    /// Remove the disk copy and take the tombstone. A copy that changed or appeared since the scan
+    /// is kept and published instead. If the copy cannot be removed, this peer keeps its `known`
+    /// entry and does not take the tombstone, so the next cycle tries again.
+    async fn take_gone(&mut self, path: &str, disk: Option<&String>, winner: &Entry, now: u64) {
+        if let Some(local) = safe_local(&self.root, path) {
+            if let Some(current) = changed_since_scan(&local, disk) {
+                return self.stage_local(path, current.as_ref(), now).await;
+            }
             match std::fs::remove_file(&local) {
                 Ok(()) => eprintln!("↓ deleted {path}"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -347,6 +354,8 @@ impl Folder {
                 Entry::Gone { sha256, ts_ms }
             }
         };
+        let before = self.known.get(path).cloned();
+        self.baseline.entry(path.to_owned()).or_insert(before);
         match &entry {
             Entry::Live { sha256, .. } => {
                 eprintln!("↑ {path}");
@@ -415,6 +424,7 @@ impl Folder {
         }
         self.local_dirty = false;
         self.adopted_since = None;
+        self.baseline.clear();
     }
 
     async fn write_pointer(&mut self, bytes: &[u8], sha: &str) -> Result<()> {
@@ -447,7 +457,7 @@ impl Folder {
     /// `scanned` is the sha256 of the disk copy that the pass decided on: if the copy is another by
     /// the time the bytes arrive, the file is left alone, and the caller treats it as a local edit.
     async fn download(&mut self, path: &str, sha: &str, scanned: Option<&String>, tickets: &[String]) -> Result<Downloaded> {
-        let local = resolve(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
+        let local = safe_local(&self.root, path).with_context(|| format!("unsafe path {path:?}"))?;
         let mut last = anyhow!("no ticket that is not paused");
         for ticket in tickets {
             if self.failed.get(ticket).is_some_and(|at| at.elapsed() < FAILED_TICKET_PAUSE) {
@@ -455,8 +465,7 @@ impl Folder {
             }
             match fetch_file(ticket, sha).await {
                 Ok(bytes) => {
-                    let current = std::fs::read(&local).ok().map(|bytes| sha256_bytes(&bytes));
-                    if current.as_ref() != scanned {
+                    if let Some(current) = changed_since_scan(&local, scanned) {
                         return Ok(Downloaded::Edited(current));
                     }
                     if let Some(parent) = local.parent() {
@@ -475,7 +484,7 @@ impl Folder {
     }
 
     fn save_known(&mut self) {
-        let text = known_text(&self.known);
+        let text = known_text(&self.known, &self.baseline);
         if text == self.known_text {
             return;
         }
@@ -539,10 +548,18 @@ fn load_known(root: &Path) -> HashMap<String, String> {
     entries.into_iter().filter_map(|(path, sha)| Some((path, sha.as_str()?.to_owned()))).collect()
 }
 
-/// The text of [`KNOWN_FILE`]: sorted, so equal maps give equal text.
-fn known_text(known: &HashMap<String, String>) -> String {
-    let sorted: BTreeMap<&String, &String> = known.iter().collect();
-    serde_json::to_string(&sorted).expect("a map of strings always serializes")
+/// The text of [`KNOWN_FILE`]: sorted, so equal maps give equal text. A path in `baseline` has a
+/// version that is not published yet, so the file keeps its old `sha256` (or none): a restart then
+/// sees the disk copy as a local change and publishes it again.
+fn known_text(known: &HashMap<String, String>, baseline: &HashMap<String, Option<String>>) -> String {
+    let mut saved: BTreeMap<&String, &String> = known.iter().collect();
+    for (path, old) in baseline {
+        match old {
+            Some(sha) => saved.insert(path, sha),
+            None => saved.remove(path),
+        };
+    }
+    serde_json::to_string(&saved).expect("a map of strings always serializes")
 }
 
 /// Write through a hidden sibling and rename it, so an editor never sees half a file.
@@ -612,6 +629,30 @@ fn check_size(bytes: &[u8], cap: u64, refused: &mut Option<String>) -> SizeCheck
     SizeCheck::TooLarge { report }
 }
 
+/// The local path of a peer's relative path: [`resolve`], and none of the parts that exist under
+/// `root` is a symlink, so a read or a write cannot leave the folder through one.
+fn safe_local(root: &Path, rel: &str) -> Option<PathBuf> {
+    let local = resolve(root, rel)?;
+    let mut walked = root.to_path_buf();
+    for part in Path::new(rel).components() {
+        walked.push(part);
+        match std::fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(_) => {}
+            // Not there yet, so nothing below it can be a link.
+            Err(_) => break,
+        }
+    }
+    Some(local)
+}
+
+/// `Some(current)` if the file at `local` is not what the scan saw (`scanned`): its sha256 now, or
+/// `None` inside if it is gone. `None` if it is unchanged.
+fn changed_since_scan(local: &Path, scanned: Option<&String>) -> Option<Option<String>> {
+    let current = std::fs::read(local).ok().map(|bytes| sha256_bytes(&bytes));
+    (current.as_ref() != scanned).then_some(current)
+}
+
 /// What is known about one path when it is settled.
 struct Facts<'a> {
     /// The sha256 that the disk and the mesh last agreed on.
@@ -676,6 +717,50 @@ mod tests {
         assert_eq!(check_size(&big, 10, &mut refused), SizeCheck::TooLarge { report: false });
         let other = vec![b'y'; 12];
         assert_eq!(check_size(&other, 10, &mut refused), SizeCheck::TooLarge { report: true });
+    }
+
+    #[test]
+    fn the_saved_known_keeps_the_old_baseline_of_a_path_that_is_not_published() {
+        let known: HashMap<String, String> =
+            [("edited.md", "new"), ("added.md", "new"), ("synced.md", "same")].map(|(path, sha)| (path.to_owned(), sha.to_owned())).into();
+        let baseline: HashMap<String, Option<String>> =
+            [("edited.md".to_owned(), Some("old".to_owned())), ("added.md".to_owned(), None)].into();
+        let saved: serde_json::Value = serde_json::from_str(&known_text(&known, &baseline)).unwrap();
+        assert_eq!(saved, json!({ "edited.md": "old", "synced.md": "same" }));
+    }
+
+    #[test]
+    fn a_file_that_changed_since_the_scan_is_reported_with_its_new_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        std::fs::write(&file, "one").unwrap();
+        let scanned = sha256_bytes(b"one");
+        assert_eq!(changed_since_scan(&file, Some(&scanned)), None);
+        std::fs::write(&file, "two").unwrap();
+        assert_eq!(changed_since_scan(&file, Some(&scanned)), Some(Some(sha256_bytes(b"two"))));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(changed_since_scan(&file, Some(&scanned)), Some(None));
+        std::fs::write(&file, "three").unwrap();
+        assert_eq!(changed_since_scan(&file, None), Some(Some(sha256_bytes(b"three"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_through_a_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        std::fs::write(outside.path().join("f.md"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("f.md"), root.join("file-link.md")).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+
+        assert_eq!(safe_local(root, "link/f.md"), None);
+        assert_eq!(safe_local(root, "link/new/f.md"), None);
+        assert_eq!(safe_local(root, "file-link.md"), None);
+        assert_eq!(safe_local(root, "real/f.md"), Some(root.join("real/f.md")));
+        assert_eq!(safe_local(root, "not/yet/there.md"), Some(root.join("not/yet/there.md")));
+        assert_eq!(safe_local(root, "../escape.md"), None);
     }
 
     #[test]
