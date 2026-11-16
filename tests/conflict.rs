@@ -30,7 +30,10 @@ async fn two_peers_that_write_one_path_at_once_converge_on_one_content() {
     let mount_dir = tempfile::tempdir().unwrap();
     let (share, mount) = (share_dir.path(), mount_dir.path());
 
+    std::fs::write(share.join("c.md"), "start").unwrap();
     let pair = Pair::start(share, mount).await;
+    // Both edits must be made against the same synced version of the file.
+    common::wait_for(&mount.join("c.md"), Some("start")).await;
     std::fs::write(share.join("c.md"), "from share").unwrap();
     std::fs::write(mount.join("c.md"), "from mount").unwrap();
 
