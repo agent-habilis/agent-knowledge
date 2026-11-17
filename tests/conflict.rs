@@ -3,9 +3,12 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
-use common::{Pair, WAIT};
+use common::Pair;
 
 const SETTLE: Duration = Duration::from_secs(7);
+/// Locally the 2 edits converge in about 2 s. A longer cap would not help a lost edit, which does not heal with time, so
+/// this stays at the 30 s of every other wait. The failure message shows how long it waited and what each side holds.
+const CONVERGE: Duration = common::WAIT;
 
 fn read(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
@@ -13,13 +16,14 @@ fn read(path: &Path) -> Option<String> {
 
 /// Wait until both folders hold the same content for `name`, and return it.
 async fn converged(left: &Path, right: &Path, name: &str) -> String {
-    let deadline = tokio::time::Instant::now() + WAIT;
+    let started = tokio::time::Instant::now();
     loop {
         let (a, b) = (read(&left.join(name)), read(&right.join(name)));
         if let Some(content) = a.as_ref().filter(|_| a == b) {
+            eprintln!("{name} converged after {:?}", started.elapsed());
             return content.clone();
         }
-        assert!(tokio::time::Instant::now() < deadline, "{name} never converged: {a:?} vs {b:?}");
+        assert!(started.elapsed() < CONVERGE, "{name} never converged in {CONVERGE:?}: {a:?} vs {b:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
