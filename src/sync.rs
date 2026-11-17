@@ -380,6 +380,8 @@ struct Downloads {
     running: HashMap<(String, String), (String, AbortHandle)>,
     slots: Arc<Semaphore>,
     done: mpsc::UnboundedSender<Finished>,
+    /// Remembers each file's hash, so a scan of an unchanged folder hashes nothing.
+    scanner: scan::Scanner,
 }
 
 /// How one download ended. On `Ok` the file is on disk, and the caller must publish it.
@@ -400,6 +402,7 @@ impl Downloads {
             running: HashMap::new(),
             slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
             done,
+            scanner: scan::Scanner::default(),
         }
     }
 
@@ -523,7 +526,7 @@ impl Downloads {
     fn claim_edits(&mut self, known: &HashMap<String, String>) -> io::Result<BTreeMap<String, String>> {
         let turn = self.gate.turn.clone();
         let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-        let disk = scan::scan(&self.root)?;
+        let disk = self.scanner.scan(&self.root)?;
         self.gate.keep_landed(&disk);
         for (path, sha) in &disk {
             if self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
