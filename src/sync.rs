@@ -175,9 +175,17 @@ pub async fn run(
                     folder.reconcile().await;
                 }
             }
-            Some(done) = finished.recv() => folder.finish(done).await,
+            Some(done) = finished.recv() => {
+                folder.finish(done).await;
+                // An edit made while this download was in flight was held back, and its watcher tick is spent.
+                folder.publish_local().await;
+            }
             Some(done) = index_done.recv() => folder.index_done(done).await,
-            _ = every.tick() => folder.reconcile().await,
+            _ = every.tick() => {
+                folder.reconcile().await;
+                // A safety net for an edit whose watcher tick was lost or came while its path was held.
+                folder.publish_local().await;
+            }
         }
         folder.publish_index().await;
         folder.write_status().await;
