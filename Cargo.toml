@@ -13,7 +13,7 @@ publish = false
 tracing = "0.1"
 # Same rev as agent-share's `chore-migrate-habilis-network`. Do not declare `iroh`:
 # habilis-network owns which iroh fork is in the graph.
-habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "959a8887e52d90d2f84c3d03007e11d8ccd509ab", features = ["blob"] }
+habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "ab79ae08e0b2981cc3bf2312a613d8eaff96f801", features = ["blob"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
@@ -28,7 +28,7 @@ tempfile = "3"
 # Pauses the test clock, so a test can wait out the fetch deadline and the retry backoff in no real time.
 tokio = { version = "1", features = ["test-util"] }
 # Test hooks only: `block_ip_paths` takes every direct path away, so a test can force the relay.
-habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "959a8887e52d90d2f84c3d03007e11d8ccd509ab", features = ["blob", "iroh-test-utils"] }
+habilis-network = { git = "https://github.com/agent-habilis/habilis-network", rev = "ab79ae08e0b2981cc3bf2312a613d8eaff96f801", features = ["blob", "iroh-test-utils"] }
 
 [profile.release]
 opt-level = 3
