@@ -178,7 +178,10 @@ pub async fn run(
             Some(done) = finished.recv() => {
                 folder.finish(done).await;
                 // An edit made while this download was in flight was held back, and its watcher tick is spent.
-                folder.publish_local().await;
+                // A burst of downloads publishes once, after the last one.
+                if folder.downloads.is_idle() {
+                    folder.publish_local().await;
+                }
             }
             Some(done) = index_done.recv() => folder.index_done(done).await,
             _ = every.tick() => {
@@ -464,6 +467,11 @@ impl Downloads {
             });
             self.running.insert(key, (sha.clone(), task.abort_handle()));
         }
+    }
+
+    /// Whether no download is in flight.
+    fn is_idle(&self) -> bool {
+        self.running.is_empty()
     }
 
     /// Record how a download ended, so a permanent failure is not started again.
@@ -1778,6 +1786,33 @@ mod tests {
 
         assert!(first.result.is_ok());
         assert!(second.result.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_downloads_are_idle_only_when_none_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![
+            ("stuck.md".to_owned(), sha.clone(), "stuck".to_owned()),
+            ("start.md".to_owned(), sha.clone(), "start".to_owned()),
+        ];
+        let fetch = move |ticket: String, _: Progress| async move {
+            if ticket == "stuck" {
+                std::future::pending::<()>().await;
+            }
+            Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+        };
+        assert!(downloads.is_idle());
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        assert!(!downloads.is_idle());
+        let first =
+            tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.expect("a result").expect("open");
+        downloads.settle(&first);
+        assert!(!downloads.is_idle(), "the stuck download is still in flight");
     }
 
     #[tokio::test(start_paused = true)]
