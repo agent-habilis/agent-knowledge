@@ -25,7 +25,7 @@ pub async fn wait_for(path: &Path, want: Option<&str>) {
 
 /// The `sync::Options` of a test peer on `root`.
 pub fn options(root: &Path, mesh: Option<String>, nickname: Option<&str>) -> sync::Options {
-    sync::Options { root: root.to_path_buf(), mesh, nickname: nickname.map(str::to_owned) }
+    sync::Options { root: root.to_path_buf(), mesh, nickname: nickname.map(str::to_owned), status_file: None }
 }
 
 /// One running `sync::run` loop.
@@ -43,10 +43,15 @@ impl Peer {
         nickname: Option<&str>,
         on_presence: impl FnMut(Presence) + Send + 'static,
     ) -> Self {
+        Self::start_with(options(root, mesh, nickname), on_presence).await
+    }
+
+    /// [`Peer::start`] with every option spelled out.
+    pub async fn start_with(options: sync::Options, on_presence: impl FnMut(Presence) + Send + 'static) -> Self {
         let (stop, mut stop_rx) = watch::channel(());
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(sync::run(
-            options(root, mesh, nickname),
+            options,
             move |ready: &Ready| ready_tx.send(ready.clone()).unwrap(),
             on_presence,
             async move {

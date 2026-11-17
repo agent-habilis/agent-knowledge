@@ -49,7 +49,9 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
 pub fn resolve(root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     let safe = !rel.is_empty()
-        && rel_path.components().all(|c| matches!(c, Component::Normal(name) if !name.to_string_lossy().starts_with('.')));
+        && rel_path
+            .components()
+            .all(|c| matches!(c, Component::Normal(name) if !name.to_string_lossy().starts_with('.')));
     safe.then(|| root.join(rel_path))
 }
 

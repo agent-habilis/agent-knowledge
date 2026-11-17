@@ -1,0 +1,52 @@
+[package]
+versioned_files = [
+  "Cargo.toml",
+  { path = "Cargo.lock", dependency = "agent-knowledge" },
+]
+changelog = "CHANGELOG.md"
+
+[[workflows]]
+name = "document-change"
+
+[[workflows.steps]]
+type = "CreateChangeFile"
+
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+# knope versions only the files above. The BSL header names the released
+# version and its Change Date, so it moves with every release.
+[[workflows.steps]]
+type = "Command"
+command = "bun scripts/update-license.ts $version"
+
+[[workflows.steps]]
+type = "Command"
+command = "git add LICENSE"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: release $version\""
+
+[[workflows.steps]]
+type = "Command"
+command = "git push origin HEAD:main"
+
+[[workflows.steps]]
+type = "Release"
+
+[[workflows]]
+name = "publish"
+
+[[workflows.steps]]
+type = "Release"
+
+[changes]
+ignore_conventional_commits = true
+
+[github]
+owner = "agent-habilis"
+repo = "agent-knowledge"

@@ -11,7 +11,7 @@ fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 fn embeds_every_skill_with_frontmatter() {
     let names: Vec<&str> = plug::SKILLS.iter().map(|s| s.name).collect();
 
-    assert_eq!(names, ["knowledge-share", "knowledge-mount", "knowledge-write", "knowledge-read"]);
+    assert_eq!(names, ["knowledge-share", "knowledge-mount", "knowledge-write", "knowledge-read", "knowledge-status"]);
     for skill in plug::SKILLS {
         assert!(skill.body.starts_with(&format!("---\nname: {}\n", skill.name)), "{} frontmatter", skill.name);
     }
@@ -28,7 +28,8 @@ fn skills_dir_defaults_under_home() {
 
 #[test]
 fn skills_dir_honors_agent_config_env() {
-    let env = env_from(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/c"), ("CODEX_HOME", "/x"), ("PI_CODING_AGENT_DIR", "/p")]);
+    let env =
+        env_from(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/c"), ("CODEX_HOME", "/x"), ("PI_CODING_AGENT_DIR", "/p")]);
 
     assert_eq!(plug::skills_dir(Agent::ClaudeCode, &env).unwrap(), PathBuf::from("/c/skills"));
     assert_eq!(plug::skills_dir(Agent::Codex, &env).unwrap(), PathBuf::from("/x/skills"));

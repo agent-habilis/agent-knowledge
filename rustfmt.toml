@@ -1,0 +1,4 @@
+# Stable options only: rust-toolchain.toml pins a stable toolchain.
+# These match how the code was written, so `cargo fmt` moves few lines.
+max_width = 120
+use_small_heuristics = "Max"
