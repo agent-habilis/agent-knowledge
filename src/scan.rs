@@ -20,6 +20,8 @@ const RACY: Duration = Duration::from_secs(2);
 /// Scans a folder again and again, and hashes only the files that changed since the last scan.
 #[derive(Default)]
 pub struct Scanner {
+    /// The folder that `seen` belongs to: its paths are relative to it, so another folder cannot reuse them.
+    root: Option<PathBuf>,
     seen: HashMap<String, Seen>,
     hashed: usize,
 }
@@ -32,9 +34,24 @@ impl Scanner {
 
     /// Every synced file under `root`, as relative path → sha256 hex.
     /// Hidden entries (a name that starts with `.`) are skipped, so `.git` and editor swap files stay local.
+    /// A scan of another folder than the last one starts from nothing.
     /// A file whose size and modification time are those of the last scan keeps its hash, unless it was modified
     /// within 2 s of that scan, which a coarse clock could not tell from the edit that follows.
     pub fn scan(&mut self, root: &Path) -> io::Result<BTreeMap<String, String>> {
+        self.scan_with(root, &mut SystemTime::now, &mut sha256_file)
+    }
+
+    /// [`Self::scan`] with the clock and the hash of a file given, so a test can see in what order they run.
+    fn scan_with(
+        &mut self,
+        root: &Path,
+        now: &mut dyn FnMut() -> SystemTime,
+        hash: &mut dyn FnMut(&Path) -> io::Result<String>,
+    ) -> io::Result<BTreeMap<String, String>> {
+        if self.root.as_deref() != Some(root) {
+            self.seen.clear();
+            self.root = Some(root.to_path_buf());
+        }
         let mut files = BTreeMap::new();
         let mut seen = HashMap::new();
         self.hashed = 0;
@@ -60,9 +77,12 @@ impl Scanner {
                     let entry = match known {
                         Some(known) => known,
                         None => {
-                            let Ok(sha) = sha256_file(&path) else { continue };
+                            // Read the clock first: an edit during the read is then not older than `hashed_at`, so the
+                            // file is hashed again at the next scan.
+                            let hashed_at = now();
+                            let Ok(sha) = hash(&path) else { continue };
                             self.hashed += 1;
-                            Seen { len: meta.len(), modified, sha, hashed_at: SystemTime::now() }
+                            Seen { len: meta.len(), modified, sha, hashed_at }
                         }
                     };
                     files.insert(rel.clone(), entry.sha.clone());
@@ -171,6 +191,43 @@ mod tests {
         write("v2");
         let files = scanner.scan(dir.path()).unwrap();
         assert_eq!(files["v.md"], sha256_bytes(b"v2"));
+    }
+
+    #[test]
+    fn the_cache_is_not_reused_for_another_root() {
+        let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let tick = SystemTime::now() - Duration::from_secs(60);
+        for (dir, content) in [(&one, "AAAA"), (&two, "BBBB")] {
+            std::fs::write(dir.path().join("same.md"), content).unwrap();
+            std::fs::File::options().write(true).open(dir.path().join("same.md")).unwrap().set_modified(tick).unwrap();
+        }
+        let mut scanner = Scanner::default();
+        scanner.scan(one.path()).unwrap();
+        let files = scanner.scan(two.path()).unwrap();
+        assert_eq!(files["same.md"], sha256_bytes(b"BBBB"));
+        assert_eq!(scanner.hashed(), 1);
+    }
+
+    #[test]
+    fn the_clock_is_read_before_the_file_is_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        let log = std::cell::RefCell::new(Vec::new());
+        let mut scanner = Scanner::default();
+        scanner
+            .scan_with(
+                dir.path(),
+                &mut || {
+                    log.borrow_mut().push("clock");
+                    SystemTime::now()
+                },
+                &mut |path| {
+                    log.borrow_mut().push("read");
+                    sha256_file(path)
+                },
+            )
+            .unwrap();
+        assert_eq!(*log.borrow(), ["clock", "read"], "an edit during the read must count as after the clock");
     }
 
     #[test]
