@@ -5,6 +5,35 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// What a scan found and could not read: some files, some folders, or, when the scan failed as a whole, everything.
+/// Such a path exists, so a caller must not take it for one that was deleted.
+#[derive(Debug, Default)]
+pub struct Unreadable {
+    files: BTreeSet<String>,
+    /// A folder that could not be listed. Every path under it is covered.
+    dirs: BTreeSet<String>,
+    all: bool,
+}
+
+impl Unreadable {
+    /// The cover of a scan that failed as a whole: every path may exist.
+    pub fn everything() -> Self {
+        Self { all: true, ..Self::default() }
+    }
+
+    /// Whether `path` may exist although the scan did not list it.
+    pub fn covers(&self, path: &str) -> bool {
+        self.all
+            || self.files.contains(path)
+            || self.dirs.iter().any(|dir| path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/')))
+    }
+
+    #[cfg(test)]
+    fn files(&self) -> Vec<&str> {
+        self.files.iter().map(String::as_str).collect()
+    }
+}
+
 /// A file hashed before: its size, modification time and identity then, and when it was hashed.
 struct Seen {
     len: u64,
@@ -27,8 +56,8 @@ pub struct Scanner {
     root: Option<PathBuf>,
     seen: HashMap<String, Seen>,
     hashed: usize,
-    /// The files that the last scan found but could not read. They are not in its result, but they are not deleted.
-    unreadable: BTreeSet<String>,
+    /// What the last scan found and could not read. It is not in the result, but it is not deleted.
+    unreadable: Unreadable,
 }
 
 impl Scanner {
@@ -37,9 +66,9 @@ impl Scanner {
         self.hashed
     }
 
-    /// The files that the last [`Self::scan`] found and could not read, such as one with mode 000. Such a file exists,
-    /// so a caller must not take it for a file that was deleted.
-    pub fn unreadable(&self) -> &BTreeSet<String> {
+    /// What the last [`Self::scan`] found and could not read, such as a file with mode 000 or a folder that cannot be
+    /// listed. Such a path exists, so a caller must not take it for one that was deleted.
+    pub fn unreadable(&self) -> &Unreadable {
         &self.unreadable
     }
 
@@ -65,7 +94,7 @@ impl Scanner {
         }
         let mut files = BTreeMap::new();
         let mut seen = HashMap::new();
-        let mut unreadable = BTreeSet::new();
+        let mut unreadable = Unreadable::default();
         self.hashed = 0;
         let walked = self.walk(root, now, hash, &mut files, &mut seen, &mut unreadable);
         if let Err(error) = walked {
@@ -86,11 +115,25 @@ impl Scanner {
         hash: &mut dyn FnMut(&Path) -> io::Result<String>,
         files: &mut BTreeMap<String, String>,
         seen: &mut HashMap<String, Seen>,
-        unreadable: &mut BTreeSet<String>,
+        unreadable: &mut Unreadable,
     ) -> io::Result<()> {
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)? {
+            // The folder of the scan itself must be listed, or the scan has nothing to say. A folder below it that cannot
+            // be listed is skipped, and what is under it counts as unreadable.
+            let listing = match std::fs::read_dir(&dir) {
+                Ok(listing) => listing,
+                Err(error) if dir != root => {
+                    if error.kind() != io::ErrorKind::NotFound
+                        && let Some(rel) = relative(root, &dir)
+                    {
+                        unreadable.dirs.insert(rel);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for entry in listing {
                 let entry = entry?;
                 if entry.file_name().to_string_lossy().starts_with('.') {
                     continue;
@@ -106,13 +149,13 @@ impl Scanner {
                         Ok(meta) => meta,
                         Err(error) => {
                             if error.kind() != io::ErrorKind::NotFound {
-                                unreadable.insert(rel);
+                                unreadable.files.insert(rel);
                             }
                             continue;
                         }
                     };
                     let Ok(modified) = meta.modified() else {
-                        unreadable.insert(rel);
+                        unreadable.files.insert(rel);
                         continue;
                     };
                     let identity = identity_of(&meta);
@@ -132,7 +175,7 @@ impl Scanner {
                                 Ok(sha) => sha,
                                 Err(error) => {
                                     if error.kind() != io::ErrorKind::NotFound {
-                                        unreadable.insert(rel);
+                                        unreadable.files.insert(rel);
                                     }
                                     continue;
                                 }
@@ -282,22 +325,47 @@ mod tests {
     fn a_scan_that_fails_keeps_the_cache() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("locked")).unwrap();
         for name in ["a.md", "b.md", "c.md"] {
             std::fs::write(dir.path().join(name), name).unwrap();
             age(&dir.path().join(name), Duration::from_secs(60));
         }
         let mut scanner = Scanner::default();
         scanner.scan(dir.path()).unwrap();
-        let locked = dir.path().join("locked");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
         let failed = scanner.scan(dir.path());
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         if failed.is_ok() {
-            return; // a user that can read any directory, such as root, cannot make the scan fail
+            return; // a user that can list any folder, such as root, cannot make the scan fail
         }
         scanner.scan(dir.path()).unwrap();
         assert_eq!(scanner.hashed(), 0, "the failed scan dropped the hashes of the files that did not change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_listed_is_skipped_and_covers_its_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("locked")).unwrap();
+        std::fs::write(dir.path().join("locked/x.md"), "x").unwrap();
+        std::fs::write(dir.path().join("a.md"), "a").unwrap();
+        age(&dir.path().join("a.md"), Duration::from_secs(60));
+        let mut scanner = Scanner::default();
+        scanner.scan(dir.path()).unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let files = scanner.scan(dir.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Ok(files) = files else { panic!("a folder below the root that cannot be listed failed the scan") };
+        if files.contains_key("locked/x.md") {
+            return; // a user that can list any folder, such as root, cannot make it unreadable
+        }
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["a.md"]);
+        assert_eq!(scanner.hashed(), 0, "the files that did not change were hashed again");
+        let unreadable = scanner.unreadable();
+        assert!(unreadable.covers("locked/x.md"), "a path under the folder was not covered");
+        assert!(!unreadable.covers("lockedx.md"), "a path that only starts like the folder was covered");
+        assert!(!unreadable.covers("a.md"));
     }
 
     #[cfg(unix)]
@@ -316,7 +384,7 @@ mod tests {
             return; // a user that can read any file, such as root, cannot make it unreadable
         }
         assert_eq!(files.keys().collect::<Vec<_>>(), ["b.md"]);
-        assert_eq!(scanner.unreadable().iter().collect::<Vec<_>>(), ["a.md"]);
+        assert_eq!(scanner.unreadable().files(), ["a.md"]);
     }
 
     #[test]
