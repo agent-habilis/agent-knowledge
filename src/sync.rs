@@ -683,7 +683,8 @@ impl Folder {
         };
         let holding = self.first_view_by.is_some_and(|by| tokio::time::Instant::now() < by);
         let mut publishable = self.downloads.publishable(&disk, &self.known);
-        publishable.retain(|(path, _)| !holding || self.known.contains_key(path));
+        // A path with a saved entry is an edit made while stopped, not a copy of unknown age: it is published at once.
+        publishable.retain(|(path, _)| !holding || self.known.contains_key(path) || self.own.contains_key(path));
         for (path, sha) in publishable {
             match self.publish(&path, &sha, now_ms()).await {
                 Ok(()) => {
