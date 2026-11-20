@@ -25,7 +25,13 @@ pub async fn wait_for(path: &Path, want: Option<&str>) {
 
 /// The `sync::Options` of a test peer on `root`.
 pub fn options(root: &Path, mesh: Option<String>, nickname: Option<&str>) -> sync::Options {
-    sync::Options { root: root.to_path_buf(), mesh, nickname: nickname.map(str::to_owned), status_file: None }
+    sync::Options {
+        root: root.to_path_buf(),
+        mesh,
+        nickname: nickname.map(str::to_owned),
+        status_file: None,
+        delays: sync::Delays::default(),
+    }
 }
 
 /// One running `sync::run` loop.

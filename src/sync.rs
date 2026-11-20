@@ -50,6 +50,17 @@ pub struct Options {
     pub nickname: Option<String>,
     /// Where to keep this memory's [`Status`] for `agent-knowledge status`, or `None` for nowhere.
     pub status_file: Option<PathBuf>,
+    /// Slow steps for the tests that need a race to be wide enough to hit. The default adds no delay.
+    #[doc(hidden)]
+    pub delays: Delays,
+}
+
+/// How long to hold back the end of each download, and the fetch of each index. Both are zero in production.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Delays {
+    pub finished: Duration,
+    pub index: Duration,
 }
 
 /// The mesh is up.
@@ -77,7 +88,7 @@ pub async fn run(
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname, status_file } = options;
+    let Options { root, mesh, nickname, status_file, delays } = options;
     let joining = mesh.is_some();
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
@@ -127,7 +138,7 @@ pub async fn run(
         member,
         blobs,
         known,
-        downloads: Downloads::new(root, done),
+        downloads: Downloads { finish_delay: delays.finished, ..Downloads::new(root, done) },
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
@@ -148,6 +159,7 @@ pub async fn run(
         winner_ts: HashMap::new(),
         index_written: None,
         spool,
+        index_delay: delays.index,
         first_view_by: joining.then(|| tokio::time::Instant::now() + FIRST_VIEW_WAIT),
     };
 
@@ -251,6 +263,7 @@ struct Folder {
     /// baseline is held back meanwhile, so a stale copy cannot replace a newer version that the document is about to
     /// bring.
     first_view_by: Option<tokio::time::Instant>,
+    index_delay: Duration,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -389,6 +402,8 @@ struct Downloads {
     done: mpsc::UnboundedSender<Finished>,
     /// Remembers each file's hash, so a scan of an unchanged folder hashes nothing.
     scanner: scan::Scanner,
+    /// How long each download waits before it reports back. Zero outside the tests.
+    finish_delay: Duration,
 }
 
 /// How one download ended. On `Ok` the file is on disk, and the caller must publish it.
@@ -410,6 +425,7 @@ impl Downloads {
             slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
             done,
             scanner: scan::Scanner::default(),
+            finish_delay: Duration::ZERO,
         }
     }
 
@@ -462,6 +478,7 @@ impl Downloads {
             let (path_for_fetch, sha_for_fetch, ticket_for_fetch) =
                 (path.clone(), sha_owned.clone(), ticket_owned.clone());
             let gate = self.gate.clone();
+            let finish_delay = self.finish_delay;
             let task = tokio::spawn(async move {
                 // The download runs in an inner task, so a panic in it still reports back as a failure.
                 let inner = tokio::spawn(async move {
@@ -473,6 +490,7 @@ impl Downloads {
                     // A panic is a bug in this code, so a retry would repeat it. It stays failed until the entry changes.
                     Err(error) => Err(Failure::Permanent(anyhow!("download task ended: {error}"))),
                 };
+                tokio::time::sleep(finish_delay).await;
                 let _ = done.send(Finished { path: path_owned, sha: sha_owned, ticket: ticket_owned, result });
             });
             self.running.insert(key, (sha.clone(), task.abort_handle()));
@@ -817,7 +835,9 @@ impl Folder {
             self.index_pending.insert((author.clone(), sha.clone()));
             let (consumer, tx) = (self.consumer.clone(), self.index_tx.clone());
             let (fetch_author, fetch_sha) = (author.clone(), sha.clone());
+            let delay = self.index_delay;
             let task = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
                 let result = fetch_index(consumer, &ticket, &fetch_sha).await.map_err(|error| format!("{error:#}"));
                 let _ = tx.send(IndexDone { author: fetch_author, sha: fetch_sha, result });
             });
@@ -886,10 +906,13 @@ impl Folder {
             self.first_view_by = None;
         }
         let view = view_of(document, &self.indexes);
-        self.winner_ts = view
-            .iter()
-            .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
-            .collect();
+        // While an author's new index is in fetch, its slice is not live and the view lacks its paths. A path that is
+        // still wanted keeps the ts of the entry it is wanted for, so its download is served with that ts and not a new one.
+        let wanted: HashSet<String> = self.downloads.gate.wanted_paths().into_iter().collect();
+        self.winner_ts.retain(|path, _| wanted.contains(path));
+        self.winner_ts.extend(
+            view.iter().map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0))),
+        );
         let tracked: Vec<String> = self
             .known
             .keys()
@@ -941,9 +964,10 @@ impl Folder {
         }
         let published = match result {
             // Serve the file too, so a peer can still get it after its author left.
-            // A served copy keeps the ts of the entry it came from, so an older copy never beats a newer edit.
+            // A served copy keeps the ts of the entry it came from, and never takes the time of the download, so an
+            // older copy never beats a newer edit or a delete.
             Ok(()) => {
-                let ts = self.winner_ts.get(&path).copied().unwrap_or_else(now_ms);
+                let ts = self.winner_ts.get(&path).copied().unwrap_or(0);
                 let published = self.publish(&path, &sha, ts).await;
                 self.save_own();
                 published

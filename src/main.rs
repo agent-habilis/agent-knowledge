@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 print_nickname(&ready.nick);
             };
             let status_file = Some(claim.status_path().to_path_buf());
-            let options = Options { root: folder, mesh: None, nickname, status_file };
+            let options = Options { root: folder, mesh: None, nickname, status_file, delays: Default::default() };
             sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Mount { hash, target, nickname } => {
@@ -136,7 +136,8 @@ async fn main() -> anyhow::Result<()> {
                 print_nickname(&ready.nick);
             };
             let status_file = Some(claim.status_path().to_path_buf());
-            let options = Options { root: target.clone(), mesh: Some(hash), nickname, status_file };
+            let options =
+                Options { root: target.clone(), mesh: Some(hash), nickname, status_file, delays: Default::default() };
             sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),
