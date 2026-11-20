@@ -64,3 +64,28 @@ async fn an_edit_made_while_a_download_is_in_flight_is_published_without_another
     mount.stop().await;
     share.stop().await;
 }
+
+/// The saved ts of `path` in the history file of the folder `dir`.
+fn saved_ts(dir: &std::path::Path, path: &str) -> Option<u64> {
+    let saved = std::fs::read_to_string(dir.join(".agent-knowledge-index.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&saved).ok()?["own"][path]["ts"].as_u64()
+}
+
+/// The copy that the mount serves keeps the ts of the entry it came from. A ts of 0 or of the time of the download would
+/// not fail the tests above, which only look at the content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_copy_keeps_the_ts_of_its_entry() {
+    let (share_dir, mount_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (share, mount) = mount_with_a_late_download(share_dir.path(), mount_dir.path()).await;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while saved_ts(mount_dir.path(), "p.md").is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "the mount never served p.md");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let from_the_share = saved_ts(share_dir.path(), "p.md").expect("the share saved no ts");
+    assert_eq!(saved_ts(mount_dir.path(), "p.md"), Some(from_the_share));
+
+    mount.stop().await;
+    share.stop().await;
+}

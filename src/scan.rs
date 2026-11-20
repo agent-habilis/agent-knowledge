@@ -208,6 +208,8 @@ fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, i64, i64)> {
     Some((meta.ino(), meta.ctime(), meta.ctime_nsec()))
 }
 
+/// Off unix there is no inode or change time to read here, so a file that replaces another with the same size and the
+/// same modification time is not told apart: the cache key is the size and the modification time alone.
 #[cfg(not(unix))]
 fn identity_of(_: &std::fs::Metadata) -> Option<(u64, i64, i64)> {
     None

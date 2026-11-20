@@ -180,6 +180,10 @@ mod tests {
         assert!(!is_change(&on(open, "/watched/a.md"), folder), "an open is no change");
         assert!(!is_change(&on(close, "/watched/a.md"), folder), "a close is no change");
         assert!(is_change(&on(write, "/watched/a.md"), folder), "a write is a change");
+        let folder_created = notify::EventKind::Create(notify::event::CreateKind::Folder);
+        assert!(!is_change(&on(folder_created, "/watched"), folder), "a report about the folder itself is no change");
+        let own_index = format!("/watched/{INDEX_FILE}.tmp");
+        assert!(!is_change(&on(write, &own_index), folder), "a write of the own index file is no change");
     }
 
     #[tokio::test]
