@@ -50,3 +50,17 @@ async fn a_late_download_of_the_old_version_does_not_beat_a_newer_delete() {
     mount.stop().await;
     share.stop().await;
 }
+
+/// An edit made after the file landed and before its download is reported is held back, and its watcher tick is
+/// spent. It must still reach the author, with no later change in the folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_made_while_a_download_is_in_flight_is_published_without_another_tick() {
+    let (share_dir, mount_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (share, mount) = mount_with_a_late_download(share_dir.path(), mount_dir.path()).await;
+
+    std::fs::write(mount_dir.path().join("p.md"), "mine").unwrap();
+    wait_for(&share_dir.path().join("p.md"), Some("mine")).await;
+
+    mount.stop().await;
+    share.stop().await;
+}

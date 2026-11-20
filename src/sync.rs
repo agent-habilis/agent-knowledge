@@ -1106,7 +1106,7 @@ fn current_pointer(pointers: &HashMap<String, String>, author: &str, sha: &str) 
 }
 
 /// The own index is kept here between runs, as a hidden file, which the scan skips.
-const INDEX_FILE: &str = ".agent-knowledge-index.json";
+pub(crate) const INDEX_FILE: &str = ".agent-knowledge-index.json";
 
 /// The largest index blob that is fetched or published. A larger one is refused with an error, never truncated.
 const INDEX_MAX_BYTES: usize = 16 * 1024 * 1024;
