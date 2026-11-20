@@ -37,8 +37,11 @@ const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
 /// How long a peer that joins an existing mesh holds its untracked files while it waits for the first view of the
-/// document. A mesh with no other peer to show one is not waited for longer.
+/// document: the pointer of another author, and the index it names. A peer that starts alone waits all of it, because
+/// it cannot tell a mesh with no other peer from one whose peers are not there yet.
 const FIRST_VIEW_WAIT: Duration = Duration::from_secs(20);
+/// The longest the wait goes on, when the index of another author is still in fetch at the end of [`FIRST_VIEW_WAIT`].
+const FIRST_VIEW_LIMIT: Duration = Duration::from_secs(60);
 
 /// What to sync, and as whom.
 pub struct Options {
@@ -162,7 +165,7 @@ pub async fn run(
         index_written: None,
         spool,
         index_delay: delays.index,
-        first_view_by: joining.then(|| tokio::time::Instant::now() + FIRST_VIEW_WAIT),
+        joined_at: joining.then(tokio::time::Instant::now),
     };
 
     for (path, sha, ts) in kept {
@@ -264,10 +267,10 @@ struct Folder {
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
     spool: PathBuf,
-    /// Set while a peer that joined an existing mesh has not seen the document yet, and until when. A file with no
+    /// Set while a peer that joined an existing mesh has not seen the document yet, and since when. A file with no
     /// baseline is held back meanwhile, so a stale copy cannot replace a newer version that the document is about to
     /// bring.
-    first_view_by: Option<tokio::time::Instant>,
+    joined_at: Option<tokio::time::Instant>,
     index_delay: Duration,
 }
 
@@ -681,7 +684,7 @@ impl Folder {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
         };
-        let holding = self.first_view_by.is_some_and(|by| tokio::time::Instant::now() < by);
+        let holding = self.waiting_for_the_first_view();
         let mut publishable = self.downloads.publishable(&disk, &self.known);
         // A path with a saved entry is an edit made while stopped, not a copy of unknown age: it is published at once.
         publishable.retain(|(path, _)| !holding || self.known.contains_key(path) || self.own.contains_key(path));
@@ -712,6 +715,14 @@ impl Folder {
         }
         self.save_own();
         self.publish_index().await;
+    }
+
+    /// Whether a file with no baseline is held back: the peer joined an existing mesh, and has not seen it yet. The wait
+    /// is [`FIRST_VIEW_WAIT`], and it goes on up to [`FIRST_VIEW_LIMIT`] while an index fetch is under way.
+    fn waiting_for_the_first_view(&self) -> bool {
+        let Some(joined) = self.joined_at else { return false };
+        let waited = joined.elapsed();
+        waited < FIRST_VIEW_WAIT || (!self.index_pending.is_empty() && waited < FIRST_VIEW_LIMIT)
     }
 
     /// Log a failed transfer and count it for `status`.
@@ -912,11 +923,11 @@ impl Folder {
             let entries = self.own.iter().map(|(path, entry)| (path.clone(), entry.clone())).collect();
             self.indexes.0.insert(author, (sha, entries));
         }
-        if self.first_view_by.is_some()
-            && !self.pointers.is_empty()
-            && pointers_to_fetch(document, &self.indexes).is_empty()
-        {
-            self.first_view_by = None;
+        // The first view is complete once another author's pointer is there and every index it names is fetched. The own
+        // pointer says nothing about the mesh, so a peer that starts alone keeps waiting.
+        let another_author = self.pointers.values().any(|sha| Some(sha) != self.index_sha.as_ref());
+        if self.joined_at.is_some() && another_author && pointers_to_fetch(document, &self.indexes).is_empty() {
+            self.joined_at = None;
         }
         let view = view_of(document, &self.indexes);
         // While an author's new index is in fetch, its slice is not live and the view lacks its paths. A path that is
