@@ -58,6 +58,25 @@ impl Scanner {
         let mut files = BTreeMap::new();
         let mut seen = HashMap::new();
         self.hashed = 0;
+        let walked = self.walk(root, now, hash, &mut files, &mut seen);
+        if let Err(error) = walked {
+            // The entries moved to `seen` go back, so the files that did not change are not hashed again.
+            self.seen.extend(seen);
+            return Err(error);
+        }
+        self.seen = seen;
+        Ok(files)
+    }
+
+    /// Visit every file under `root`: each one is added to `files`, and its cache entry moves from `self.seen` to `seen`.
+    fn walk(
+        &mut self,
+        root: &Path,
+        now: &mut dyn FnMut() -> SystemTime,
+        hash: &mut dyn FnMut(&Path) -> io::Result<String>,
+        files: &mut BTreeMap<String, String>,
+        seen: &mut HashMap<String, Seen>,
+    ) -> io::Result<()> {
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir)? {
@@ -97,8 +116,7 @@ impl Scanner {
                 }
             }
         }
-        self.seen = seen;
-        Ok(files)
+        Ok(())
     }
 }
 
@@ -227,6 +245,29 @@ mod tests {
         std::fs::rename(&other, &file).unwrap();
         let files = scanner.scan(dir.path()).unwrap();
         assert_eq!(files["a.md"], sha256_bytes(b"BBBB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_that_fails_keeps_the_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("locked")).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+            age(&dir.path().join(name), Duration::from_secs(60));
+        }
+        let mut scanner = Scanner::default();
+        scanner.scan(dir.path()).unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let failed = scanner.scan(dir.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if failed.is_ok() {
+            return; // a user that can read any directory, such as root, cannot make the scan fail
+        }
+        scanner.scan(dir.path()).unwrap();
+        assert_eq!(scanner.hashed(), 0, "the failed scan dropped the hashes of the files that did not change");
     }
 
     #[test]
