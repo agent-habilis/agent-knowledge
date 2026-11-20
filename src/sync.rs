@@ -36,6 +36,9 @@ use crate::watch::watch;
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
+/// How long a peer that joins an existing mesh holds its untracked files while it waits for the first view of the
+/// document. A mesh with no other peer to show one is not waited for longer.
+const FIRST_VIEW_WAIT: Duration = Duration::from_secs(20);
 
 /// What to sync, and as whom.
 pub struct Options {
@@ -75,6 +78,7 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let Options { root, mesh, nickname, status_file } = options;
+    let joining = mesh.is_some();
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -144,6 +148,7 @@ pub async fn run(
         winner_ts: HashMap::new(),
         index_written: None,
         spool,
+        first_view_by: joining.then(|| tokio::time::Instant::now() + FIRST_VIEW_WAIT),
     };
 
     for (path, sha, ts) in kept {
@@ -152,8 +157,6 @@ pub async fn run(
         }
     }
 
-    // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
-    // newer remote version. It is pre-existing, and it is not fixed here.
     folder.reconcile().await;
     folder.publish_local().await;
     folder.write_status().await;
@@ -244,6 +247,10 @@ struct Folder {
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
     spool: PathBuf,
+    /// Set while a peer that joined an existing mesh has not seen the document yet, and until when. A file with no
+    /// baseline is held back meanwhile, so a stale copy cannot replace a newer version that the document is about to
+    /// bring.
+    first_view_by: Option<tokio::time::Instant>,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -651,7 +658,10 @@ impl Folder {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
         };
-        for (path, sha) in self.downloads.publishable(&disk, &self.known) {
+        let holding = self.first_view_by.is_some_and(|by| tokio::time::Instant::now() < by);
+        let mut publishable = self.downloads.publishable(&disk, &self.known);
+        publishable.retain(|(path, _)| !holding || self.known.contains_key(path));
+        for (path, sha) in publishable {
             match self.publish(&path, &sha, now_ms()).await {
                 Ok(()) => {
                     eprintln!("↑ {path}");
@@ -868,6 +878,12 @@ impl Folder {
         {
             let entries = self.own.iter().map(|(path, entry)| (path.clone(), entry.clone())).collect();
             self.indexes.0.insert(author, (sha, entries));
+        }
+        if self.first_view_by.is_some()
+            && !self.pointers.is_empty()
+            && pointers_to_fetch(document, &self.indexes).is_empty()
+        {
+            self.first_view_by = None;
         }
         let view = view_of(document, &self.indexes);
         self.winner_ts = view

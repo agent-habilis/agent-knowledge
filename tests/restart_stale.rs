@@ -43,7 +43,7 @@ async fn a_restarted_peer_with_a_stale_copy_takes_the_newer_version() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_copy_with_no_history_does_not_beat_the_mesh() {
     restart_with_a_stale_copy(|root| {
-        let _ = std::fs::remove_file(root.join(".agent-knowledge-known.json"));
+        std::fs::remove_file(root.join(".agent-knowledge-index.json")).unwrap();
     })
     .await;
 }
