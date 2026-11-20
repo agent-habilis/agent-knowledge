@@ -5,10 +5,13 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-/// A file hashed before: its size and modification time then, and when it was hashed.
+/// A file hashed before: its size, modification time and identity then, and when it was hashed.
 struct Seen {
     len: u64,
     modified: SystemTime,
+    /// The inode and the change time, where the system has them. A file that replaces another by a rename can keep its
+    /// size and its modification time, but not these. `git` keys its index on them for the same reason.
+    identity: Option<(u64, i64, i64)>,
     sha: String,
     hashed_at: SystemTime,
 }
@@ -71,8 +74,12 @@ impl Scanner {
                     // A file can vanish between the listing and the read.
                     let Ok(meta) = entry.metadata() else { continue };
                     let Ok(modified) = meta.modified() else { continue };
+                    let identity = identity_of(&meta);
                     let known = self.seen.remove(&rel).filter(|known| {
-                        known.len == meta.len() && known.modified == modified && known.hashed_at > known.modified + RACY
+                        known.len == meta.len()
+                            && known.modified == modified
+                            && known.identity == identity
+                            && known.modified.checked_add(RACY).is_some_and(|racy_end| known.hashed_at > racy_end)
                     });
                     let entry = match known {
                         Some(known) => known,
@@ -82,7 +89,7 @@ impl Scanner {
                             let hashed_at = now();
                             let Ok(sha) = hash(&path) else { continue };
                             self.hashed += 1;
-                            Seen { len: meta.len(), modified, sha, hashed_at }
+                            Seen { len: meta.len(), modified, identity, sha, hashed_at }
                         }
                     };
                     files.insert(rel.clone(), entry.sha.clone());
@@ -102,6 +109,17 @@ pub fn scan(root: &Path) -> io::Result<BTreeMap<String, String>> {
 
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(unix)]
+fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.ino(), meta.ctime(), meta.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn identity_of(_: &std::fs::Metadata) -> Option<(u64, i64, i64)> {
+    None
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -191,6 +209,24 @@ mod tests {
         write("v2");
         let files = scanner.scan(dir.path()).unwrap();
         assert_eq!(files["v.md"], sha256_bytes(b"v2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_with_the_same_size_and_the_same_mtime_is_not_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, other) = (dir.path().join("a.md"), dir.path().join("b.md"));
+        let tick = SystemTime::now() - Duration::from_secs(60);
+        for (path, content) in [(&file, "AAAA"), (&other, "BBBB")] {
+            std::fs::write(path, content).unwrap();
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(tick).unwrap();
+        }
+        let mut scanner = Scanner::default();
+        scanner.scan(dir.path()).unwrap();
+        // `mv`, `cp -p` and `rsync -t` give the file that replaces it the old size and the old mtime.
+        std::fs::rename(&other, &file).unwrap();
+        let files = scanner.scan(dir.path()).unwrap();
+        assert_eq!(files["a.md"], sha256_bytes(b"BBBB"));
     }
 
     #[test]
