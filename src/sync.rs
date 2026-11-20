@@ -109,7 +109,7 @@ pub async fn run(
     let blobs = BlobServer::start(blob_lookups(), spool.clone(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
-    let (_watcher, mut ticks) = watch(&root)?;
+    let (_watcher, mut ticks, activity) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
     let mesh = ready.mesh.clone();
@@ -203,8 +203,11 @@ pub async fn run(
             Some(done) = index_done.recv() => folder.index_done(done).await,
             _ = every.tick() => {
                 folder.reconcile().await;
-                // A safety net for an edit whose watcher tick was lost or came while its path was held.
-                folder.publish_local().await;
+                // A safety net for an edit whose watcher tick was lost or came while its path was held. It waits while the
+                // folder is still changing, as the tick does, so a file that is being written is not published half done.
+                if !activity.is_busy() {
+                    folder.publish_local().await;
+                }
             }
         }
         folder.publish_index().await;
