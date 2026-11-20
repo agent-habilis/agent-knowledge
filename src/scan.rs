@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -27,12 +27,20 @@ pub struct Scanner {
     root: Option<PathBuf>,
     seen: HashMap<String, Seen>,
     hashed: usize,
+    /// The files that the last scan found but could not read. They are not in its result, but they are not deleted.
+    unreadable: BTreeSet<String>,
 }
 
 impl Scanner {
     /// How many files the last [`Self::scan`] hashed.
     pub fn hashed(&self) -> usize {
         self.hashed
+    }
+
+    /// The files that the last [`Self::scan`] found and could not read, such as one with mode 000. Such a file exists,
+    /// so a caller must not take it for a file that was deleted.
+    pub fn unreadable(&self) -> &BTreeSet<String> {
+        &self.unreadable
     }
 
     /// Every synced file under `root`, as relative path → sha256 hex.
@@ -57,14 +65,16 @@ impl Scanner {
         }
         let mut files = BTreeMap::new();
         let mut seen = HashMap::new();
+        let mut unreadable = BTreeSet::new();
         self.hashed = 0;
-        let walked = self.walk(root, now, hash, &mut files, &mut seen);
+        let walked = self.walk(root, now, hash, &mut files, &mut seen, &mut unreadable);
         if let Err(error) = walked {
             // The entries moved to `seen` go back, so the files that did not change are not hashed again.
             self.seen.extend(seen);
             return Err(error);
         }
         self.seen = seen;
+        self.unreadable = unreadable;
         Ok(files)
     }
 
@@ -76,6 +86,7 @@ impl Scanner {
         hash: &mut dyn FnMut(&Path) -> io::Result<String>,
         files: &mut BTreeMap<String, String>,
         seen: &mut HashMap<String, Seen>,
+        unreadable: &mut BTreeSet<String>,
     ) -> io::Result<()> {
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -90,9 +101,20 @@ impl Scanner {
                     stack.push(path);
                 } else if file_type.is_file() {
                     let Some(rel) = relative(root, &path) else { continue };
-                    // A file can vanish between the listing and the read.
-                    let Ok(meta) = entry.metadata() else { continue };
-                    let Ok(modified) = meta.modified() else { continue };
+                    // A file can vanish between the listing and the read. Any other failure leaves a file that exists.
+                    let meta = match entry.metadata() {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            if error.kind() != io::ErrorKind::NotFound {
+                                unreadable.insert(rel);
+                            }
+                            continue;
+                        }
+                    };
+                    let Ok(modified) = meta.modified() else {
+                        unreadable.insert(rel);
+                        continue;
+                    };
                     let identity = identity_of(&meta);
                     let known = self.seen.remove(&rel).filter(|known| {
                         known.len == meta.len()
@@ -106,7 +128,15 @@ impl Scanner {
                             // Read the clock first: an edit during the read is then not older than `hashed_at`, so the
                             // file is hashed again at the next scan.
                             let hashed_at = now();
-                            let Ok(sha) = hash(&path) else { continue };
+                            let sha = match hash(&path) {
+                                Ok(sha) => sha,
+                                Err(error) => {
+                                    if error.kind() != io::ErrorKind::NotFound {
+                                        unreadable.insert(rel);
+                                    }
+                                    continue;
+                                }
+                            };
                             self.hashed += 1;
                             Seen { len: meta.len(), modified, identity, sha, hashed_at }
                         }
@@ -268,6 +298,25 @@ mod tests {
         }
         scanner.scan(dir.path()).unwrap();
         assert_eq!(scanner.hashed(), 0, "the failed scan dropped the hashes of the files that did not change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported_and_not_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.md", "b.md"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        std::fs::set_permissions(dir.path().join("a.md"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut scanner = Scanner::default();
+        let files = scanner.scan(dir.path()).unwrap();
+        std::fs::set_permissions(dir.path().join("a.md"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        if files.contains_key("a.md") {
+            return; // a user that can read any file, such as root, cannot make it unreadable
+        }
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["b.md"]);
+        assert_eq!(scanner.unreadable().iter().collect::<Vec<_>>(), ["a.md"]);
     }
 
     #[test]

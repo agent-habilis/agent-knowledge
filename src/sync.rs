@@ -114,8 +114,10 @@ pub async fn run(
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
     let mesh = ready.mesh.clone();
     let saved = std::fs::read(root.join(INDEX_FILE)).ok().map(|bytes| load_saved(&bytes, &mesh)).unwrap_or_default();
-    let disk = scan::scan(&root).unwrap_or_default();
-    let own = own_after_restart(saved, &disk, now_ms());
+    // The scanner is kept, so the first scan of the loop hashes only the files that changed since this one.
+    let mut scanner = scan::Scanner::default();
+    let disk = scanner.scan(&root).unwrap_or_default();
+    let own = own_after_restart(saved, &disk, scanner.unreadable(), now_ms());
     // A disk file whose sha is its saved entry is not an edit made while stopped, so it is not published again.
     let known: HashMap<String, String> = own
         .iter()
@@ -138,7 +140,7 @@ pub async fn run(
         member,
         blobs,
         known,
-        downloads: Downloads { finish_delay: delays.finished, ..Downloads::new(root, done) },
+        downloads: Downloads { finish_delay: delays.finished, scanner, ..Downloads::new(root, done) },
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
@@ -689,7 +691,14 @@ impl Folder {
                 Err(error) => self.failed(&format!("publish {path} failed: {error:#}")),
             }
         }
-        let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
+        // A file that exists and cannot be read is not gone: deleting it here would delete it on every peer.
+        let unreadable = self.downloads.scanner.unreadable();
+        let gone: Vec<String> = self
+            .known
+            .keys()
+            .filter(|path| !disk.contains_key(*path) && !unreadable.contains(*path))
+            .cloned()
+            .collect();
         for path in gone {
             eprintln!("↑ deleted {path}");
             self.own.insert(path.clone(), json!({ "deleted": true, "ts": now_ms() }));
@@ -1059,12 +1068,13 @@ fn fetch_error(error: BlobError) -> anyhow::Error {
 fn own_after_restart(
     saved: BTreeMap<String, Value>,
     disk: &BTreeMap<String, String>,
+    unreadable: &BTreeSet<String>,
     now: u64,
 ) -> BTreeMap<String, Value> {
     saved
         .into_iter()
         .map(|(path, entry)| {
-            if is_tombstone(&entry) || disk.contains_key(&path) {
+            if is_tombstone(&entry) || disk.contains_key(&path) || unreadable.contains(&path) {
                 (path, entry)
             } else {
                 (path, json!({ "deleted": true, "ts": now }))
@@ -3157,7 +3167,7 @@ mod tests {
     fn a_restart_keeps_its_tombstones() {
         let saved = BTreeMap::from([("gone.md".to_owned(), serde_json::json!({ "deleted": true, "ts": 5 }))]);
 
-        let own = own_after_restart(saved, &BTreeMap::new(), 9);
+        let own = own_after_restart(saved, &BTreeMap::new(), &BTreeSet::new(), 9);
 
         assert_eq!(own["gone.md"]["deleted"], true);
         assert_eq!(own["gone.md"]["ts"], 5);
@@ -3167,7 +3177,7 @@ mod tests {
     fn a_restart_turns_a_file_deleted_while_stopped_into_a_tombstone() {
         let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
 
-        let own = own_after_restart(saved, &BTreeMap::new(), 9);
+        let own = own_after_restart(saved, &BTreeMap::new(), &BTreeSet::new(), 9);
 
         assert_eq!(own["a.md"]["deleted"], true, "a file gone while stopped was not tombstoned: {own:?}");
         assert_eq!(own["a.md"]["ts"], 9);
@@ -3178,9 +3188,19 @@ mod tests {
         let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
         let disk = BTreeMap::from([("a.md".to_owned(), "x".to_owned())]);
 
-        let own = own_after_restart(saved, &disk, 9);
+        let own = own_after_restart(saved, &disk, &BTreeSet::new(), 9);
 
         assert_eq!(own["a.md"]["sha256"], "x");
+    }
+
+    #[test]
+    fn a_restart_keeps_a_file_that_is_on_disk_and_cannot_be_read() {
+        let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
+        let unreadable = BTreeSet::from(["a.md".to_owned()]);
+
+        let own = own_after_restart(saved, &BTreeMap::new(), &unreadable, 9);
+
+        assert_eq!(own["a.md"]["sha256"], "x", "an unreadable file was tombstoned: {own:?}");
     }
 
     #[test]
