@@ -9,19 +9,45 @@ use crate::sync::INDEX_FILE;
 
 const QUIET: Duration = Duration::from_millis(300);
 
-/// When the folder last changed, as far as a tick is concerned. The timer of the loop reads it, so it does not publish a
-/// file that is still being written, which the tick waits for.
+/// How long the timer of the loop waits for a folder that keeps changing: one period of that timer. A folder that never
+/// is quiet, for example one with a log file that is written every 100 ms, would otherwise get no tick and no publish.
+const TIMER_HOLD: Duration = Duration::from_secs(2);
+
+/// When the folder changed, as far as a tick is concerned. The timer of the loop reads it, so it does not publish a file
+/// that is still being written, which the tick waits for. It waits for one period of the timer at most.
 #[derive(Clone, Default)]
-pub struct Activity(Arc<Mutex<Option<Instant>>>);
+pub struct Activity(Arc<Mutex<Changes>>);
+
+#[derive(Default)]
+struct Changes {
+    /// The last change, and the first change of the run of changes that it ends, none of them `QUIET` apart.
+    last: Option<Instant>,
+    since: Option<Instant>,
+}
 
 impl Activity {
     fn touch(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+        self.touch_at(Instant::now());
     }
 
-    /// Whether the folder changed less than the quiet time ago, so a tick for it is still to come.
-    pub fn is_busy(&self) -> bool {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).is_some_and(|at| at.elapsed() < QUIET)
+    fn touch_at(&self, now: Instant) {
+        let mut changes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if changes.last.is_none_or(|last| now.duration_since(last) >= QUIET) {
+            changes.since = Some(now);
+        }
+        changes.last = Some(now);
+    }
+
+    /// Whether the timer should leave the publish to the tick: the folder changed less than the quiet time ago, so a
+    /// tick is still to come, and the run of changes is younger than [`TIMER_HOLD`].
+    pub fn holds_timer(&self) -> bool {
+        self.holds_timer_at(Instant::now())
+    }
+
+    fn holds_timer_at(&self, now: Instant) -> bool {
+        let changes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let busy = changes.last.is_some_and(|last| now.duration_since(last) < QUIET);
+        busy && changes.since.is_some_and(|since| now.duration_since(since) < TIMER_HOLD)
     }
 }
 
@@ -38,7 +64,7 @@ pub fn watch(root: &Path) -> notify::Result<(notify::RecommendedWatcher, mpsc::R
     let activity = Activity::default();
     let touched = activity.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if event.is_ok_and(|event| !is_own_index(&event) && !is_folder_metadata(&event, &folder)) {
+        if event.is_ok_and(|event| is_change(&event, &folder)) {
             touched.touch();
             let _ = raw_tx.send(());
         }
@@ -54,6 +80,12 @@ pub fn watch(root: &Path) -> notify::Result<(notify::RecommendedWatcher, mpsc::R
         }
     });
     Ok((watcher, tick_rx, activity))
+}
+
+/// Whether `event` is a change to the folder that a scan could find. Opening or closing a file for a read is not one:
+/// a system that reports each open, such as inotify, would make a tick for every read of the folder, and so for every scan.
+fn is_change(event: &notify::Event, folder: &Path) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_)) && !is_own_index(event) && !is_folder_metadata(event, folder)
 }
 
 /// Whether `event` touches only the own index file or its temporary copy.
@@ -105,16 +137,49 @@ mod tests {
         assert!(!is_folder_metadata(&on(removed, "/watched"), folder), "a removed folder is a change");
     }
 
-    #[tokio::test]
-    async fn the_folder_is_busy_until_it_has_been_quiet_for_the_tick_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_watcher, _ticks, activity) = watch(dir.path()).unwrap();
-        assert!(!activity.is_busy(), "a folder with no change was busy");
-        std::fs::write(dir.path().join("note.md"), "x").unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(activity.is_busy(), "a folder that just changed was not busy");
-        tokio::time::sleep(QUIET + Duration::from_millis(300)).await;
-        assert!(!activity.is_busy(), "a folder that was quiet for the tick time was still busy");
+    #[test]
+    fn the_timer_waits_for_a_folder_that_changed_a_moment_ago() {
+        let (activity, start) = (Activity::default(), Instant::now());
+        assert!(!activity.holds_timer_at(start), "a folder with no change held the timer");
+        activity.touch_at(start);
+        assert!(activity.holds_timer_at(start + Duration::from_millis(100)));
+        assert!(!activity.holds_timer_at(start + QUIET + Duration::from_millis(1)), "a quiet folder held the timer");
+    }
+
+    #[test]
+    fn the_timer_does_not_wait_for_a_folder_that_never_is_quiet_longer_than_one_period() {
+        let (activity, start) = (Activity::default(), Instant::now());
+        for step in 0..40 {
+            activity.touch_at(start + Duration::from_millis(100 * step));
+        }
+        assert!(
+            activity.holds_timer_at(start + Duration::from_millis(3900) - TIMER_HOLD),
+            "held for less than a period"
+        );
+        assert!(!activity.holds_timer_at(start + Duration::from_millis(3950)), "a busy folder held the timer for good");
+    }
+
+    #[test]
+    fn a_new_run_of_changes_holds_the_timer_again() {
+        let (activity, start) = (Activity::default(), Instant::now());
+        for step in 0..40 {
+            activity.touch_at(start + Duration::from_millis(100 * step));
+        }
+        let later = start + Duration::from_secs(10);
+        activity.touch_at(later);
+        assert!(activity.holds_timer_at(later + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn opening_a_file_is_no_change() {
+        let folder = Path::new("/watched");
+        let on = |kind, path: &str| notify::Event::new(kind).add_path(path.into());
+        let open = notify::EventKind::Access(notify::event::AccessKind::Open(notify::event::AccessMode::Any));
+        let close = notify::EventKind::Access(notify::event::AccessKind::Close(notify::event::AccessMode::Read));
+        let write = notify::EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Any));
+        assert!(!is_change(&on(open, "/watched/a.md"), folder), "an open is no change");
+        assert!(!is_change(&on(close, "/watched/a.md"), folder), "a close is no change");
+        assert!(is_change(&on(write, "/watched/a.md"), folder), "a write is a change");
     }
 
     #[tokio::test]

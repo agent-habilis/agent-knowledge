@@ -205,7 +205,7 @@ pub async fn run(
                 folder.reconcile().await;
                 // A safety net for an edit whose watcher tick was lost or came while its path was held. It waits while the
                 // folder is still changing, as the tick does, so a file that is being written is not published half done.
-                if !activity.is_busy() {
+                if !activity.holds_timer() {
                     folder.publish_local().await;
                 }
             }
