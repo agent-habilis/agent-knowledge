@@ -45,7 +45,11 @@ async fn each_side_sees_the_other_peer_and_the_synced_file() {
     assert_eq!((seen.nick.as_str(), seen.files), ("alice", 1));
     assert!(seen.changes.iter().any(|change| change.arrow == "↑" && change.path == "note.md"));
 
-    let got = wait_status(&mount_status, "alice", |status| status.peers.iter().any(|peer| peer.nick == "alice")).await;
+    // The file lands on disk before the sync loop counts it, so wait for the count as well as the peer.
+    let got = wait_status(&mount_status, "alice and the synced file", |status| {
+        status.peers.iter().any(|peer| peer.nick == "alice") && status.files == 1
+    })
+    .await;
     assert_eq!((got.nick.as_str(), got.mesh.as_str(), got.files, got.bytes), ("bob", share.ready.mesh.as_str(), 1, 5));
     assert!(got.changes.iter().any(|change| change.arrow == "↓" && change.path == "note.md"));
     assert!(got.synced_at.is_some());
