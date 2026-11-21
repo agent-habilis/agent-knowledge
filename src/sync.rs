@@ -36,6 +36,12 @@ use crate::watch::watch;
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
+/// How long a peer that joins an existing mesh holds its untracked files while it waits for the first view of the
+/// document: the pointer of another author, and the index it names. A peer that starts alone waits all of it, because
+/// it cannot tell a mesh with no other peer from one whose peers are not there yet.
+const FIRST_VIEW_WAIT: Duration = Duration::from_secs(20);
+/// The longest the wait goes on, when the index of another author is still in fetch at the end of [`FIRST_VIEW_WAIT`].
+const FIRST_VIEW_LIMIT: Duration = Duration::from_secs(60);
 
 /// What to sync, and as whom.
 pub struct Options {
@@ -47,6 +53,17 @@ pub struct Options {
     pub nickname: Option<String>,
     /// Where to keep this memory's [`Status`] for `agent-knowledge status`, or `None` for nowhere.
     pub status_file: Option<PathBuf>,
+    /// Slow steps for the tests that need a race to be wide enough to hit. The default adds no delay.
+    #[doc(hidden)]
+    pub delays: Delays,
+}
+
+/// How long to hold back the end of each download, and the fetch of each index. Both are zero in production.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Delays {
+    pub finished: Duration,
+    pub index: Duration,
 }
 
 /// The mesh is up.
@@ -74,7 +91,8 @@ pub async fn run(
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname, status_file } = options;
+    let Options { root, mesh, nickname, status_file, delays } = options;
+    let joining = mesh.is_some();
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -82,9 +100,10 @@ pub async fn run(
         .nick(nickname)
         .name(Some(MESH_NAME.to_owned()))
         .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
-        // The engine default plus `Relay`. Without it, 2 peers whose hole punch fails find each
-        // other through the relay but never link, because the relay is kept for lookup alone.
-        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
+        // The engine default. `Relay` is in the list because, without it, 2 peers whose hole punch
+        // fails find each other through the relay but never link, because the relay is kept for
+        // lookup alone.
+        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     let ready = wait_ready(&mut events).await?;
     on_ready(&ready);
@@ -93,13 +112,23 @@ pub async fn run(
     let blobs = BlobServer::start(blob_lookups(), spool.clone(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
-    let (_watcher, mut ticks) = watch(&root)?;
+    let (_watcher, mut ticks, activity) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
     let mesh = ready.mesh.clone();
     let saved = std::fs::read(root.join(INDEX_FILE)).ok().map(|bytes| load_saved(&bytes, &mesh)).unwrap_or_default();
-    let disk = scan::scan(&root).unwrap_or_default();
-    let own = own_after_restart(saved, &disk, now_ms());
+    // The scanner is kept, so the first scan of the loop hashes only the files that changed since this one.
+    let mut scanner = scan::Scanner::default();
+    // A scan that fails as a whole says nothing about which files are there: every saved entry is kept, not tombstoned.
+    let everything = scan::Unreadable::everything();
+    let (disk, unreadable) = match scanner.scan(&root) {
+        Ok(disk) => (disk, scanner.unreadable()),
+        Err(error) => {
+            eprintln!("scan failed at start: {error}");
+            (BTreeMap::new(), &everything)
+        }
+    };
+    let own = own_after_restart(saved, &disk, unreadable, now_ms());
     // A disk file whose sha is its saved entry is not an edit made while stopped, so it is not published again.
     let known: HashMap<String, String> = own
         .iter()
@@ -122,7 +151,7 @@ pub async fn run(
         member,
         blobs,
         known,
-        downloads: Downloads::new(root, done),
+        downloads: Downloads { finish_delay: delays.finished, scanner, ..Downloads::new(root, done) },
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
@@ -143,6 +172,8 @@ pub async fn run(
         winner_ts: HashMap::new(),
         index_written: None,
         spool,
+        index_delay: delays.index,
+        joined_at: joining.then(tokio::time::Instant::now),
     };
 
     for (path, sha, ts) in kept {
@@ -151,8 +182,6 @@ pub async fn run(
         }
     }
 
-    // Open item: this publishes before the document has arrived, so a stale copy of an untracked file can replace a
-    // newer remote version. It is pre-existing, and it is not fixed here.
     folder.reconcile().await;
     folder.publish_local().await;
     folder.write_status().await;
@@ -174,9 +203,23 @@ pub async fn run(
                     folder.reconcile().await;
                 }
             }
-            Some(done) = finished.recv() => folder.finish(done).await,
+            Some(done) = finished.recv() => {
+                folder.finish(done).await;
+                // An edit made while this download was in flight was held back, and its watcher tick is spent.
+                // A burst of downloads publishes once, after the last one.
+                if folder.downloads.is_idle() {
+                    folder.publish_local().await;
+                }
+            }
             Some(done) = index_done.recv() => folder.index_done(done).await,
-            _ = every.tick() => folder.reconcile().await,
+            _ = every.tick() => {
+                folder.reconcile().await;
+                // A safety net for an edit whose watcher tick was lost or came while its path was held. It waits while the
+                // folder is still changing, as the tick does, so a file that is being written is not published half done.
+                if !activity.holds_timer() {
+                    folder.publish_local().await;
+                }
+            }
         }
         folder.publish_index().await;
         folder.write_status().await;
@@ -232,6 +275,11 @@ struct Folder {
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
     spool: PathBuf,
+    /// Set while a peer that joined an existing mesh has not seen the document yet, and since when. A file with no
+    /// baseline is held back meanwhile, so a stale copy cannot replace a newer version that the document is about to
+    /// bring.
+    joined_at: Option<tokio::time::Instant>,
+    index_delay: Duration,
 }
 
 /// One file the document names: its path, its sha256, and its blob ticket.
@@ -368,6 +416,10 @@ struct Downloads {
     running: HashMap<(String, String), (String, AbortHandle)>,
     slots: Arc<Semaphore>,
     done: mpsc::UnboundedSender<Finished>,
+    /// Remembers each file's hash, so a scan of an unchanged folder hashes nothing.
+    scanner: scan::Scanner,
+    /// How long each download waits before it reports back. Zero outside the tests.
+    finish_delay: Duration,
 }
 
 /// How one download ended. On `Ok` the file is on disk, and the caller must publish it.
@@ -388,6 +440,8 @@ impl Downloads {
             running: HashMap::new(),
             slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
             done,
+            scanner: scan::Scanner::default(),
+            finish_delay: Duration::ZERO,
         }
     }
 
@@ -440,6 +494,7 @@ impl Downloads {
             let (path_for_fetch, sha_for_fetch, ticket_for_fetch) =
                 (path.clone(), sha_owned.clone(), ticket_owned.clone());
             let gate = self.gate.clone();
+            let finish_delay = self.finish_delay;
             let task = tokio::spawn(async move {
                 // The download runs in an inner task, so a panic in it still reports back as a failure.
                 let inner = tokio::spawn(async move {
@@ -451,10 +506,16 @@ impl Downloads {
                     // A panic is a bug in this code, so a retry would repeat it. It stays failed until the entry changes.
                     Err(error) => Err(Failure::Permanent(anyhow!("download task ended: {error}"))),
                 };
+                tokio::time::sleep(finish_delay).await;
                 let _ = done.send(Finished { path: path_owned, sha: sha_owned, ticket: ticket_owned, result });
             });
             self.running.insert(key, (sha.clone(), task.abort_handle()));
         }
+    }
+
+    /// Whether no download is in flight.
+    fn is_idle(&self) -> bool {
+        self.running.is_empty()
     }
 
     /// Record how a download ended, so a permanent failure is not started again.
@@ -506,7 +567,7 @@ impl Downloads {
     fn claim_edits(&mut self, known: &HashMap<String, String>) -> io::Result<BTreeMap<String, String>> {
         let turn = self.gate.turn.clone();
         let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-        let disk = scan::scan(&self.root)?;
+        let disk = self.scanner.scan(&self.root)?;
         self.gate.keep_landed(&disk);
         for (path, sha) in &disk {
             if self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
@@ -631,7 +692,11 @@ impl Folder {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
         };
-        for (path, sha) in self.downloads.publishable(&disk, &self.known) {
+        let holding = self.waiting_for_the_first_view();
+        let mut publishable = self.downloads.publishable(&disk, &self.known);
+        // A path with a saved entry is an edit made while stopped, not a copy of unknown age: it is published at once.
+        publishable.retain(|(path, _)| !holding || self.known.contains_key(path) || self.own.contains_key(path));
+        for (path, sha) in publishable {
             match self.publish(&path, &sha, now_ms()).await {
                 Ok(()) => {
                     eprintln!("↑ {path}");
@@ -641,7 +706,11 @@ impl Folder {
                 Err(error) => self.failed(&format!("publish {path} failed: {error:#}")),
             }
         }
-        let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
+        // A file that exists and cannot be read, or sits in a folder that cannot be listed, is not gone: deleting it here
+        // would delete it on every peer.
+        let unreadable = self.downloads.scanner.unreadable();
+        let gone: Vec<String> =
+            self.known.keys().filter(|path| !disk.contains_key(*path) && !unreadable.covers(path)).cloned().collect();
         for path in gone {
             eprintln!("↑ deleted {path}");
             self.own.insert(path.clone(), json!({ "deleted": true, "ts": now_ms() }));
@@ -651,6 +720,14 @@ impl Folder {
         }
         self.save_own();
         self.publish_index().await;
+    }
+
+    /// Whether a file with no baseline is held back: the peer joined an existing mesh, and has not seen it yet. The wait
+    /// is [`FIRST_VIEW_WAIT`], and it goes on up to [`FIRST_VIEW_LIMIT`] while an index fetch is under way.
+    fn waiting_for_the_first_view(&self) -> bool {
+        let Some(joined) = self.joined_at else { return false };
+        let waited = joined.elapsed();
+        waited < FIRST_VIEW_WAIT || (!self.index_pending.is_empty() && waited < FIRST_VIEW_LIMIT)
     }
 
     /// Log a failed transfer and count it for `status`.
@@ -787,7 +864,9 @@ impl Folder {
             self.index_pending.insert((author.clone(), sha.clone()));
             let (consumer, tx) = (self.consumer.clone(), self.index_tx.clone());
             let (fetch_author, fetch_sha) = (author.clone(), sha.clone());
+            let delay = self.index_delay;
             let task = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
                 let result = fetch_index(consumer, &ticket, &fetch_sha).await.map_err(|error| format!("{error:#}"));
                 let _ = tx.send(IndexDone { author: fetch_author, sha: fetch_sha, result });
             });
@@ -849,11 +928,20 @@ impl Folder {
             let entries = self.own.iter().map(|(path, entry)| (path.clone(), entry.clone())).collect();
             self.indexes.0.insert(author, (sha, entries));
         }
+        // The first view is complete once another author's pointer is there and every index it names is fetched. The own
+        // pointer says nothing about the mesh, so a peer that starts alone keeps waiting.
+        let another_author = self.pointers.values().any(|sha| Some(sha) != self.index_sha.as_ref());
+        if self.joined_at.is_some() && another_author && pointers_to_fetch(document, &self.indexes).is_empty() {
+            self.joined_at = None;
+        }
         let view = view_of(document, &self.indexes);
-        self.winner_ts = view
-            .iter()
-            .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
-            .collect();
+        // While an author's new index is in fetch, its slice is not live and the view lacks its paths. A path that is
+        // still wanted keeps the ts of the entry it is wanted for, so its download is served with that ts and not a new one.
+        let wanted: HashSet<String> = self.downloads.gate.wanted_paths().into_iter().collect();
+        self.winner_ts.retain(|path, _| wanted.contains(path));
+        self.winner_ts.extend(
+            view.iter().map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0))),
+        );
         let tracked: Vec<String> = self
             .known
             .keys()
@@ -905,9 +993,10 @@ impl Folder {
         }
         let published = match result {
             // Serve the file too, so a peer can still get it after its author left.
-            // A served copy keeps the ts of the entry it came from, so an older copy never beats a newer edit.
+            // A served copy keeps the ts of the entry it came from, and never takes the time of the download, so an
+            // older copy never beats a newer edit or a delete.
             Ok(()) => {
-                let ts = self.winner_ts.get(&path).copied().unwrap_or_else(now_ms);
+                let ts = self.winner_ts.get(&path).copied().unwrap_or(0);
                 let published = self.publish(&path, &sha, ts).await;
                 self.save_own();
                 published
@@ -999,12 +1088,13 @@ fn fetch_error(error: BlobError) -> anyhow::Error {
 fn own_after_restart(
     saved: BTreeMap<String, Value>,
     disk: &BTreeMap<String, String>,
+    unreadable: &scan::Unreadable,
     now: u64,
 ) -> BTreeMap<String, Value> {
     saved
         .into_iter()
         .map(|(path, entry)| {
-            if is_tombstone(&entry) || disk.contains_key(&path) {
+            if is_tombstone(&entry) || disk.contains_key(&path) || unreadable.covers(&path) {
                 (path, entry)
             } else {
                 (path, json!({ "deleted": true, "ts": now }))
@@ -1046,7 +1136,7 @@ fn current_pointer(pointers: &HashMap<String, String>, author: &str, sha: &str) 
 }
 
 /// The own index is kept here between runs, as a hidden file, which the scan skips.
-const INDEX_FILE: &str = ".agent-knowledge-index.json";
+pub(crate) const INDEX_FILE: &str = ".agent-knowledge-index.json";
 
 /// The largest index blob that is fetched or published. A larger one is refused with an error, never truncated.
 const INDEX_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1769,6 +1859,33 @@ mod tests {
 
         assert!(first.result.is_ok());
         assert!(second.result.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_downloads_are_idle_only_when_none_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from author";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![
+            ("stuck.md".to_owned(), sha.clone(), "stuck".to_owned()),
+            ("start.md".to_owned(), sha.clone(), "start".to_owned()),
+        ];
+        let fetch = move |ticket: String, _: Progress| async move {
+            if ticket == "stuck" {
+                std::future::pending::<()>().await;
+            }
+            Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+        };
+        assert!(downloads.is_idle());
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        assert!(!downloads.is_idle());
+        let first =
+            tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.expect("a result").expect("open");
+        downloads.settle(&first);
+        assert!(!downloads.is_idle(), "the stuck download is still in flight");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3070,7 +3187,7 @@ mod tests {
     fn a_restart_keeps_its_tombstones() {
         let saved = BTreeMap::from([("gone.md".to_owned(), serde_json::json!({ "deleted": true, "ts": 5 }))]);
 
-        let own = own_after_restart(saved, &BTreeMap::new(), 9);
+        let own = own_after_restart(saved, &BTreeMap::new(), &scan::Unreadable::default(), 9);
 
         assert_eq!(own["gone.md"]["deleted"], true);
         assert_eq!(own["gone.md"]["ts"], 5);
@@ -3080,7 +3197,7 @@ mod tests {
     fn a_restart_turns_a_file_deleted_while_stopped_into_a_tombstone() {
         let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
 
-        let own = own_after_restart(saved, &BTreeMap::new(), 9);
+        let own = own_after_restart(saved, &BTreeMap::new(), &scan::Unreadable::default(), 9);
 
         assert_eq!(own["a.md"]["deleted"], true, "a file gone while stopped was not tombstoned: {own:?}");
         assert_eq!(own["a.md"]["ts"], 9);
@@ -3091,9 +3208,20 @@ mod tests {
         let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
         let disk = BTreeMap::from([("a.md".to_owned(), "x".to_owned())]);
 
-        let own = own_after_restart(saved, &disk, 9);
+        let own = own_after_restart(saved, &disk, &scan::Unreadable::default(), 9);
 
         assert_eq!(own["a.md"]["sha256"], "x");
+    }
+
+    #[test]
+    fn a_restart_keeps_a_file_that_is_on_disk_and_cannot_be_read() {
+        let saved = BTreeMap::from([("a.md".to_owned(), serde_json::json!({ "sha256": "x", "ticket": "t", "ts": 1 }))]);
+        let own = own_after_restart(saved.clone(), &BTreeMap::new(), &scan::Unreadable::default(), 9);
+        assert_eq!(own["a.md"]["deleted"], true, "a file that is not there was kept");
+
+        let own = own_after_restart(saved, &BTreeMap::new(), &scan::Unreadable::everything(), 9);
+
+        assert_eq!(own["a.md"]["sha256"], "x", "an unreadable file was tombstoned: {own:?}");
     }
 
     #[test]

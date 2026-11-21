@@ -1,0 +1,91 @@
+mod common;
+
+use std::time::Duration;
+
+use agent_knowledge::sync;
+use common::{Peer, WAIT, options, wait_for};
+
+/// The end of a download and the fetch of an index are both slow, so the mount reads the author's new pointer while
+/// its download of the old version is still in flight.
+const SLOW: sync::Delays = sync::Delays { finished: Duration::from_secs(3), index: Duration::from_secs(4) };
+
+/// A share and a mount that has fetched `p.md` as v1, with its download not yet reported.
+async fn mount_with_a_late_download(share_dir: &std::path::Path, mount_dir: &std::path::Path) -> (Peer, Peer) {
+    std::fs::write(share_dir.join("p.md"), "v1").unwrap();
+    let share = Peer::start(share_dir, None, None, |_| {}).await;
+    let slow = sync::Options { delays: SLOW, ..options(mount_dir, Some(share.ready.mesh.clone()), None) };
+    let mount = Peer::start_with(slow, |_| {}).await;
+    wait_for(&mount_dir.join("p.md"), Some("v1")).await;
+    (share, mount)
+}
+
+/// The mount serves v1 with the ts of the entry it came from, so the author's newer v2 still wins.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_download_of_the_old_version_does_not_beat_the_newer_edit() {
+    let (share_dir, mount_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (share, mount) = mount_with_a_late_download(share_dir.path(), mount_dir.path()).await;
+
+    std::fs::write(share_dir.path().join("p.md"), "v2").unwrap();
+    wait_for(&mount_dir.path().join("p.md"), Some("v2")).await;
+    tokio::time::sleep(WAIT / 3).await;
+    wait_for(&share_dir.path().join("p.md"), Some("v2")).await;
+    wait_for(&mount_dir.path().join("p.md"), Some("v2")).await;
+
+    mount.stop().await;
+    share.stop().await;
+}
+
+/// The same for a delete: the author's tombstone is newer than the copy that the mount is still serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_download_of_the_old_version_does_not_beat_a_newer_delete() {
+    let (share_dir, mount_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (share, mount) = mount_with_a_late_download(share_dir.path(), mount_dir.path()).await;
+
+    std::fs::remove_file(share_dir.path().join("p.md")).unwrap();
+    wait_for(&mount_dir.path().join("p.md"), None).await;
+    tokio::time::sleep(WAIT / 3).await;
+    wait_for(&share_dir.path().join("p.md"), None).await;
+    wait_for(&mount_dir.path().join("p.md"), None).await;
+
+    mount.stop().await;
+    share.stop().await;
+}
+
+/// An edit made after the file landed and before its download is reported is held back, and its watcher tick is
+/// spent. It must still reach the author, with no later change in the folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_made_while_a_download_is_in_flight_is_published_without_another_tick() {
+    let (share_dir, mount_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (share, mount) = mount_with_a_late_download(share_dir.path(), mount_dir.path()).await;
+
+    std::fs::write(mount_dir.path().join("p.md"), "mine").unwrap();
+    wait_for(&share_dir.path().join("p.md"), Some("mine")).await;
+
+    mount.stop().await;
+    share.stop().await;
+}
+
+/// The saved ts of `path` in the history file of the folder `dir`.
+fn saved_ts(dir: &std::path::Path, path: &str) -> Option<u64> {
+    let saved = std::fs::read_to_string(dir.join(".agent-knowledge-index.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&saved).ok()?["own"][path]["ts"].as_u64()
+}
+
+/// The copy that the mount serves keeps the ts of the entry it came from. A ts of 0 or of the time of the download would
+/// not fail the tests above, which only look at the content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_copy_keeps_the_ts_of_its_entry() {
+    let (share_dir, mount_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (share, mount) = mount_with_a_late_download(share_dir.path(), mount_dir.path()).await;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while saved_ts(mount_dir.path(), "p.md").is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "the mount never served p.md");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let from_the_share = saved_ts(share_dir.path(), "p.md").expect("the share saved no ts");
+    assert_eq!(saved_ts(mount_dir.path(), "p.md"), Some(from_the_share));
+
+    mount.stop().await;
+    share.stop().await;
+}
