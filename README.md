@@ -220,20 +220,24 @@ A mounter of a creator share gets a read-only copy:
 - A mounter never publishes an edit, a create, or a delete.
 - If a mounter changes or deletes a file, `mount` puts the creator version
   back. It prints `read-only share: reverted <path>` on stderr, 1 line for
-  each path.
+  each path. This line shows only when the file on the disk differs from the
+  version that `mount` last synced. When the creator updates a file, `mount`
+  prints the normal `↓ <path>` line and not this line.
 - The same happens when `mount` starts and finds an offline edit.
 - If the mesh never gave the mounter a file, the file stays on the mounter.
   This includes a file at a path that the creator deleted, a file at a path
   that the creator never shared, and a file that the mounter creates after it
   joins. `mount` does not publish the file. It prints
   `read-only share: not published <path>` on stderr, 1 line for each path.
+- If the mounter has a file at a path that the creator shares now, `mount`
+  replaces the file with the creator version. It prints no line.
 - If the mesh gave the mounter a file, and the creator deletes it, `mount`
   removes the file. This is true also when the mounter edited the file.
 
 Each mounter keeps a copy of the signed entries. If the creator process stops,
 a new mounter still gets the folder from the other mounters. Nobody can sign
-again, so the share stays read-only for ever. To change files again, run
-`share` again. The new run prints a new hash.
+again. To change files again, run `share` again. The new run prints a new
+hash.
 
 ### Known limits of creator mode
 
@@ -249,6 +253,16 @@ again, so the share stays read-only for ever. To change files again, run
   from the view for that time.
 - A peer that keeps its own file at a deleted path does not rehost that
   delete.
+- When a mounter joins, it can read the entry of a rehoster before it reads
+  the index of the creator. If the rehoster holds an older copy of a path that
+  the creator deleted, that copy can replace a file that the mesh never gave
+  the mounter at this path.
+- A file system that ignores case, such as the default on macOS and Windows,
+  holds 2 paths that differ only by case as 1 file. A mounter on such a file
+  system can not keep both paths. The mounter keeps 1 path. For the other path,
+  `mount` prints
+  `read-only share: <path> is not downloaded: <kept> has the same name in a folder that ignores case`
+  on stderr, 1 time.
 - Each entry is about 160 bytes larger, because it holds a signature and a
   size.
 
