@@ -245,6 +245,13 @@ async fn a_holder_that_wins_the_tie_with_bad_bytes_does_not_block_a_mounter(writ
     if good == GoodHolder::WithTheBadHolder {
         tokio::time::sleep(SETTLE).await;
         assert_eq!(failed_transfers(&status), 0, "the mounter counted a failed download");
+    } else {
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(
+            failed_transfers(&status),
+            0,
+            "the mounter still counts the failed bad ticket after the other holder gave it the file"
+        );
     }
     late.stop().await;
     anchor.stop().await;
