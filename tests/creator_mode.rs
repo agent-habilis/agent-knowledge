@@ -262,19 +262,16 @@ async fn a_mounter_keeps_a_file_made_after_join_at_a_tombstoned_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mount_with_a_malformed_creator_suffix_fails() {
-    let (c_dir, target, home) = (dir(), dir(), dir());
+    let (c_dir, target) = (dir(), dir());
     write(&c_dir, "base.md", CREATOR_V1);
     let creator = Peer::share_as(c_dir.path(), Writers::Creator).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-knowledge"))
-        .args(["mount", &format!("{}.zz", mesh_of(&creator.ready.mesh))])
-        .arg(target.path())
-        .env("AGENT_KNOWLEDGE_HOME", home.path())
-        .output()
-        .unwrap();
+    let mut mount = MountProcess::start(&format!("{}.zz", mesh_of(&creator.ready.mesh)), target.path());
 
-    assert_eq!(output.status.code(), Some(1), "mount joined with a malformed suffix");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = mount.exit_code().await;
+
+    let stderr = std::fs::read_to_string(&mount.stderr).unwrap_or_default();
+    assert_eq!(code, Some(1), "mount did not fail with a malformed suffix: {stderr:?}");
     assert!(stderr.contains(KEY_ERROR), "unexpected error: {stderr}");
     creator.stop().await;
 }
@@ -320,6 +317,19 @@ impl MountProcess {
             .spawn()
             .unwrap();
         Self { child, stderr, _home: home, _log: log }
+    }
+
+    /// The exit code of the process. A process that runs on after [`WAIT`] is a failure, and not a hang.
+    async fn exit_code(&mut self) -> Option<i32> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.code();
+            }
+            let stderr = std::fs::read_to_string(&self.stderr).unwrap_or_default();
+            assert!(tokio::time::Instant::now() < deadline, "the process did not exit: {stderr:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Wait until stderr holds `line`; fail after [`WAIT`].
