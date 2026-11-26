@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use agent_knowledge::sync::{self, Presence, Ready};
+use agent_knowledge::sync::{self, Lookups, Presence, Ready};
 use agent_knowledge::writers::Writers;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{oneshot, watch};
@@ -39,6 +39,7 @@ pub fn options(root: &Path, mesh: Option<String>, nickname: Option<&str>) -> syn
         nickname: nickname.map(str::to_owned),
         status_file: None,
         writers: Writers::Everybody,
+        lookups: Lookups::Public,
     }
 }
 
@@ -69,6 +70,19 @@ impl Peer {
     /// Start a share on `root` under the writer rule `writers`. `ready.mesh` is its hash.
     pub async fn share_as(root: &Path, writers: Writers) -> Self {
         Self::start_with(sync::Options { writers, ..options(root, None, None) }, |_| {}).await
+    }
+
+    /// Start a share on `root` over loopback lookups: only peers on this machine are found, and no relay or lookup
+    /// server is asked. A test that checks the writer rule, not the discovery, uses it with [`Peer::mount_loopback`].
+    pub async fn share_loopback(root: &Path, writers: Writers) -> Self {
+        let options = sync::Options { writers, lookups: Lookups::Loopback, ..options(root, None, None) };
+        Self::start_with(options, |_| {}).await
+    }
+
+    /// Start a mount of `mesh` on `root` over loopback lookups, to join a [`Peer::share_loopback`].
+    pub async fn mount_loopback(root: &Path, mesh: &str) -> Self {
+        let options = sync::Options { lookups: Lookups::Loopback, ..options(root, Some(mesh.to_owned()), None) };
+        Self::start_with(options, |_| {}).await
     }
 
     /// [`Peer::start`] with every option spelled out.

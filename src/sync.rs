@@ -50,6 +50,46 @@ pub struct Options {
     pub status_file: Option<PathBuf>,
     /// Who may write to the new mesh. A joiner learns it from the hash, so it ignores this.
     pub writers: Writers,
+    /// How this peer finds the others. Every peer of one mesh must use the same.
+    pub lookups: Lookups,
+}
+
+/// How a peer finds the other peers of its mesh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lookups {
+    /// LAN multicast, the DHT and the relay: peers on other machines are found. The default of every command.
+    #[default]
+    Public,
+    /// No lookup and no relay: only peers on this machine are found. A test uses it to take the network out of a run.
+    Loopback,
+}
+
+impl Lookups {
+    /// The lookups of the mesh join.
+    fn join(self) -> Vec<Lookup> {
+        match self {
+            Self::Public => vec![Lookup::Mdns, Lookup::Dht, Lookup::Relay],
+            Self::Loopback => Vec::new(),
+        }
+    }
+
+    /// The transports of the mesh join. The relay transport needs the relay lookup.
+    fn transports(self) -> Vec<Transport> {
+        let direct = [Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip];
+        match self {
+            Self::Public => direct.into_iter().chain([Transport::Relay]).collect(),
+            Self::Loopback => direct.to_vec(),
+        }
+    }
+
+    /// The lookups of every blob endpoint. The server and the consumers must share them, so a ticket that one side
+    /// publishes is found by the other side.
+    fn blob(self) -> LookupOpts {
+        match self {
+            Self::Public => LookupOpts::public_preset(),
+            Self::Loopback => LookupOpts::loopback(),
+        }
+    }
 }
 
 /// The mesh is up.
@@ -77,7 +117,7 @@ pub async fn run(
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname, status_file, writers } = options;
+    let Options { root, mesh, nickname, status_file, writers, lookups } = options;
     let (mesh, creator_key, joined_hash) = match mesh {
         None => (None, matches!(writers, Writers::Creator).then(CreatorKey::generate).transpose()?, None),
         Some(hash) => (Some(writers::parse_hash(&hash)?.0), None, Some(hash)),
@@ -88,10 +128,10 @@ pub async fn run(
         .mesh(mesh)
         .nick(nickname)
         .name(Some(MESH_NAME.to_owned()))
-        .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
+        .lookup(lookups.join())
         // The engine default plus `Relay`. Without it, 2 peers whose hole punch fails find each
         // other through the relay but never link, because the relay is kept for lookup alone.
-        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
+        .transport(lookups.transports());
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     let ready = wait_ready(&mut events).await?;
     let mesh = ready.mesh.clone();
@@ -101,7 +141,7 @@ pub async fn run(
     on_ready(&ready);
 
     let spool = spool_dir();
-    let blobs = BlobServer::start(blob_lookups(), spool.clone(), None, PayloadPath::RelayAllowed)
+    let blobs = BlobServer::start(lookups.blob(), spool.clone(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     // Before the watcher starts, so the probe file is not an event. A stop cannot leave it in the folder, and a probe that
@@ -148,6 +188,7 @@ pub async fn run(
         known,
         downloads,
         trust,
+        lookups,
         creator_key,
         viewed: false,
         unpublished: HashSet::new(),
@@ -262,6 +303,8 @@ struct Folder {
     own_version: u64,
     /// What the share lets this peer write: everybody, or only the creator.
     trust: Trust,
+    /// How this peer finds the others, so each blob endpoint it builds finds them the same way.
+    lookups: Lookups,
     /// Only the creator of a creator share holds it.
     creator_key: Option<CreatorKey>,
     /// Whether a view with entries has been read, so a read-only peer knows what the mesh holds.
@@ -1116,10 +1159,11 @@ impl Folder {
             self.index_pending.insert((author.clone(), sha.clone()));
             let (consumer, tx) = (self.consumer.clone(), self.index_tx.clone());
             let (fetch_author, fetch_sha) = (author.clone(), sha.clone());
-            let trust = self.trust.clone();
+            let (trust, lookups) = (self.trust.clone(), self.lookups);
             let task = tokio::spawn(async move {
-                let result =
-                    fetch_index(consumer, &ticket, &fetch_sha, &trust).await.map_err(|error| format!("{error:#}"));
+                let result = fetch_index(consumer, lookups, &ticket, &fetch_sha, &trust)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
                 let _ = tx.send(IndexDone { author: fetch_author, sha: fetch_sha, result });
             });
             self.index_tasks.insert(author, (sha, task.abort_handle()));
@@ -1235,9 +1279,10 @@ impl Folder {
                 entries.push((path.clone(), sha.to_owned(), ticket));
             }
         }
-        let consumer = self.consumer.clone();
-        self.downloads
-            .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
+        let (consumer, lookups) = (self.consumer.clone(), self.lookups);
+        self.downloads.reconcile(&entries, &self.known, move |ticket, progress| {
+            fetch_blob(consumer.clone(), lookups, ticket, progress)
+        });
         self.downloads.prune(&named);
         for (path, error) in self.downloads.abandoned() {
             self.failed(&format!("download {path} failed: {error}"));
@@ -1755,15 +1800,18 @@ struct IndexDone {
 /// Fetch an index blob, and check it. A fetch that fails is retried with the same backoff as a file.
 async fn fetch_index(
     consumer: Arc<Consumer<Endpoint>>,
+    lookups: Lookups,
     ticket: &str,
     sha: &str,
     trust: &Trust,
 ) -> Result<serde_json::Map<String, Value>> {
     let mut attempt = 0;
     loop {
-        let fetched =
-            tokio::time::timeout(ATTEMPT_DEADLINE, fetch_blob(consumer.clone(), ticket.to_owned(), index_progress()))
-                .await;
+        let fetched = tokio::time::timeout(
+            ATTEMPT_DEADLINE,
+            fetch_blob(consumer.clone(), lookups, ticket.to_owned(), index_progress()),
+        )
+        .await;
         match fetched {
             Ok(Ok(bytes)) => return check_index(&bytes, sha).map(|entries| verified_entries(entries, trust)),
             Ok(Err(error)) if error.is::<BadTicket>() => return Err(error),
@@ -1812,12 +1860,6 @@ impl std::fmt::Display for BadTicket {
 }
 
 impl std::error::Error for BadTicket {}
-
-/// The lookups of every blob endpoint. The server and the consumers must share them, so a ticket that one side
-/// publishes is found by the other side.
-fn blob_lookups() -> LookupOpts {
-    LookupOpts::public_preset()
-}
 
 /// What the consumer needs from an endpoint: whether it has closed, and how to close it.
 trait Closable {
@@ -2015,14 +2057,18 @@ async fn close_when_idle<E: Closable>(endpoint: E, leases: Arc<AtomicUsize>) {
     endpoint.close_now().await;
 }
 
-async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress: Progress) -> Result<Vec<u8>> {
+async fn fetch_blob(
+    consumer: Arc<Consumer<Endpoint>>,
+    lookups: Lookups,
+    ticket: String,
+    progress: Progress,
+) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
     let lease =
-        consumer.get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(anyhow::Error::new) }).await?;
+        consumer.get(|| async { build_peer_endpoint(&lookups.blob()).await.map_err(anyhow::Error::new) }).await?;
     let mut bytes = Collected { bytes: Vec::new(), progress, over: false };
-    let lookups = blob_lookups();
     let build = || {
-        let lookups = lookups.clone();
+        let lookups = lookups.blob();
         detach_build(async move { build_peer_endpoint(&lookups).await })
     };
     match fetch_hedged(&lease.endpoint, build, &ticket, &mut bytes, None).await {
@@ -2473,7 +2519,7 @@ mod tests {
                 &sha,
                 "not a ticket",
                 &gate_wanting("start.md", &sha),
-                move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress),
+                move |ticket, progress| fetch_blob(consumer.clone(), Lookups::Public, ticket, progress),
             ),
         )
         .await;
@@ -3844,6 +3890,21 @@ mod tests {
         assert_eq!(std::fs::read(&local).unwrap(), bytes);
     }
 
+    #[test]
+    fn the_default_lookups_are_public() {
+        assert_eq!(Lookups::default(), Lookups::Public);
+        assert!(!Lookups::Public.blob().is_loopback());
+        assert_eq!(Lookups::Public.join(), vec![Lookup::Mdns, Lookup::Dht, Lookup::Relay]);
+        assert!(Lookups::Public.transports().contains(&Transport::Relay));
+    }
+
+    #[test]
+    fn loopback_lookups_reach_no_other_machine_and_use_no_relay() {
+        assert!(Lookups::Loopback.blob().is_loopback());
+        assert!(Lookups::Loopback.join().is_empty());
+        assert!(!Lookups::Loopback.transports().contains(&Transport::Relay));
+    }
+
     #[tokio::test]
     async fn a_malformed_creator_suffix_is_an_error_before_any_join() {
         let dir = tempfile::tempdir().unwrap();
@@ -3853,6 +3914,7 @@ mod tests {
             nickname: None,
             status_file: None,
             writers: Writers::Everybody,
+            lookups: Lookups::default(),
         };
         let run = run(options, |_: &Ready| panic!("a malformed hash must not join"), |_| {}, std::future::pending());
         let error = tokio::time::timeout(Duration::from_secs(5), run).await.expect("run must fail fast").unwrap_err();
