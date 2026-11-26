@@ -230,7 +230,7 @@ A mounter of a creator share gets a read-only copy:
   joins. `mount` does not publish the file. It prints
   `read-only share: not published <path>` on stderr, 1 line for each path.
 - If the mounter has a file at a path that the creator shares now, `mount`
-  replaces the file with the creator version. It prints no line.
+  replaces the file with the creator version. It prints no `read-only share:` line.
 - If the mesh gave the mounter a file, and the creator deletes it, `mount`
   removes the file. This is true also when the mounter edited the file.
 
@@ -259,7 +259,7 @@ hash.
   the mounter at this path.
 - A file system that ignores case, such as the default on macOS and Windows,
   holds 2 paths that differ only by case as 1 file. A mounter on such a file
-  system can not keep both paths. The mounter keeps 1 path. For the other path,
+  system cannot keep both paths. The mounter keeps 1 path. For the other path,
   `mount` prints
   `read-only share: <path> is not downloaded: <kept> has the same name in a folder that ignores case`
   on stderr, 1 time.
