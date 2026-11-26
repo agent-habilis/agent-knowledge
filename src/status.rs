@@ -25,7 +25,8 @@ pub struct Status {
     pub bytes: u64,
     /// When the shared file list was last applied to the folder.
     pub synced_at: Option<u64>,
-    /// Uploads and downloads that failed since the process started.
+    /// The failures since the process started: index, publish, sign and kept-file failures. It also counts each
+    /// (path, sha) download that failed and has not landed. A file that lands, or that the creator deletes, leaves it.
     pub failed: u64,
     /// The newest change last, at most [`RECENT_CHANGES`].
     pub changes: VecDeque<Change>,

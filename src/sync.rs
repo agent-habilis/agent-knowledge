@@ -543,7 +543,7 @@ impl Downloads {
         self.reported.insert((path.to_owned(), sha.to_owned()));
     }
 
-    /// How many downloads are reported as failed. A file that lands later leaves the count: another holder delivered it.
+    /// How many (path, sha) pairs are reported as failed. A path that lands later leaves the count: another holder delivered it.
     fn failed_downloads(&self) -> u64 {
         self.reported.len() as u64
     }
