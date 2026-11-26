@@ -4,8 +4,14 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use agent_knowledge::scan::sha256_bytes;
 use agent_knowledge::writers::{CreatorKey, Writers};
 use common::{Peer, WAIT, wait_for};
+use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
+use habilis_network::net::direct::PayloadPath;
+use habilis_network::ops::blob::{BlobServer, ContentId};
+use habilis_network::protocol::{Lookup, LookupOpts, Transport};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// Long enough for an entry to cross the mesh several times, so a missing file is not a slow file.
@@ -28,7 +34,7 @@ fn read(dir: &TempDir, name: &str) -> Option<String> {
 }
 
 fn mesh_of(hash: &str) -> &str {
-    hash.split_once('.').expect("a creator hash has a suffix").0
+    hash.split_once('.').map_or(hash, |(mesh, _)| mesh)
 }
 
 async fn mount(dir: &TempDir, hash: &str) -> Peer {
@@ -57,15 +63,112 @@ async fn stop_all(peers: Vec<Peer>) {
 }
 
 /// Which holder of the file leaves before the new mounter joins.
-#[derive(Clone, Copy)]
-enum Leaver {
-    Creator,
-    Rehoster,
+/// A live peer of the mesh that offers `base.md` with the signed entry of the creator and a ticket for other bytes.
+struct Hostile {
+    member: Membership,
+    blobs: BlobServer,
+    author: String,
+    _dir: TempDir,
 }
 
-/// The creator and a rehoster hold the file. One of them leaves, and a new mounter must still get the file.
-/// The entry of the leaver stays in the mesh with a ticket that no longer works.
-async fn a_new_mounter_gets_the_file_after_a_holder_left(writers: Writers, leaver: Leaver) {
+impl Hostile {
+    /// Join `mesh` and publish an index with a copy of `entry`, whose ticket serves other bytes than the entry names.
+    async fn join(mesh: &str, entry: &Value) -> Self {
+        let (sink, mut events) = membership::json_sink();
+        let options = JoinOptions::default()
+            .mesh(Some(mesh.to_owned()))
+            .nick(None)
+            .name(Some("agent-knowledge".to_owned()))
+            .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
+            .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
+        let member = membership::join(&options, sink).await.unwrap();
+        tokio::time::timeout(WAIT, async {
+            while let Some(event) = events.recv().await {
+                if serde_json::from_str::<Value>(&event).unwrap()["kind"] == "ready" {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the hostile peer was not ready");
+
+        let dir = dir();
+        let blobs =
+            BlobServer::start(LookupOpts::public_preset(), dir.path().join("spool"), None, PayloadPath::RelayAllowed)
+                .await
+                .unwrap();
+        let wrong = dir.path().join("wrong");
+        std::fs::write(&wrong, "other bytes").unwrap();
+        let ticket = blobs.register(&wrong, ContentId::new(entry["sha256"].as_str().unwrap())).await.unwrap();
+        let mut offered = entry.clone();
+        offered["ticket"] = json!(ticket.encode());
+
+        let index = serde_json::to_vec(&json!({ "base.md": offered })).unwrap();
+        let index_sha = sha256_bytes(&index);
+        let file = dir.path().join("index.json");
+        std::fs::write(&file, &index).unwrap();
+        let index_ticket = blobs.register(&file, ContentId::new(&index_sha)).await.unwrap();
+        let merge = json!({ "index": { "ticket": index_ticket.encode(), "sha256": index_sha, "ts": entry["ts"] } });
+        member.request(|reply| Request::Messaging(Messaging::StateMerge { merge, reply })).await.unwrap().unwrap();
+
+        let author = authors_of(&member)
+            .await
+            .into_iter()
+            .find_map(|(author, sha)| (sha == index_sha).then_some(author))
+            .expect("the hostile slice is not in the document");
+        Self { member, blobs, author, _dir: dir }
+    }
+
+    async fn leave(self) {
+        self.blobs.shutdown().await;
+        let _ = membership::depart(self.member.node).await;
+    }
+}
+
+/// The author and the index pointer of each slice in the document that `member` holds.
+async fn authors_of(member: &Membership) -> Vec<(String, String)> {
+    let text = member.request(|reply| Request::Inspect(Inspect::StateJson { reply })).await.unwrap();
+    let document: Value = serde_json::from_str(&text).unwrap();
+    document
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter_map(|(author, slice)| Some((author.clone(), slice["index"]["sha256"].as_str()?.to_owned())))
+        .collect()
+}
+
+/// A hostile peer whose author key is larger than the key of each peer that holds the file, so its entry wins the
+/// tie between equal entries and its bad ticket comes first. Each try joins with a new key.
+async fn a_hostile_peer_that_wins_the_tie(mesh: &str, entry: &Value, holders: usize) -> Hostile {
+    let mut earlier: Vec<String> = Vec::new();
+    for _ in 0..20 {
+        let hostile = Hostile::join(mesh, entry).await;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        let others = loop {
+            let others: Vec<String> = authors_of(&hostile.member)
+                .await
+                .into_iter()
+                .map(|(author, _)| author)
+                .filter(|author| *author != hostile.author && !earlier.contains(author))
+                .collect();
+            if others.len() >= holders {
+                break others;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the hostile peer sees only {others:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        if others.iter().all(|author| *author < hostile.author) {
+            return hostile;
+        }
+        earlier.push(hostile.author.clone());
+        hostile.leave().await;
+    }
+    panic!("no hostile peer with the largest key in 20 tries");
+}
+
+/// The creator and a rehoster hold the file, and a live peer wins the tie with a ticket that gives other bytes. A new
+/// mounter must still get the file from a good holder.
+async fn a_hostile_holder_that_wins_the_tie_does_not_block_a_mounter(writers: Writers) {
     let (c_dir, r_dir, b_dir) = (dir(), dir(), dir());
     write(&c_dir, "base.md", CREATOR_V1);
     let creator = Peer::share_as(c_dir.path(), writers).await;
@@ -74,17 +177,37 @@ async fn a_new_mounter_gets_the_file_after_a_holder_left(writers: Writers, leave
     wait_for(&r_dir.path().join("base.md"), Some(CREATOR_V1)).await;
     // The rehoster publishes its copy a moment after it writes the file.
     tokio::time::sleep(SETTLE).await;
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(c_dir.path().join(".agent-knowledge-index.json")).unwrap()).unwrap();
+    let entry = saved["own"]["base.md"].clone();
 
-    let (stays, gone) = match leaver {
-        Leaver::Creator => (rehoster, creator),
-        Leaver::Rehoster => (creator, rehoster),
-    };
-    gone.stop().await;
+    let hostile = a_hostile_peer_that_wins_the_tie(mesh_of(&hash), &entry, 2).await;
     let late = mount(&b_dir, &hash).await;
     wait_for(&b_dir.path().join("base.md"), Some(CREATOR_V1)).await;
 
     late.stop().await;
-    stays.stop().await;
+    rehoster.stop().await;
+    creator.stop().await;
+    hostile.leave().await;
+}
+
+/// The creator leaves, and a new mounter must still get the file from the rehoster.
+async fn a_new_mounter_gets_the_file_after_the_creator_left() {
+    let (c_dir, r_dir, b_dir) = (dir(), dir(), dir());
+    write(&c_dir, "base.md", CREATOR_V1);
+    let creator = Peer::share_as(c_dir.path(), Writers::Creator).await;
+    let hash = creator.ready.mesh.clone();
+    let rehoster = mount(&r_dir, &hash).await;
+    wait_for(&r_dir.path().join("base.md"), Some(CREATOR_V1)).await;
+    // The rehoster publishes its copy a moment after it writes the file.
+    tokio::time::sleep(SETTLE).await;
+
+    creator.stop().await;
+    let late = mount(&b_dir, &hash).await;
+    wait_for(&b_dir.path().join("base.md"), Some(CREATOR_V1)).await;
+
+    late.stop().await;
+    rehoster.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -107,21 +230,17 @@ async fn a_non_creator_write_is_not_applied_on_other_peers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_folder_syncs_to_a_new_mounter_after_the_creator_leaves() {
-    a_new_mounter_gets_the_file_after_a_holder_left(Writers::Creator, Leaver::Creator).await;
+    a_new_mounter_gets_the_file_after_the_creator_left().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_with_a_larger_key_and_a_bad_ticket_does_not_block_a_mounter() {
-    // The mesh breaks a tie by author key, and the keys are random. The leaver with the larger key
-    // has its dead ticket first, so one of the 2 runs meets a bad ticket first.
-    a_new_mounter_gets_the_file_after_a_holder_left(Writers::Creator, Leaver::Rehoster).await;
-    a_new_mounter_gets_the_file_after_a_holder_left(Writers::Creator, Leaver::Creator).await;
+    a_hostile_holder_that_wins_the_tie_does_not_block_a_mounter(Writers::Creator).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn everybody_mode_falls_back_to_another_ticket() {
-    a_new_mounter_gets_the_file_after_a_holder_left(Writers::Everybody, Leaver::Rehoster).await;
-    a_new_mounter_gets_the_file_after_a_holder_left(Writers::Everybody, Leaver::Creator).await;
+    a_hostile_holder_that_wins_the_tie_does_not_block_a_mounter(Writers::Everybody).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
