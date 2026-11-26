@@ -4,3 +4,4 @@ pub mod scan;
 pub mod status;
 pub mod sync;
 mod watch;
+pub mod writers;
