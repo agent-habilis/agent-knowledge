@@ -12,7 +12,6 @@ use common::{Peer, WAIT, wait_for};
 use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
 use habilis_network::net::direct::PayloadPath;
 use habilis_network::ops::blob::{BlobServer, ContentId};
-use habilis_network::protocol::{Lookup, LookupOpts, Transport};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -51,7 +50,7 @@ async fn mount_with_status(dir: &TempDir, hash: &str, status: &Path) -> Peer {
 
 /// How many transfers the mount that writes `status` counts as failed. The mount writes it after each step.
 fn failed_transfers(status: &Path) -> u64 {
-    Status::read(status).unwrap().map_or(0, |status| status.failed)
+    Status::read(status).unwrap().expect("the mount did not write its status").failed
 }
 
 async fn mount(dir: &TempDir, hash: &str) -> Peer {
@@ -113,8 +112,8 @@ impl Hostile {
             .mesh(Some(mesh.to_owned()))
             .nick(None)
             .name(Some("agent-knowledge".to_owned()))
-            .lookup(Vec::<Lookup>::new())
-            .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip]);
+            .lookup(Lookups::Loopback.join())
+            .transport(Lookups::Loopback.transports());
         let member = membership::join(&options, sink).await.unwrap();
         tokio::time::timeout(WAIT, async {
             while let Some(event) = events.recv().await {
@@ -128,7 +127,7 @@ impl Hostile {
 
         let dir = dir();
         let blobs =
-            BlobServer::start(LookupOpts::loopback(), dir.path().join("spool"), None, PayloadPath::RelayAllowed)
+            BlobServer::start(Lookups::Loopback.blob(), dir.path().join("spool"), None, PayloadPath::RelayAllowed)
                 .await
                 .unwrap();
         Self { member, blobs, author: String::new(), published: 0, _dir: dir }

@@ -81,7 +81,7 @@ bun test scripts/                                                        # scrip
   on this machine, and no test waits for the network. The other test files use
   the public lookups. The binary always uses the public lookups. The 2 tests
   that read the `read-only share:` lines run the binary, so they use the public
-  lookups too. Do not run the binary in another test of this file.
+  lookups too. Do not run the binary in another test that joins a mesh.
 - `scripts/update-license.test.ts` checks the `LICENSE` header rewrite.
 
 ### Releasing
