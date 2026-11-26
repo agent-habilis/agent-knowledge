@@ -66,7 +66,7 @@ pub enum Lookups {
 
 impl Lookups {
     /// The lookups of the mesh join.
-    fn join(self) -> Vec<Lookup> {
+    pub fn join(self) -> Vec<Lookup> {
         match self {
             Self::Public => vec![Lookup::Mdns, Lookup::Dht, Lookup::Relay],
             Self::Loopback => Vec::new(),
@@ -74,7 +74,7 @@ impl Lookups {
     }
 
     /// The transports of the mesh join. The relay transport needs the relay lookup.
-    fn transports(self) -> Vec<Transport> {
+    pub fn transports(self) -> Vec<Transport> {
         let direct = [Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip];
         match self {
             Self::Public => direct.into_iter().chain([Transport::Relay]).collect(),
@@ -84,7 +84,7 @@ impl Lookups {
 
     /// The lookups of every blob endpoint. The server and the consumers must share them, so a ticket that one side
     /// publishes is found by the other side.
-    fn blob(self) -> LookupOpts {
+    pub fn blob(self) -> LookupOpts {
         match self {
             Self::Public => LookupOpts::public_preset(),
             Self::Loopback => LookupOpts::loopback(),
@@ -543,6 +543,11 @@ impl Downloads {
         self.reported.insert((path.to_owned(), sha.to_owned()));
     }
 
+    /// How many downloads are reported as failed. A file that lands later leaves the count: another holder delivered it.
+    fn failed_downloads(&self) -> u64 {
+        self.reported.len() as u64
+    }
+
     /// The paths that cannot be fetched any more, with the last error of each, once each. A permanent failure is quiet
     /// while another ticket can deliver. If that ticket leaves the document, the path is left with no ticket that works.
     fn abandoned(&mut self) -> Vec<(String, String)> {
@@ -960,7 +965,8 @@ impl Folder {
             .map(|meta| meta.len())
             .sum();
         self.status.written_at = status::now();
-        if let Err(error) = self.status.write(path) {
+        let state = Status { failed: self.status.failed + self.downloads.failed_downloads(), ..self.status.clone() };
+        if let Err(error) = state.write(path) {
             eprintln!("{error:#}");
         }
     }
@@ -1285,7 +1291,7 @@ impl Folder {
         });
         self.downloads.prune(&named);
         for (path, error) in self.downloads.abandoned() {
-            self.failed(&format!("download {path} failed: {error}"));
+            eprintln!("download {path} failed: {error}");
         }
         for path in self.downloads.remove_dropped(&named, &mut self.known, |local| std::fs::remove_file(local)) {
             self.status.record("↓", &path, true);
@@ -1328,7 +1334,6 @@ impl Folder {
                 eprintln!("↓ {path}");
             }
         } else {
-            self.status.failed += 1;
             self.downloads.mark_reported(&path, &sha);
         }
         mark_landed(&mut self.known, path, sha, published);
@@ -4502,6 +4507,40 @@ mod tests {
 
         assert_eq!(downloads.abandoned(), vec![("a.md".to_owned(), "no route".to_owned())]);
         assert!(downloads.abandoned().is_empty(), "each path is reported once");
+    }
+
+    fn idle_handle() -> AbortHandle {
+        tokio::spawn(std::future::pending::<()>()).abort_handle()
+    }
+
+    fn permanent(path: &str, sha: &str, ticket: &str) -> Finished {
+        let result = Err(Failure::Permanent(anyhow!("content does not match its sha256")));
+        Finished { path: path.to_owned(), sha: sha.to_owned(), ticket: ticket.to_owned(), result }
+    }
+
+    #[tokio::test]
+    async fn a_path_that_lands_after_a_report_no_longer_counts_as_failed() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        // Only the bad holder is in the document when its ticket fails for good, so the failure is reported.
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["bad".to_owned()]);
+        downloads.running.insert(("a.md".to_owned(), "bad".to_owned()), ("sha".to_owned(), idle_handle()));
+        downloads.settle(&permanent("a.md", "sha", "bad"));
+        assert!(!downloads.another_ticket_can_deliver("a.md", "sha"));
+        downloads.mark_reported("a.md", "sha");
+        assert_eq!(downloads.failed_downloads(), 1);
+
+        // The good holder appears later, and its ticket delivers.
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["bad".to_owned(), "good".to_owned()]);
+        downloads.running.insert(("a.md".to_owned(), "good".to_owned()), ("sha".to_owned(), idle_handle()));
+        downloads.settle(&Finished {
+            path: "a.md".to_owned(),
+            sha: "sha".to_owned(),
+            ticket: "good".to_owned(),
+            result: Ok(()),
+        });
+
+        assert_eq!(downloads.failed_downloads(), 0, "a file that landed counts as a failed download");
     }
 
     #[test]
