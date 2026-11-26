@@ -5,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use agent_knowledge::scan::sha256_bytes;
-use agent_knowledge::writers::{CreatorKey, Writers, sign_entry};
+use agent_knowledge::writers::{self, CreatorKey, Writers, sign_entry};
 use common::{Peer, WAIT, wait_for};
 use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
 use habilis_network::net::direct::PayloadPath;
@@ -18,6 +18,17 @@ use tempfile::TempDir;
 const SETTLE: Duration = Duration::from_secs(6);
 
 const CREATOR_V1: &str = "creator v1";
+
+/// How many tests run at once. Each test starts up to 4 peers, and each peer opens several endpoints that look up each
+/// other over mDNS and DHT. With more tests at once, a join takes more than [`WAIT`].
+const MAX_CONCURRENT_TESTS: usize = 4;
+
+static TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_TESTS);
+
+/// A place to run in. A test holds it to the end, so it covers the stop of each peer of the test.
+async fn test_slot() -> tokio::sync::SemaphorePermit<'static> {
+    TEST_SLOTS.acquire().await.expect("the semaphore is never closed")
+}
 
 const KEY_ERROR: &str = "the creator key in the hash is not 64 lowercase hex digits of an Ed25519 key";
 
@@ -75,12 +86,21 @@ struct Hostile {
     member: Membership,
     blobs: BlobServer,
     author: String,
+    published: usize,
     _dir: TempDir,
 }
 
 impl Hostile {
     /// Join `mesh` and publish an index of `offers`.
     async fn join(mesh: &str, offers: &[Offer<'_>]) -> Self {
+        let mut hostile = Self::enter(mesh).await;
+        let ts = offers[0].entry["ts"].clone();
+        hostile.publish(offers, &ts).await;
+        hostile
+    }
+
+    /// Join `mesh` and publish nothing yet, so the author key of the peer is not known.
+    async fn enter(mesh: &str) -> Self {
         let (sink, mut events) = membership::json_sink();
         let options = JoinOptions::default()
             .mesh(Some(mesh.to_owned()))
@@ -104,31 +124,39 @@ impl Hostile {
             BlobServer::start(LookupOpts::public_preset(), dir.path().join("spool"), None, PayloadPath::RelayAllowed)
                 .await
                 .unwrap();
+        Self { member, blobs, author: String::new(), published: 0, _dir: dir }
+    }
+
+    /// Publish an index of `offers` at `ts`, in place of the last index of this peer. Each publish makes an index that
+    /// no other publish made, so the slice of the peer is known by the sha256 of its index.
+    async fn publish(&mut self, offers: &[Offer<'_>], ts: &Value) {
+        self.published += 1;
+        let round = self.published;
         let mut files = serde_json::Map::new();
         for (number, offer) in offers.iter().enumerate() {
-            let file = dir.path().join(format!("offer-{number}"));
+            let file = self._dir.path().join(format!("offer-{round}-{number}"));
             std::fs::write(&file, offer.bytes).unwrap();
-            let ticket = blobs.register(&file, ContentId::new(offer.entry["sha256"].as_str().unwrap())).await.unwrap();
+            let sha = ContentId::new(offer.entry["sha256"].as_str().unwrap());
+            let ticket = self.blobs.register(&file, sha).await.unwrap();
             let mut entry = offer.entry.clone();
             entry["ticket"] = json!(ticket.encode());
             files.insert(offer.path.to_owned(), entry);
         }
 
-        let index = serde_json::to_vec(&files).unwrap();
+        let mut index = serde_json::to_vec(&files).unwrap();
+        index.extend(std::iter::repeat_n(b' ', round));
         let index_sha = sha256_bytes(&index);
-        let file = dir.path().join("index.json");
+        let file = self._dir.path().join(format!("index-{round}.json"));
         std::fs::write(&file, &index).unwrap();
-        let index_ticket = blobs.register(&file, ContentId::new(&index_sha)).await.unwrap();
-        let merge =
-            json!({ "index": { "ticket": index_ticket.encode(), "sha256": index_sha, "ts": offers[0].entry["ts"] } });
-        member.request(|reply| Request::Messaging(Messaging::StateMerge { merge, reply })).await.unwrap().unwrap();
+        let index_ticket = self.blobs.register(&file, ContentId::new(&index_sha)).await.unwrap();
+        let merge = json!({ "index": { "ticket": index_ticket.encode(), "sha256": index_sha, "ts": ts } });
+        self.member.request(|reply| Request::Messaging(Messaging::StateMerge { merge, reply })).await.unwrap().unwrap();
 
-        let author = authors_of(&member)
+        self.author = authors_of(&self.member)
             .await
             .into_iter()
             .find_map(|(author, sha)| (sha == index_sha).then_some(author))
             .expect("the hostile slice is not in the document");
-        Self { member, blobs, author, _dir: dir }
     }
 
     async fn leave(self) {
@@ -149,59 +177,73 @@ async fn authors_of(member: &Membership) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A hostile peer whose author key is larger than the key of each peer that holds the file, so its entry wins the
-/// tie between equal entries and its bad ticket comes first. Each try joins with a new key.
-async fn a_hostile_peer_that_wins_the_tie(mesh: &str, entry: &Value, holders: usize) -> Hostile {
-    let mut earlier: Vec<String> = Vec::new();
-    for _ in 0..20 {
-        let offer = Offer { path: "base.md", bytes: b"other bytes", entry: entry.clone() };
-        let hostile = Hostile::join(mesh, &[offer]).await;
-        let deadline = tokio::time::Instant::now() + WAIT;
-        let others = loop {
-            let others: Vec<String> = authors_of(&hostile.member)
-                .await
-                .into_iter()
-                .map(|(author, _)| author)
-                .filter(|author| *author != hostile.author && !earlier.contains(author))
-                .collect();
-            if others.len() >= holders {
-                break others;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "the hostile peer sees only {others:?}");
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        };
-        if others.iter().all(|author| *author < hostile.author) {
-            return hostile;
-        }
-        earlier.push(hostile.author.clone());
-        hostile.leave().await;
+/// Two live peers that will hold the same entry of `base.md`. They join and publish an empty index first, so their author
+/// keys are known. The peer with the larger key is `bad`: its entry wins the tie between equal entries, so its ticket
+/// comes first. The roles do not depend on luck.
+async fn two_holders_ordered_by_key(mesh: &str, ts: &Value) -> (Hostile, Hostile) {
+    let mut peers = [Hostile::enter(mesh).await, Hostile::enter(mesh).await];
+    for peer in &mut peers {
+        peer.publish(&[], ts).await;
     }
-    panic!("no hostile peer with the largest key in 20 tries");
+    let [first, second] = peers;
+    if first.author > second.author { (first, second) } else { (second, first) }
 }
 
-/// The creator and a rehoster hold the file, and a live peer wins the tie with a ticket that gives other bytes. A new
-/// mounter must still get the file from a good holder.
-async fn a_hostile_holder_that_wins_the_tie_does_not_block_a_mounter(writers: Writers) {
-    let (c_dir, r_dir, b_dir) = (dir(), dir(), dir());
-    write(&c_dir, "base.md", CREATOR_V1);
-    let creator = Peer::share_as(c_dir.path(), writers).await;
-    let hash = creator.ready.mesh.clone();
-    let rehoster = mount(&r_dir, &hash).await;
-    wait_for(&r_dir.path().join("base.md"), Some(CREATOR_V1)).await;
-    // The rehoster publishes its copy a moment after it writes the file.
-    tokio::time::sleep(SETTLE).await;
-    let saved: Value =
-        serde_json::from_slice(&std::fs::read(c_dir.path().join(".agent-knowledge-index.json")).unwrap()).unwrap();
-    let entry = saved["own"]["base.md"].clone();
+/// The entry of `base.md` that both holders offer. In creator mode `key` signs it.
+fn base_entry(mesh: &str, key: Option<&CreatorKey>) -> Value {
+    let entry = json!({ "sha256": sha256_bytes(CREATOR_V1.as_bytes()), "ts": now_ms(), "size": CREATOR_V1.len() });
+    key.map_or(entry.clone(), |key| sign_entry(key, mesh, "base.md", &entry).unwrap())
+}
 
-    let hostile = a_hostile_peer_that_wins_the_tie(mesh_of(&hash), &entry, 2).await;
-    let late = mount(&b_dir, &hash).await;
+/// When the other holder appears.
+#[derive(Clone, Copy, PartialEq)]
+enum GoodHolder {
+    /// It publishes after the new mounter has tried the bad ticket, so the mounter has no other ticket yet.
+    AfterTheBadTicketFailed,
+    /// It publishes with the bad holder, before the mounter starts.
+    WithTheBadHolder,
+}
+
+/// The holder with the larger key serves other bytes, and its entry wins the tie. The other holder serves the file. A new
+/// mounter must still get the file. No real peer holds the file, so the keys of the two holders alone decide the tie.
+/// The anchor only makes the mesh. It has a creator key of its own, so it ignores both entries.
+///
+/// With `AfterTheBadTicketFailed` the mounter sees only the bad ticket at first, so the file can come only from a
+/// ticket that is added to the winner later. With `WithTheBadHolder` the mounter must not report a failed download.
+async fn a_holder_that_wins_the_tie_with_bad_bytes_does_not_block_a_mounter(writers: Writers, good: GoodHolder) {
+    let (anchor_dir, b_dir) = (dir(), dir());
+    let anchor = Peer::share_as(anchor_dir.path(), Writers::Creator).await;
+    let mesh = mesh_of(&anchor.ready.mesh).to_owned();
+    let key = (writers == Writers::Creator).then(|| CreatorKey::generate().unwrap());
+    let hash = writers::encode_hash(&mesh, key.as_ref());
+    let entry = base_entry(&mesh, key.as_ref());
+    let ts = entry["ts"].clone();
+    let (mut bad_holder, mut good_holder) = two_holders_ordered_by_key(&mesh, &ts).await;
+    let bad_offer = Offer { path: "base.md", bytes: b"creator v2", entry: entry.clone() };
+    let good_offer = Offer { path: "base.md", bytes: CREATOR_V1.as_bytes(), entry };
+
+    bad_holder.publish(&[bad_offer], &ts).await;
+    let late = if good == GoodHolder::AfterTheBadTicketFailed {
+        let late = MountProcess::start(&hash, b_dir.path());
+        tokio::time::sleep(SETTLE).await;
+        assert_eq!(read(&b_dir, "base.md"), None, "the bad bytes were applied");
+        good_holder.publish(&[good_offer], &ts).await;
+        late
+    } else {
+        good_holder.publish(&[good_offer], &ts).await;
+        MountProcess::start(&hash, b_dir.path())
+    };
     wait_for(&b_dir.path().join("base.md"), Some(CREATOR_V1)).await;
 
-    late.stop().await;
-    rehoster.stop().await;
-    creator.stop().await;
-    hostile.leave().await;
+    if good == GoodHolder::WithTheBadHolder {
+        tokio::time::sleep(SETTLE).await;
+        let stderr = late.stderr_text();
+        assert!(!stderr.contains("download base.md failed"), "the mounter reported a failed download: {stderr}");
+    }
+    drop(late);
+    anchor.stop().await;
+    bad_holder.leave().await;
+    good_holder.leave().await;
 }
 
 /// The creator leaves, and a new mounter must still get the file from the rehoster.
@@ -225,6 +267,7 @@ async fn a_new_mounter_gets_the_file_after_the_creator_left() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_creator_write_is_not_applied_on_other_peers() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     let (_, creator, mounters) = creator_mesh(&c_dir, &[&a_dir, &b_dir]).await;
 
@@ -260,6 +303,7 @@ fn newer_entry(bytes: &[u8]) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forged_entry_from_a_member_is_not_applied() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     write(&c_dir, "second.md", "second v1");
     let (hash, creator, mounters) = creator_mesh(&c_dir, &[&a_dir, &b_dir]).await;
@@ -297,21 +341,40 @@ async fn a_forged_entry_from_a_member_is_not_applied() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_folder_syncs_to_a_new_mounter_after_the_creator_leaves() {
+    let _slot = test_slot().await;
     a_new_mounter_gets_the_file_after_the_creator_left().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_with_a_larger_key_and_a_bad_ticket_does_not_block_a_mounter() {
-    a_hostile_holder_that_wins_the_tie_does_not_block_a_mounter(Writers::Creator).await;
+    let _slot = test_slot().await;
+    a_holder_that_wins_the_tie_with_bad_bytes_does_not_block_a_mounter(
+        Writers::Creator,
+        GoodHolder::AfterTheBadTicketFailed,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn everybody_mode_falls_back_to_another_ticket() {
-    a_hostile_holder_that_wins_the_tie_does_not_block_a_mounter(Writers::Everybody).await;
+    let _slot = test_slot().await;
+    a_holder_that_wins_the_tie_with_bad_bytes_does_not_block_a_mounter(
+        Writers::Everybody,
+        GoodHolder::AfterTheBadTicketFailed,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mounter_reports_no_failed_download_when_a_holder_serves_bad_bytes() {
+    let _slot = test_slot().await;
+    a_holder_that_wins_the_tie_with_bad_bytes_does_not_block_a_mounter(Writers::Creator, GoodHolder::WithTheBadHolder)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rehoster_that_restarts_after_the_creator_left_still_serves() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
 
@@ -327,6 +390,7 @@ async fn a_rehoster_that_restarts_after_the_creator_left_still_serves() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rehoster_restart_keeps_the_creator_signatures() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
     tokio::time::sleep(SETTLE).await;
@@ -351,6 +415,7 @@ async fn a_rehoster_restart_keeps_the_creator_signatures() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_creator_edit_is_reverted_and_the_next_creator_change_applies() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     let (_, creator, mounters) = creator_mesh(&c_dir, &[&a_dir, &b_dir]).await;
 
@@ -366,6 +431,7 @@ async fn a_non_creator_edit_is_reverted_and_the_next_creator_change_applies() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_creator_delete_is_reverted() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir) = (dir(), dir());
     let (_, creator, mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
 
@@ -379,6 +445,7 @@ async fn a_non_creator_delete_is_reverted() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_only_peer_reverts_an_edit_made_while_stopped() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir) = (dir(), dir());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
     mounters.remove(0).stop().await;
@@ -395,6 +462,7 @@ async fn a_read_only_peer_reverts_an_edit_made_while_stopped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_given_edited_file_is_removed_when_the_creator_deletes_it() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir) = (dir(), dir());
     let (hash, creator, mut mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
     tokio::time::sleep(SETTLE).await;
@@ -413,6 +481,7 @@ async fn a_given_edited_file_is_removed_when_the_creator_deletes_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mounter_keeps_its_own_file_at_a_tombstoned_path() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     let (hash, creator, mounters) = creator_mesh(&c_dir, &[&a_dir]).await;
     std::fs::remove_file(c_dir.path().join("base.md")).unwrap();
@@ -435,6 +504,7 @@ async fn a_mounter_keeps_its_own_file_at_a_tombstoned_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mounter_keeps_a_file_made_after_join_at_a_tombstoned_path() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     let (_, creator, mounters) = creator_mesh(&c_dir, &[&a_dir, &b_dir]).await;
     std::fs::remove_file(c_dir.path().join("base.md")).unwrap();
@@ -455,6 +525,7 @@ async fn a_mounter_keeps_a_file_made_after_join_at_a_tombstoned_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mount_with_a_malformed_creator_suffix_fails() {
+    let _slot = test_slot().await;
     let (c_dir, target) = (dir(), dir());
     write(&c_dir, "base.md", CREATOR_V1);
     let creator = Peer::share_as(c_dir.path(), Writers::Creator).await;
@@ -471,6 +542,7 @@ async fn a_mount_with_a_malformed_creator_suffix_fails() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mount_with_another_creator_key_applies_nothing() {
+    let _slot = test_slot().await;
     let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
     write(&c_dir, "base.md", CREATOR_V1);
     let creator = Peer::share_as(c_dir.path(), Writers::Creator).await;
@@ -525,6 +597,10 @@ impl MountProcess {
         }
     }
 
+    fn stderr_text(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap_or_default()
+    }
+
     /// Wait until stderr holds `line`; fail after [`WAIT`].
     async fn wait_for_line(&self, line: &str) {
         let deadline = tokio::time::Instant::now() + WAIT;
@@ -548,6 +624,7 @@ impl Drop for MountProcess {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_two_read_only_lines_are_printed() {
+    let _slot = test_slot().await;
     let (c_dir, target) = (dir(), dir());
     write(&c_dir, "base.md", CREATOR_V1);
     let creator = Peer::share_as(c_dir.path(), Writers::Creator).await;
@@ -560,5 +637,27 @@ async fn the_two_read_only_lines_are_printed() {
     mounter.wait_for_line("read-only share: not published mine.md").await;
 
     assert_eq!(read(&c_dir, "mine.md"), None, "the file of the mounter reached the creator");
+    creator.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_creator_update_prints_the_download_and_no_reverted_line() {
+    let _slot = test_slot().await;
+    let (c_dir, target) = (dir(), dir());
+    write(&c_dir, "base.md", CREATOR_V1);
+    let creator = Peer::share_as(c_dir.path(), Writers::Creator).await;
+    let mounter = MountProcess::start(&creator.ready.mesh, target.path());
+    wait_for(&target.path().join("base.md"), Some(CREATOR_V1)).await;
+
+    write(&c_dir, "base.md", "creator v2");
+    wait_for(&target.path().join("base.md"), Some("creator v2")).await;
+    tokio::time::sleep(SETTLE).await;
+
+    let stderr = mounter.stderr_text();
+    assert!(
+        !stderr.contains("read-only share: reverted"),
+        "an update of the creator was reported as a revert: {stderr}"
+    );
+    assert!(stderr.contains("↓ base.md"), "the update was not reported: {stderr}");
     creator.stop().await;
 }
