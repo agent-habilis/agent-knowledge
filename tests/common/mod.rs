@@ -4,11 +4,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent_knowledge::sync::{self, Presence, Ready};
+use agent_knowledge::writers::Writers;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 /// How long a test waits for the mesh to deliver something.
 pub const WAIT: Duration = Duration::from_secs(30);
+
+/// How long [`Peer::stop`] waits for a loop to exit.
+pub const STOP_LIMIT: Duration = Duration::from_secs(30);
 
 /// Poll `path` until its contents equal `want` (`None`: the file is absent); fail after [`WAIT`].
 pub async fn wait_for(path: &Path, want: Option<&str>) {
@@ -25,7 +29,13 @@ pub async fn wait_for(path: &Path, want: Option<&str>) {
 
 /// The `sync::Options` of a test peer on `root`.
 pub fn options(root: &Path, mesh: Option<String>, nickname: Option<&str>) -> sync::Options {
-    sync::Options { root: root.to_path_buf(), mesh, nickname: nickname.map(str::to_owned), status_file: None }
+    sync::Options {
+        root: root.to_path_buf(),
+        mesh,
+        nickname: nickname.map(str::to_owned),
+        status_file: None,
+        writers: Writers::Everybody,
+    }
 }
 
 /// One running `sync::run` loop.
@@ -46,6 +56,11 @@ impl Peer {
         Self::start_with(options(root, mesh, nickname), on_presence).await
     }
 
+    /// Start a share on `root` under the writer rule `writers`. `ready.mesh` is its hash.
+    pub async fn share_as(root: &Path, writers: Writers) -> Self {
+        Self::start_with(sync::Options { writers, ..options(root, None, None) }, |_| {}).await
+    }
+
     /// [`Peer::start`] with every option spelled out.
     pub async fn start_with(options: sync::Options, on_presence: impl FnMut(Presence) + Send + 'static) -> Self {
         let (stop, mut stop_rx) = watch::channel(());
@@ -62,10 +77,11 @@ impl Peer {
         Self { ready, stop, task }
     }
 
-    /// Signal the loop to stop and wait until it exits cleanly.
+    /// Signal the loop to stop and wait until it exits cleanly. Fails after [`STOP_LIMIT`].
     pub async fn stop(self) {
         self.stop.send(()).unwrap();
-        self.task.await.unwrap().unwrap();
+        let exited = tokio::time::timeout(STOP_LIMIT, self.task).await;
+        exited.expect("the peer did not stop within the limit").unwrap().unwrap();
     }
 }
 

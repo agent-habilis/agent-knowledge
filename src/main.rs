@@ -4,6 +4,7 @@ use agent_knowledge::memory::{self, Claim, Kind, Memory};
 use agent_knowledge::plug::{self, Agent};
 use agent_knowledge::status::{self, Status};
 use agent_knowledge::sync::{self, Options, Presence, Ready};
+use agent_knowledge::writers::Writers;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
@@ -23,6 +24,9 @@ enum Command {
         /// This peer's nickname in the mesh. Default: a random one.
         #[arg(long)]
         nickname: Option<String>,
+        /// Who can change the share. With `creator`, a mounter applies only what this `share` run signed.
+        #[arg(long, value_enum, default_value_t)]
+        writers: Writers,
     },
     /// Sync <target> with the folder that `share` printed <hash> for, until Ctrl-C.
     Mount {
@@ -118,14 +122,14 @@ async fn main() -> anyhow::Result<()> {
         let _ = tokio::signal::ctrl_c().await;
     };
     match Cli::parse().command {
-        Command::Share { folder, nickname } => {
+        Command::Share { folder, nickname, writers } => {
             let claim = claim(Kind::Share, &folder)?;
             let on_ready = |ready: &Ready| {
                 println!("{}", ready.mesh);
                 print_nickname(&ready.nick);
             };
             let status_file = Some(claim.status_path().to_path_buf());
-            let options = Options { root: folder, mesh: None, nickname, status_file };
+            let options = Options { root: folder, mesh: None, nickname, status_file, writers };
             sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Mount { hash, target, nickname } => {
@@ -136,7 +140,8 @@ async fn main() -> anyhow::Result<()> {
                 print_nickname(&ready.nick);
             };
             let status_file = Some(claim.status_path().to_path_buf());
-            let options = Options { root: target.clone(), mesh: Some(hash), nickname, status_file };
+            let options =
+                Options { root: target.clone(), mesh: Some(hash), nickname, status_file, writers: Writers::default() };
             sync::run(options, on_ready, print_presence, shutdown).await
         }
         Command::Plug { agents } => run_plug(agents),

@@ -32,6 +32,7 @@ use tokio::task::AbortHandle;
 use crate::scan::{self, resolve, sha256_bytes};
 use crate::status::{self, Status};
 use crate::watch::watch;
+use crate::writers::{self, CreatorKey, Writers};
 
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
@@ -41,18 +42,20 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(2);
 pub struct Options {
     /// The folder to keep in sync.
     pub root: PathBuf,
-    /// The mesh to join, or `None` to create a new one.
+    /// The hash to join, as `share` printed it, or `None` to create a new mesh.
     pub mesh: Option<String>,
     /// This peer's nickname, or `None` for the mesh to mint a random one.
     pub nickname: Option<String>,
     /// Where to keep this memory's [`Status`] for `agent-knowledge status`, or `None` for nowhere.
     pub status_file: Option<PathBuf>,
+    /// Who may write to the new mesh. A joiner learns it from the hash, so it ignores this.
+    pub writers: Writers,
 }
 
 /// The mesh is up.
 #[derive(Clone, Debug)]
 pub struct Ready {
-    /// The mesh id, which is the hash that `mount` takes.
+    /// The hash that `mount` takes: the mesh id, with the creator key of a creator share after a dot.
     pub mesh: String,
     /// This peer's nickname: the one asked for, or the one the mesh minted.
     pub nick: String,
@@ -66,15 +69,19 @@ pub enum Presence {
 }
 
 /// Sync `options.root` until `shutdown` resolves. With `options.mesh` `None`, create a new mesh;
-/// else join it. `on_ready` gets the mesh id and this peer's nickname; `on_presence` gets each
-/// other peer that joins or leaves.
+/// else join it. A malformed hash is an error before any join. `on_ready` gets the hash and this
+/// peer's nickname; `on_presence` gets each other peer that joins or leaves.
 pub async fn run(
     options: Options,
     on_ready: impl FnOnce(&Ready),
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname, status_file } = options;
+    let Options { root, mesh, nickname, status_file, writers } = options;
+    let (mesh, creator_key, joined_hash) = match mesh {
+        None => (None, matches!(writers, Writers::Creator).then(CreatorKey::generate).transpose()?, None),
+        Some(hash) => (Some(writers::parse_hash(&hash)?.0), None, Some(hash)),
+    };
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
@@ -87,6 +94,9 @@ pub async fn run(
         .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     let ready = wait_ready(&mut events).await?;
+    let mesh = ready.mesh.clone();
+    let hash = joined_hash.unwrap_or_else(|| writers::encode_hash(&mesh, creator_key.as_ref()));
+    let ready = Ready { mesh: hash, ..ready };
     on_ready(&ready);
 
     let spool = spool_dir();
@@ -96,7 +106,6 @@ pub async fn run(
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
-    let mesh = ready.mesh.clone();
     let saved = std::fs::read(root.join(INDEX_FILE)).ok().map(|bytes| load_saved(&bytes, &mesh)).unwrap_or_default();
     let disk = scan::scan(&root).unwrap_or_default();
     let own = own_after_restart(saved, &disk, now_ms());
@@ -3219,5 +3228,20 @@ mod tests {
         let minimum = BLOB_RETRY_BASE * 3;
         assert!(started.elapsed() >= minimum, "elapsed {:?}", started.elapsed());
         assert_eq!(std::fs::read(&local).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_creator_suffix_is_an_error_before_any_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            root: dir.path().to_path_buf(),
+            mesh: Some("mesh.not-a-key".to_owned()),
+            nickname: None,
+            status_file: None,
+            writers: Writers::Everybody,
+        };
+        let run = run(options, |_: &Ready| panic!("a malformed hash must not join"), |_| {}, std::future::pending());
+        let error = tokio::time::timeout(Duration::from_secs(5), run).await.expect("run must fail fast").unwrap_err();
+        assert!(error.to_string().contains("creator key"), "{error}");
     }
 }
