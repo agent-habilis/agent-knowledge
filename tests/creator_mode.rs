@@ -5,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use agent_knowledge::scan::sha256_bytes;
-use agent_knowledge::writers::{CreatorKey, Writers};
+use agent_knowledge::writers::{CreatorKey, Writers, sign_entry};
 use common::{Peer, WAIT, wait_for};
 use habilis_network::membership::{self, Inspect, JoinOptions, Membership, Messaging, Request};
 use habilis_network::net::direct::PayloadPath;
@@ -62,8 +62,15 @@ async fn stop_all(peers: Vec<Peer>) {
     }
 }
 
-/// Which holder of the file leaves before the new mounter joins.
-/// A live peer of the mesh that offers `base.md` with the signed entry of the creator and a ticket for other bytes.
+/// A file that a hostile peer offers. `entry` holds every field of its index entry except the ticket. The ticket serves
+/// `bytes`, and `entry` can name other bytes.
+struct Offer<'a> {
+    path: &'a str,
+    bytes: &'a [u8],
+    entry: Value,
+}
+
+/// A live peer of the mesh that publishes an index of the files that it offers.
 struct Hostile {
     member: Membership,
     blobs: BlobServer,
@@ -72,8 +79,8 @@ struct Hostile {
 }
 
 impl Hostile {
-    /// Join `mesh` and publish an index with a copy of `entry`, whose ticket serves other bytes than the entry names.
-    async fn join(mesh: &str, entry: &Value) -> Self {
+    /// Join `mesh` and publish an index of `offers`.
+    async fn join(mesh: &str, offers: &[Offer<'_>]) -> Self {
         let (sink, mut events) = membership::json_sink();
         let options = JoinOptions::default()
             .mesh(Some(mesh.to_owned()))
@@ -97,18 +104,23 @@ impl Hostile {
             BlobServer::start(LookupOpts::public_preset(), dir.path().join("spool"), None, PayloadPath::RelayAllowed)
                 .await
                 .unwrap();
-        let wrong = dir.path().join("wrong");
-        std::fs::write(&wrong, "other bytes").unwrap();
-        let ticket = blobs.register(&wrong, ContentId::new(entry["sha256"].as_str().unwrap())).await.unwrap();
-        let mut offered = entry.clone();
-        offered["ticket"] = json!(ticket.encode());
+        let mut files = serde_json::Map::new();
+        for (number, offer) in offers.iter().enumerate() {
+            let file = dir.path().join(format!("offer-{number}"));
+            std::fs::write(&file, offer.bytes).unwrap();
+            let ticket = blobs.register(&file, ContentId::new(offer.entry["sha256"].as_str().unwrap())).await.unwrap();
+            let mut entry = offer.entry.clone();
+            entry["ticket"] = json!(ticket.encode());
+            files.insert(offer.path.to_owned(), entry);
+        }
 
-        let index = serde_json::to_vec(&json!({ "base.md": offered })).unwrap();
+        let index = serde_json::to_vec(&files).unwrap();
         let index_sha = sha256_bytes(&index);
         let file = dir.path().join("index.json");
         std::fs::write(&file, &index).unwrap();
         let index_ticket = blobs.register(&file, ContentId::new(&index_sha)).await.unwrap();
-        let merge = json!({ "index": { "ticket": index_ticket.encode(), "sha256": index_sha, "ts": entry["ts"] } });
+        let merge =
+            json!({ "index": { "ticket": index_ticket.encode(), "sha256": index_sha, "ts": offers[0].entry["ts"] } });
         member.request(|reply| Request::Messaging(Messaging::StateMerge { merge, reply })).await.unwrap().unwrap();
 
         let author = authors_of(&member)
@@ -142,7 +154,8 @@ async fn authors_of(member: &Membership) -> Vec<(String, String)> {
 async fn a_hostile_peer_that_wins_the_tie(mesh: &str, entry: &Value, holders: usize) -> Hostile {
     let mut earlier: Vec<String> = Vec::new();
     for _ in 0..20 {
-        let hostile = Hostile::join(mesh, entry).await;
+        let offer = Offer { path: "base.md", bytes: b"other bytes", entry: entry.clone() };
+        let hostile = Hostile::join(mesh, &[offer]).await;
         let deadline = tokio::time::Instant::now() + WAIT;
         let others = loop {
             let others: Vec<String> = authors_of(&hostile.member)
@@ -219,6 +232,7 @@ async fn a_non_creator_write_is_not_applied_on_other_peers() {
     write(&a_dir, "base.md", "edited by a");
     tokio::time::sleep(SETTLE).await;
 
+    assert_eq!(read(&a_dir, "new.md").as_deref(), Some("from a"), "A lost its own new file");
     assert_eq!(read(&b_dir, "new.md"), None);
     assert_eq!(read(&b_dir, "base.md").as_deref(), Some(CREATOR_V1));
     assert_eq!(read(&c_dir, "new.md"), None);
@@ -226,6 +240,59 @@ async fn a_non_creator_write_is_not_applied_on_other_peers() {
 
     creator.stop().await;
     stop_all(mounters).await;
+}
+
+/// The entry of `base.md` in the index that a peer keeps in its folder.
+fn saved_entry(dir: &TempDir) -> Value {
+    let saved = std::fs::read(dir.path().join(".agent-knowledge-index.json")).unwrap();
+    serde_json::from_slice::<Value>(&saved).unwrap()["own"]["base.md"].clone()
+}
+
+fn now_ms() -> u64 {
+    let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    u64::try_from(since_epoch.as_millis()).unwrap()
+}
+
+/// An entry of a file with `bytes`, 1 minute newer than any entry of the creator now.
+fn newer_entry(bytes: &[u8]) -> Value {
+    json!({ "sha256": sha256_bytes(bytes), "ts": now_ms() + 60_000, "size": bytes.len() })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_entry_from_a_member_is_not_applied() {
+    let (c_dir, a_dir, b_dir) = (dir(), dir(), dir());
+    write(&c_dir, "second.md", "second v1");
+    let (hash, creator, mounters) = creator_mesh(&c_dir, &[&a_dir, &b_dir]).await;
+    wait_for(&a_dir.path().join("second.md"), Some("second v1")).await;
+    wait_for(&b_dir.path().join("second.md"), Some("second v1")).await;
+    let mesh = mesh_of(&hash);
+    let other_key = CreatorKey::generate().unwrap();
+    // An entry that holds each signed field, signed by a key that is not the creator key.
+    let forged = |path: &str, bytes: &[u8]| sign_entry(&other_key, mesh, path, &newer_entry(bytes)).unwrap();
+    let offers = [
+        Offer { path: "unsigned.md", bytes: b"unsigned", entry: newer_entry(b"unsigned") },
+        Offer { path: "forged.md", bytes: b"forged", entry: forged("forged.md", b"forged") },
+        Offer { path: "base.md", bytes: b"forged base", entry: forged("base.md", b"forged base") },
+        Offer { path: "second.md", bytes: b"unsigned second", entry: newer_entry(b"unsigned second") },
+    ];
+
+    let hostile = Hostile::join(mesh, &offers).await;
+    tokio::time::sleep(SETTLE).await;
+    // The marker shows that the mounters follow the creator after the hostile peer joined.
+    write(&c_dir, "marker.md", "marker");
+    wait_for(&a_dir.path().join("marker.md"), Some("marker")).await;
+    wait_for(&b_dir.path().join("marker.md"), Some("marker")).await;
+    tokio::time::sleep(SETTLE).await;
+
+    for mounter in [&a_dir, &b_dir] {
+        assert_eq!(read(mounter, "unsigned.md"), None, "an unsigned entry was applied");
+        assert_eq!(read(mounter, "forged.md"), None, "an entry with another key was applied");
+        assert_eq!(read(mounter, "base.md").as_deref(), Some(CREATOR_V1), "a forged entry replaced base.md");
+        assert_eq!(read(mounter, "second.md").as_deref(), Some("second v1"), "an unsigned entry replaced second.md");
+    }
+    creator.stop().await;
+    stop_all(mounters).await;
+    hostile.leave().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -267,6 +334,13 @@ async fn a_rehoster_restart_keeps_the_creator_signatures() {
     mounters.remove(0).stop().await;
     let a = mount(&a_dir, &hash).await;
     tokio::time::sleep(SETTLE).await;
+    // The rehoster copies the entry of the creator with its ts, signature and size, and a ticket of its own.
+    let creator_entry = saved_entry(&c_dir);
+    let rehoster_entry = saved_entry(&a_dir);
+    for field in ["sha256", "ts", "sig", "size"] {
+        assert!(creator_entry[field].is_string() || creator_entry[field].is_u64(), "the creator has no {field}");
+        assert_eq!(rehoster_entry[field], creator_entry[field], "the rehoster changed {field} after a restart");
+    }
     creator.stop().await;
     let b = mount(&b_dir, &hash).await;
     wait_for(&b_dir.path().join("base.md"), Some(CREATOR_V1)).await;
