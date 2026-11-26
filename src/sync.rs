@@ -1444,16 +1444,17 @@ fn check_index(bytes: &[u8], sha: &str) -> Result<serde_json::Map<String, Value>
     }
 }
 
-/// The entries of each author slice whose index is fetched and matches the pointer. A slice with no fetched index
-/// holds no data.
+/// The entries of each author slice that has an index pointer, as of the last index fetched for it. While the index
+/// for a newer pointer is fetched, the entries before it stay in the view: a slice that dropped out for that time would
+/// let an older copy of a file win over the delete that the slice holds. A slice with no fetched index holds no data.
 fn live_slices<'a>(
     document: &'a Value,
     indexes: &'a Indexes,
 ) -> impl Iterator<Item = (&'a String, &'a serde_json::Map<String, Value>)> + 'a {
     document.as_object().into_iter().flatten().filter_map(move |(author, slice)| {
-        let pointer = slice.get("index")?.get("sha256")?.as_str()?;
-        let (fetched, entries) = indexes.0.get(author)?;
-        (fetched == pointer).then_some((author, entries))
+        slice.get("index")?.get("sha256")?.as_str()?;
+        let (_, entries) = indexes.0.get(author)?;
+        Some((author, entries))
     })
 }
 
@@ -3985,5 +3986,22 @@ mod tests {
         seen.sort();
         assert_eq!(seen, vec!["a".to_owned(), "b".to_owned()]);
         assert_eq!(downloads.running.len(), 2);
+    }
+
+    #[test]
+    fn a_slice_whose_new_index_has_not_landed_keeps_its_last_entries_in_the_view() {
+        let (mut document, indexes) = pointed(&[
+            ("a", serde_json::json!({ "p": { "sha256": "x", "ticket": "t", "ts": 1 } })),
+            ("c", serde_json::json!({ "p": { "deleted": true, "ts": 2 } })),
+        ]);
+        // First pass: both indexes match their pointers, and the delete of c wins.
+        assert!(!view_of(&document, &indexes).contains_key("p"));
+
+        // Second pass: c points at a newer index that is still being fetched. Its delete must still win over the older
+        // copy in a, or a peer fetches the file that c deleted.
+        document["c"]["index"]["sha256"] = serde_json::json!("not fetched yet");
+
+        assert!(!view_of(&document, &indexes).contains_key("p"));
+        assert_eq!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]), vec!["p".to_owned()]);
     }
 }
