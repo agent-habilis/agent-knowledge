@@ -58,6 +58,8 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
  "habilis-network",
  "hex",
  "notify",
@@ -67,6 +69,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

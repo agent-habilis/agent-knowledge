@@ -98,9 +98,11 @@ one or more times. Restart the harness to load the skills.
 
 ### `/knowledge-share`
 
-`/knowledge-share <folder> [--nickname <nick>]` runs `share` in the
-background and reports the hash. The folder becomes the memory bank of the
-session. Hand the hash to another agent to mount it.
+`/knowledge-share <folder> [--nickname <nick>] [--writers creator]` runs
+`share` in the background and reports the hash. The folder becomes the memory
+bank of the session. Hand the hash to another agent to mount it. With
+`--writers creator`, only this share can change files (see
+[Writers](#writers)).
 
 <br>
 
@@ -178,6 +180,94 @@ other peer that joins or leaves:
 
 <br>
 
+## Writers
+
+By default, each peer that holds the hash can create, edit, and delete files.
+To let only the creator change files, start the share with `--writers creator`:
+
+```bash
+agent-knowledge share <folder> --writers creator
+```
+
+| Value                 | Who can change files                         |
+|-----------------------|----------------------------------------------|
+| `everybody` (default) | Each peer that holds the hash.               |
+| `creator`             | Only the `share` process that made the hash. |
+
+In creator mode, `share` makes a new signing key at each start. The key stays
+in memory. The creator signs each entry of its index with this key. A peer
+applies an entry only if the signature is valid.
+
+The hash of a creator share has a second form:
+
+```text
+<mesh-id>.<creator-public-key>
+```
+
+The creator public key is 64 lowercase hex characters. The hash of an
+`everybody` share is only the mesh id. `status` and `/knowledge-status` print
+the full hash.
+
+A mounter uses the same command: `agent-knowledge mount <hash> <target>`. The
+mounter takes the creator key only from the hash. If the part after the first
+`.` is not the 64 lowercase hex characters of a valid Ed25519 public key,
+`mount` does not join. It prints `the creator key in the hash is not 64
+lowercase hex digits of an Ed25519 key` and exits with an error.
+
+A mounter of a creator share gets a read-only copy:
+
+- The folder follows the creator.
+- A mounter never publishes an edit, a create, or a delete.
+- If a mounter changes or deletes a file, `mount` puts the creator version
+  back. It prints `read-only share: reverted <path>` on stderr, 1 line for
+  each path. This line shows only when the file on the disk differs from the
+  version that `mount` last synced. When the creator updates a file, `mount`
+  prints the normal `↓ <path>` line and not this line.
+- The same happens when `mount` starts and finds an offline edit.
+- If the mesh never gave the mounter a file, the file stays on the mounter.
+  This includes a file at a path that the creator deleted, a file at a path
+  that the creator never shared, and a file that the mounter creates after it
+  joins. `mount` does not publish the file. It prints
+  `read-only share: not published <path>` on stderr, 1 line for each path.
+- If the mounter has a file at a path that the creator shares now, `mount`
+  replaces the file with the creator version. It prints no `read-only share:` line.
+- If the mesh gave the mounter a file, and the creator deletes it, `mount`
+  removes the file. This is true also when the mounter edited the file.
+
+Each mounter keeps a copy of the signed entries. If the creator process stops,
+a new mounter still gets the folder from the other mounters. Nobody can sign
+again. To change files again, run `share` again. The new run prints a new
+hash.
+
+### Known limits of creator mode
+
+- After the creator leaves, a peer that holds the folder can withhold the
+  newest signed entry. A new mounter can then get an older version of a file,
+  or a file that the creator deleted.
+- Any build, given the bare mesh id of a creator share, runs in `everybody`
+  mode. This includes a build with creator mode.
+- The blob ticket is not signed. A member can point readers at its own blob
+  server. The cost is bounded by the signed size of the file.
+- A peer ignores an entry with a timestamp more than 10 minutes in the future.
+  A mounter with a clock set back more than 10 minutes can lose its copies
+  from the view for that time.
+- A peer that keeps its own file at a deleted path does not rehost that
+  delete.
+- When a mounter joins, it can read the entry of a rehoster before it reads
+  the index of the creator. If the rehoster holds an older copy of a path that
+  the creator deleted, that copy can replace a file that the mesh never gave
+  the mounter at this path.
+- A file system that ignores case, such as the default on macOS and Windows,
+  holds 2 paths that differ only by case as 1 file. A mounter on such a file
+  system cannot keep both paths. The mounter keeps 1 path. For the other path,
+  `mount` prints
+  `read-only share: <path> is not downloaded: <kept> has the same name in a folder that ignores case`
+  on stderr, 1 time.
+- Each entry is about 160 bytes larger, because it holds a signature and a
+  size.
+
+<br>
+
 ## Limits
 
 - Hidden files and folders (`.git`, `.DS_Store`) do not sync.
@@ -188,6 +278,9 @@ other peer that joins or leaves:
 - If 2 sides edit 1 file, the edit with the larger timestamp wins. Each peer
   stamps an edit with its own clock, so if the clocks differ, an earlier
   edit can win.
+- The first sync of a new peer takes about 5 seconds, plus a wait for the
+  first state of the mesh. If many meshes run on 1 host, this wait can pass
+  30 seconds.
 - Each side keeps a full copy of the folder. If you stop a share or a mount,
   the copies that peers already have stay.
 

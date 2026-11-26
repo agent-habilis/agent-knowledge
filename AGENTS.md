@@ -70,6 +70,18 @@ bun test scripts/                                                        # scrip
   nickname, and the 📚 line format.
 - `tests/relay_only.rs` blocks every direct path, so 2 peers sync only
   through the public relay. It needs internet access.
+- `src/writers.rs` has the unit tests of the signed entries.
+- `tests/creator_mode.rs` runs peers with `--writers creator`. It checks that
+  a non-creator write does not apply, that the folder syncs after the creator
+  leaves, that a rehoster keeps the creator signatures after a restart, that a
+  mounter puts back an edit or a delete, and that a mounter keeps a file that
+  the mesh never gave it. It also runs the binary, to check the 2 `read-only
+  share:` lines and the error for a malformed hash. It takes about 30 seconds.
+  Its peers use loopback lookups (`Lookups::Loopback`): they find only peers
+  on this machine, and no test waits for the network. The other test files use
+  the public lookups. The binary always uses the public lookups. The 2 tests
+  that read the `read-only share:` lines run the binary, so they use the public
+  lookups too. Do not run the binary in another test that joins a mesh.
 - `scripts/update-license.test.ts` checks the `LICENSE` header rewrite.
 
 ### Releasing
@@ -110,6 +122,8 @@ To recover a failed release, first check if the tag `v<version>` exists:
 - `src/skills/`: the skills that `plug` installs. Edit them here, then
   rebuild.
 - `src/sync.rs`: the sync loop. Both commands run it.
+- `src/writers.rs`: the `--writers` flag, the creator key, and the signed
+  entries. It has no I/O.
 - `src/scan.rs`: walks a folder and hashes each file. It also rejects unsafe
   paths from a peer.
 - `src/status.rs`: the status file that a running memory writes, and the 📚
@@ -121,7 +135,13 @@ To recover a failed release, first check if the tag `v<version>` exists:
 ### How it works
 
 - **The hash** is a habilis-network mesh id. The mesh uses all lookups: mDNS,
-  DHT, and relay.
+  DHT, and relay. With `--writers creator`, the hash is
+  `<mesh-id>.<creator-public-key>`. Only the mesh id goes into the signed
+  message and the saved index. See [Writers](README.md#writers).
+- **Creator mode:** the creator signs each entry of its index. A peer drops an
+  entry that does not verify before it picks a winner. A peer that is not the
+  creator never authors an entry. It copies the signed entry of the winner,
+  with the same timestamp, signature, and size.
 - **The file list** is an index blob per author. An index maps each path to
   the sha256, a blob ticket, and a timestamp of the file, or to a delete.
 - **The mesh `state` document** is an automerge CRDT (a data type that merges

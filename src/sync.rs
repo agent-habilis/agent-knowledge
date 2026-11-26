@@ -32,6 +32,7 @@ use tokio::task::AbortHandle;
 use crate::scan::{self, resolve, sha256_bytes};
 use crate::status::{self, Status};
 use crate::watch::watch;
+use crate::writers::{self, CreatorKey, Trust, Writers, sign_entry};
 
 const MESH_NAME: &str = "agent-knowledge";
 /// A safety net for a `state_changed` event that never fires, for example after a backfill.
@@ -41,18 +42,60 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(2);
 pub struct Options {
     /// The folder to keep in sync.
     pub root: PathBuf,
-    /// The mesh to join, or `None` to create a new one.
+    /// The hash to join, as `share` printed it, or `None` to create a new mesh.
     pub mesh: Option<String>,
     /// This peer's nickname, or `None` for the mesh to mint a random one.
     pub nickname: Option<String>,
     /// Where to keep this memory's [`Status`] for `agent-knowledge status`, or `None` for nowhere.
     pub status_file: Option<PathBuf>,
+    /// Who may write to the new mesh. A joiner learns it from the hash, so it ignores this.
+    pub writers: Writers,
+    /// How this peer finds the others. Every peer of one mesh must use the same.
+    pub lookups: Lookups,
+}
+
+/// How a peer finds the other peers of its mesh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lookups {
+    /// LAN multicast, the DHT and the relay: peers on other machines are found. The default of every command.
+    #[default]
+    Public,
+    /// No lookup and no relay: only peers on this machine are found. A test uses it to take the network out of a run.
+    Loopback,
+}
+
+impl Lookups {
+    /// The lookups of the mesh join.
+    pub fn join(self) -> Vec<Lookup> {
+        match self {
+            Self::Public => vec![Lookup::Mdns, Lookup::Dht, Lookup::Relay],
+            Self::Loopback => Vec::new(),
+        }
+    }
+
+    /// The transports of the mesh join. The relay transport needs the relay lookup.
+    pub fn transports(self) -> Vec<Transport> {
+        let direct = [Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip];
+        match self {
+            Self::Public => direct.into_iter().chain([Transport::Relay]).collect(),
+            Self::Loopback => direct.to_vec(),
+        }
+    }
+
+    /// The lookups of every blob endpoint. The server and the consumers must share them, so a ticket that one side
+    /// publishes is found by the other side.
+    pub fn blob(self) -> LookupOpts {
+        match self {
+            Self::Public => LookupOpts::public_preset(),
+            Self::Loopback => LookupOpts::loopback(),
+        }
+    }
 }
 
 /// The mesh is up.
 #[derive(Clone, Debug)]
 pub struct Ready {
-    /// The mesh id, which is the hash that `mount` takes.
+    /// The hash that `mount` takes: the mesh id, with the creator key of a creator share after a dot.
     pub mesh: String,
     /// This peer's nickname: the one asked for, or the one the mesh minted.
     pub nick: String,
@@ -66,40 +109,57 @@ pub enum Presence {
 }
 
 /// Sync `options.root` until `shutdown` resolves. With `options.mesh` `None`, create a new mesh;
-/// else join it. `on_ready` gets the mesh id and this peer's nickname; `on_presence` gets each
-/// other peer that joins or leaves.
+/// else join it. A malformed hash is an error before any join. `on_ready` gets the hash and this
+/// peer's nickname; `on_presence` gets each other peer that joins or leaves.
 pub async fn run(
     options: Options,
     on_ready: impl FnOnce(&Ready),
     mut on_presence: impl FnMut(Presence),
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    let Options { root, mesh, nickname, status_file } = options;
+    let Options { root, mesh, nickname, status_file, writers, lookups } = options;
+    let (mesh, creator_key, joined_hash) = match mesh {
+        None => (None, matches!(writers, Writers::Creator).then(CreatorKey::generate).transpose()?, None),
+        Some(hash) => (Some(writers::parse_hash(&hash)?.0), None, Some(hash)),
+    };
     let root = std::fs::canonicalize(&root).with_context(|| format!("no folder at {}", root.display()))?;
     let (sink, mut events) = membership::json_sink();
     let options = JoinOptions::default()
         .mesh(mesh)
         .nick(nickname)
         .name(Some(MESH_NAME.to_owned()))
-        .lookup([Lookup::Mdns, Lookup::Dht, Lookup::Relay])
+        .lookup(lookups.join())
         // The engine default plus `Relay`. Without it, 2 peers whose hole punch fails find each
         // other through the relay but never link, because the relay is kept for lookup alone.
-        .transport([Transport::Udp, Transport::WebRtc, Transport::Multihop, Transport::Gossip, Transport::Relay]);
+        .transport(lookups.transports());
     let member = membership::join(&options, sink).await.map_err(|error| anyhow!("{error}"))?;
     let ready = wait_ready(&mut events).await?;
+    let mesh = ready.mesh.clone();
+    let hash = joined_hash.unwrap_or_else(|| writers::encode_hash(&mesh, creator_key.as_ref()));
+    let (_, trust) = writers::parse_hash(&hash)?;
+    let ready = Ready { mesh: hash, ..ready };
     on_ready(&ready);
 
     let spool = spool_dir();
-    let blobs = BlobServer::start(blob_lookups(), spool.clone(), None, PayloadPath::RelayAllowed)
+    let blobs = BlobServer::start(lookups.blob(), spool.clone(), None, PayloadPath::RelayAllowed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
+    // Before the watcher starts, so the probe file is not an event. A stop cannot leave it in the folder, and a probe that
+    // an earlier run left is written over and removed.
+    let case_insensitive = matches!(trust, Trust::Creator { .. }) && creator_key.is_none() && ignores_case(&root);
     let (_watcher, mut ticks) = watch(&root)?;
     let (done, mut finished) = mpsc::unbounded_channel();
     let (index_tx, mut index_done) = mpsc::unbounded_channel();
-    let mesh = ready.mesh.clone();
     let saved = std::fs::read(root.join(INDEX_FILE)).ok().map(|bytes| load_saved(&bytes, &mesh)).unwrap_or_default();
+    let saved = trusted_saved(saved, &trust);
     let disk = scan::scan(&root).unwrap_or_default();
-    let own = own_after_restart(saved, &disk, now_ms());
+    let signed_share = matches!(trust, Trust::Creator { .. });
+    let read_only = signed_share && creator_key.is_none();
+    // A path that this peer once held counts as given by the mesh, even when its saved entry is dropped below.
+    let given: HashSet<String> =
+        saved.iter().filter(|(_, entry)| !is_tombstone(entry)).map(|(path, _)| path.clone()).collect();
+    let own =
+        if signed_share { own_after_restart_signed(saved, &disk) } else { own_after_restart(saved, &disk, now_ms()) };
     // A disk file whose sha is its saved entry is not an edit made while stopped, so it is not published again.
     let known: HashMap<String, String> = own
         .iter()
@@ -108,21 +168,33 @@ pub async fn run(
             (disk.get(path).map(String::as_str) == Some(sha)).then(|| (path.clone(), sha.to_owned()))
         })
         .collect();
-    // A kept file has no ticket of this run, so it is registered below. Its ts stays, so a restart is not a new edit.
-    let kept: Vec<(String, String, u64)> = known
+    // A kept file has no ticket of this run, so it is registered below. Its ts, signature and size stay, so a restart
+    // is not a new edit and a copy of the creator's entry stays valid.
+    let kept: Vec<(String, String, Meta)> = known
         .iter()
-        .map(|(path, sha)| {
-            let ts = own.get(path).and_then(|entry| entry.get("ts")).and_then(Value::as_u64).unwrap_or(0);
-            (path.clone(), sha.clone(), ts)
-        })
+        .map(|(path, sha)| (path.clone(), sha.clone(), own.get(path).map(meta_of_entry).unwrap_or_default()))
         .collect();
+    let mut downloads = Downloads::new(root.clone(), done);
+    downloads.read_only = read_only;
+    downloads.given = given;
+    if read_only {
+        downloads.disk = disk.clone();
+    }
     let status = Status { mesh: ready.mesh, nick: ready.nick, folder: root.clone(), ..Status::default() };
     let mut folder = Folder {
         root: root.clone(),
         member,
         blobs,
         known,
-        downloads: Downloads::new(root, done),
+        downloads,
+        trust,
+        lookups,
+        creator_key,
+        viewed: false,
+        unpublished: HashSet::new(),
+        case_insensitive,
+        collisions_warned: HashSet::new(),
+        unregistered: Unregistered::default(),
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
@@ -140,13 +212,13 @@ pub async fn run(
         // A restart may have turned files into tombstones, so the first pass publishes the index.
         index_dirty: true,
         index_version: 0,
-        winner_ts: HashMap::new(),
         index_written: None,
         spool,
     };
 
-    for (path, sha, ts) in kept {
-        if let Err(error) = folder.publish(&path, &sha, ts).await {
+    for (path, sha, meta) in kept {
+        if let Err(error) = folder.register_kept(&path, &sha, &meta).await {
+            folder.unregistered.note(path.clone(), sha, meta);
             folder.failed(&format!("kept file {path} failed to register: {error:#}"));
         }
     }
@@ -176,7 +248,10 @@ pub async fn run(
             }
             Some(done) = finished.recv() => folder.finish(done).await,
             Some(done) = index_done.recv() => folder.index_done(done).await,
-            _ = every.tick() => folder.reconcile().await,
+            _ = every.tick() => {
+                folder.retry_unregistered().await;
+                folder.reconcile().await;
+            }
         }
         folder.publish_index().await;
         folder.write_status().await;
@@ -226,8 +301,22 @@ struct Folder {
     index_refused_at: Option<u64>,
     /// Counts each change to `own`, so a refused index is retried only after a change.
     own_version: u64,
-    /// The ts of the winning entry of each path in the view, which a served copy keeps.
-    winner_ts: HashMap<String, u64>,
+    /// What the share lets this peer write: everybody, or only the creator.
+    trust: Trust,
+    /// How this peer finds the others, so each blob endpoint it builds finds them the same way.
+    lookups: Lookups,
+    /// Only the creator of a creator share holds it.
+    creator_key: Option<CreatorKey>,
+    /// Whether a view with entries has been read, so a read-only peer knows what the mesh holds.
+    viewed: bool,
+    /// The paths that a read-only peer keeps and does not publish, so each is logged once.
+    unpublished: HashSet<String>,
+    /// Whether the folder treats names that differ only in case as one name. Only a read-only peer needs it.
+    case_insensitive: bool,
+    /// The paths that a read-only peer does not download because another path has the same name in its folder.
+    collisions_warned: HashSet<String>,
+    /// The kept files whose registration failed. Their entries hold the ticket of the last run, and each one is tried again.
+    unregistered: Unregistered,
     /// When the own index was last written. A pointer write waits for `INDEX_INTERVAL` after it.
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
@@ -261,17 +350,31 @@ struct Progress(Arc<std::sync::Mutex<Transfer>>);
 
 struct Transfer {
     bytes: u64,
+    /// The most bytes the transfer may hold, or `None` for no limit.
+    cap: Option<u64>,
     started: Option<tokio::time::Instant>,
     last: tokio::time::Instant,
 }
 
 impl Default for Progress {
     fn default() -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Transfer { bytes: 0, started: None, last: tokio::time::Instant::now() })))
+        Self::capped(None)
     }
 }
 
 impl Progress {
+    /// A transfer that stops once it holds more than `cap` bytes.
+    fn capped(cap: Option<u64>) -> Self {
+        let last = tokio::time::Instant::now();
+        Self(Arc::new(std::sync::Mutex::new(Transfer { bytes: 0, cap, started: None, last })))
+    }
+
+    /// Whether `more` bytes fit under the cap.
+    fn allows(&self, more: usize) -> bool {
+        let transfer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        transfer.cap.is_none_or(|cap| transfer.bytes.saturating_add(more as u64) <= cap)
+    }
+
     /// Starts the clock. Until then the transfer is not cut, so a wait for a fetch slot does not count as a stall.
     fn start(&self) {
         let now = tokio::time::Instant::now();
@@ -312,15 +415,32 @@ async fn guarded<T>(attempt: impl Future<Output = T>, progress: &Progress) -> Op
     }
 }
 
-/// Collects a blob transfer, and records each write in its progress.
+/// A transfer that holds more bytes than its cap: the signed size of a file, or the size of an index.
+#[derive(Debug)]
+struct OverSize;
+
+impl std::fmt::Display for OverSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("more bytes than the size that the entry allows")
+    }
+}
+
+impl std::error::Error for OverSize {}
+
+/// Collects a blob transfer, and records each write in its progress. A write past the cap of the progress fails.
 struct Collected {
     bytes: Vec<u8>,
     progress: Progress,
+    over: bool,
 }
 
 impl AsyncWrite for Collected {
     fn poll_write(self: Pin<&mut Self>, _: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if !this.progress.allows(buf.len()) {
+            this.over = true;
+            return Poll::Ready(Err(io::Error::other(OverSize)));
+        }
         this.bytes.extend_from_slice(buf);
         this.progress.record(buf.len());
         Poll::Ready(Ok(buf.len()))
@@ -360,14 +480,25 @@ fn local_backoff(attempts: u32) -> Duration {
 struct Downloads {
     root: PathBuf,
     gate: Gate,
-    /// The sha and ticket of each entry whose download failed for good.
-    failed: HashMap<String, (String, String)>,
+    /// The sha of each path, and the tickets whose download failed for good for that sha.
+    failed: HashMap<String, (String, HashSet<String>)>,
     /// When a path whose write failed may be tried again.
     local_retry: HashMap<String, LocalRetry>,
     /// The sha of each download in flight, and the handle that cancels it.
     running: HashMap<(String, String), (String, AbortHandle)>,
     slots: Arc<Semaphore>,
     done: mpsc::UnboundedSender<Finished>,
+    /// A read-only peer follows the document: a file that differs from its entry is put back, and nothing is published.
+    read_only: bool,
+    /// The sha256 of each file on disk at the last scan. Only a read-only peer reads it.
+    disk: BTreeMap<String, String>,
+    /// The paths that the mesh gave this peer at some time, so a read-only peer knows a copy of its own from a file of its own.
+    given: HashSet<String>,
+    /// The paths whose running download puts back a file that a read-only peer changed.
+    reverts: HashSet<String>,
+    /// The error of the last permanent failure for each path, and the (path, sha) pairs that were reported as failed.
+    last_error: HashMap<String, String>,
+    reported: HashSet<(String, String)>,
 }
 
 /// How one download ended. On `Ok` the file is on disk, and the caller must publish it.
@@ -388,7 +519,59 @@ impl Downloads {
             running: HashMap::new(),
             slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
             done,
+            read_only: false,
+            disk: BTreeMap::new(),
+            given: HashSet::new(),
+            reverts: HashSet::new(),
+            last_error: HashMap::new(),
+            reported: HashSet::new(),
         }
+    }
+
+    fn is_given(&self, path: &str) -> bool {
+        self.given.contains(path)
+    }
+
+    /// Whether a ticket for `sha` at `path` is left that has not failed for good.
+    fn another_ticket_can_deliver(&self, path: &str, sha: &str) -> bool {
+        let bad = self.failed.get(path).filter(|(failed, _)| failed == sha).map(|(_, bad)| bad);
+        self.gate.tickets_of(path, sha).iter().any(|ticket| !bad.is_some_and(|bad| bad.contains(ticket)))
+    }
+
+    /// Mark a failure as reported, so `abandoned` does not report it again.
+    fn mark_reported(&mut self, path: &str, sha: &str) {
+        self.reported.insert((path.to_owned(), sha.to_owned()));
+    }
+
+    /// How many (path, sha) pairs are reported as failed. A path that lands later leaves the count: another holder delivered it.
+    fn failed_downloads(&self) -> u64 {
+        self.reported.len() as u64
+    }
+
+    /// The paths that cannot be fetched any more, with the last error of each, once each. A permanent failure is quiet
+    /// while another ticket can deliver. If that ticket leaves the document, the path is left with no ticket that works.
+    fn abandoned(&mut self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (path, (sha, _)) in &self.failed {
+            let tickets = self.gate.tickets_of(path, sha);
+            let pair = (path.clone(), sha.clone());
+            let ended = !tickets.is_empty() && self.gate.wanted_sha(path).as_deref() == Some(sha.as_str());
+            if ended && !self.another_ticket_can_deliver(path, sha) && !self.reported.contains(&pair) {
+                out.push((pair, self.last_error.get(path).cloned().unwrap_or_default()));
+            }
+        }
+        out.into_iter()
+            .map(|(pair, error)| {
+                let path = pair.0.clone();
+                self.reported.insert(pair);
+                (path, error)
+            })
+            .collect()
+    }
+
+    /// Whether the download of `path` that just ended put back a file that a read-only peer changed.
+    fn take_revert(&mut self, path: &str) -> bool {
+        self.reverts.remove(path)
     }
 
     /// Start a download for each entry that `known` does not hold and no download is already running for.
@@ -398,12 +581,22 @@ impl Downloads {
         F: Fn(String, Progress) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send,
     {
+        let mut tickets_of: HashMap<&String, (&String, Vec<String>)> = HashMap::new();
         for (path, sha, ticket) in entries {
-            self.gate.set_wanted(path, sha, ticket);
+            let (_, tickets) = tickets_of.entry(path).or_insert_with(|| (sha, Vec::new()));
+            tickets.push(ticket.clone());
+        }
+        for (path, (sha, tickets)) in tickets_of {
+            self.gate.set_wanted_all(path, sha, tickets);
+        }
+        for (path, sha, ticket) in entries {
             // A landed copy that is not `sha` is a stale download, so `sha` is fetched again even when `known` holds it.
-            let synced = known.get(path) == Some(sha) && self.gate.landed_sha(path).is_none_or(|landed| &landed == sha);
+            let on_disk = !self.read_only || self.disk.get(path) == Some(sha);
+            let synced = known.get(path) == Some(sha)
+                && on_disk
+                && self.gate.landed_sha(path).is_none_or(|landed| &landed == sha);
             if synced
-                || self.failed.get(path) == Some(&(sha.clone(), ticket.clone()))
+                || self.failed.get(path).is_some_and(|(failed, bad)| failed == sha && bad.contains(ticket))
                 || self.waiting_to_retry(path, sha)
             {
                 continue;
@@ -421,10 +614,19 @@ impl Downloads {
                 !obsolete
             });
             let Some(local) = resolve(&self.root, path) else {
-                self.failed.insert(path.clone(), (sha.clone(), ticket.clone()));
+                self.fail_for_good(path, sha, ticket);
                 eprintln!("download {path} failed: unsafe path {path:?}");
                 continue;
             };
+            // A revert puts back what this peer last synced. A file that the creator changed is not one.
+            let (current, base) = (self.disk.get(path), known.get(path));
+            if self.read_only
+                && self.given.contains(path)
+                && current != Some(sha)
+                && (base.is_none() || base != current)
+            {
+                self.reverts.insert(path.clone());
+            }
             // A fetch takes a slot only while it runs, so a download that waits to retry holds none.
             let (slots, fetch_again) = (self.slots.clone(), fetch.clone());
             let attempt = move |ticket: String, progress: Progress| {
@@ -471,7 +673,12 @@ impl Downloads {
             Err(Failure::Transient(_)) => return false,
             Ok(()) => {
                 self.failed.remove(&done.path);
+                self.last_error.remove(&done.path);
+                self.reported.retain(|(path, _)| path != &done.path);
                 self.local_retry.remove(&done.path);
+                if self.read_only {
+                    self.disk.insert(done.path.clone(), done.sha.clone());
+                }
                 // The file landed, so the other tickets for this sha need not finish.
                 self.running.retain(|(running_path, _), (running_sha, handle)| {
                     let same = running_path == &done.path && running_sha == &done.sha;
@@ -481,8 +688,9 @@ impl Downloads {
                     !same
                 });
             }
-            Err(Failure::Permanent(_)) => {
-                self.failed.insert(done.path.clone(), (done.sha.clone(), done.ticket.clone()));
+            Err(Failure::Permanent(error)) => {
+                self.last_error.insert(done.path.clone(), error_text(error));
+                self.fail_for_good(&done.path, &done.sha, &done.ticket);
             }
             Err(Failure::LocalWrite(_)) => {
                 let attempts = self.local_retry.get(&done.path).map_or(0, |retry| retry.attempts + 1);
@@ -492,6 +700,16 @@ impl Downloads {
             }
         }
         true
+    }
+
+    /// Remember that `ticket` cannot give `sha` for `path`. Another ticket for the same sha is still tried.
+    fn fail_for_good(&mut self, path: &str, sha: &str, ticket: &str) {
+        let (failed, bad) = self.failed.entry(path.to_owned()).or_insert_with(|| (sha.to_owned(), HashSet::new()));
+        if failed != sha {
+            *failed = sha.to_owned();
+            bad.clear();
+        }
+        bad.insert(ticket.to_owned());
     }
 
     /// Whether the write for this entry failed, and its wait is not over yet.
@@ -512,9 +730,14 @@ impl Downloads {
             if self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
                 continue;
             }
-            if known.get(path).is_some_and(|base| base != sha) {
+            // A read-only peer does not claim an edit of a file that the document names: its download puts the file back.
+            let follows = self.read_only && self.gate.wanted_sha(path).is_some();
+            if known.get(path).is_some_and(|base| base != sha) && !follows {
                 self.forget(path);
             }
+        }
+        if self.read_only {
+            self.disk.clone_from(&disk);
         }
         Ok(disk)
     }
@@ -525,6 +748,9 @@ impl Downloads {
     /// Open item: a local file at a path that the document names with other content is replaced by the download, with
     /// no conflict copy. That is part of the last-write-wins design, not this change.
     fn publishable(&self, disk: &BTreeMap<String, String>, known: &HashMap<String, String>) -> Vec<(String, String)> {
+        if self.read_only {
+            return Vec::new();
+        }
         disk.iter()
             .filter(|&(path, sha)| {
                 if known.get(path) == Some(sha) || self.gate.landed_sha(path).as_deref() == Some(sha.as_str()) {
@@ -547,15 +773,22 @@ impl Downloads {
         files: &serde_json::Map<String, Value>,
         known: &HashMap<String, String>,
     ) -> Vec<(String, Option<PathBuf>)> {
-        let tracked: BTreeSet<String> = known.keys().cloned().chain(self.gate.landed_paths()).collect();
+        let tracked: BTreeSet<String> = known
+            .keys()
+            .cloned()
+            .chain(self.gate.landed_paths())
+            .chain(self.read_only.then(|| self.given.iter().cloned()).into_iter().flatten())
+            .collect();
         unnamed(tracked.into_iter().collect(), files)
             .into_iter()
             .map(|path| {
                 let synced = known.get(&path).cloned();
                 let landed = self.gate.landed_sha(&path);
+                // A read-only peer removes a file that the mesh gave it, even when it edited the file.
+                let given = self.read_only && self.given.contains(&path);
                 let copy = resolve(&self.root, &path).filter(|local| {
                     let on_disk = file_sha(local);
-                    on_disk.is_some() && (on_disk == synced || on_disk == landed)
+                    on_disk.is_some() && (given || on_disk == synced || on_disk == landed)
                 });
                 (path, copy)
             })
@@ -591,15 +824,20 @@ impl Downloads {
     }
 
     /// Forgets a path that the document no longer names, once its local copy is gone or kept.
-    fn drop_record(&self, path: &str, known: &mut HashMap<String, String>) {
+    fn drop_record(&mut self, path: &str, known: &mut HashMap<String, String>) {
         known.remove(path);
         self.gate.forget_landed(path);
+        // The mesh took its bytes back, so a file made here later at this path is the peer's own.
+        self.given.remove(path);
     }
 
     /// Stop everything for a path that the document no longer names.
     fn forget(&mut self, path: &str) {
+        self.reverts.remove(path);
         self.gate.unwant(path);
         self.failed.remove(path);
+        self.last_error.remove(path);
+        self.reported.retain(|(reported, _)| reported != path);
         self.local_retry.remove(path);
         self.running.retain(|(running_path, _), (_, handle)| {
             let gone = running_path == path;
@@ -631,8 +869,13 @@ impl Folder {
             Ok(disk) => disk,
             Err(error) => return eprintln!("scan failed: {error}"),
         };
+        if self.read_only() {
+            self.note_unpublished(&disk);
+            self.save_own();
+            return self.publish_index().await;
+        }
         for (path, sha) in self.downloads.publishable(&disk, &self.known) {
-            match self.publish(&path, &sha, now_ms()).await {
+            match self.publish(&path, &sha, self.authored_ts(&path)).await {
                 Ok(()) => {
                     eprintln!("↑ {path}");
                     self.known.insert(path.clone(), sha.clone());
@@ -644,7 +887,14 @@ impl Folder {
         let gone: Vec<String> = self.known.keys().filter(|path| !disk.contains_key(*path)).cloned().collect();
         for path in gone {
             eprintln!("↑ deleted {path}");
-            self.own.insert(path.clone(), json!({ "deleted": true, "ts": now_ms() }));
+            let tombstone = json!({ "deleted": true, "ts": self.authored_ts(&path) });
+            match self.authored(&path, tombstone) {
+                Ok(entry) => self.own.insert(path.clone(), entry),
+                Err(error) => {
+                    self.failed(&format!("delete of {path} failed to sign: {error:#}"));
+                    continue;
+                }
+            };
             self.own_changed();
             self.known.remove(&path);
             self.status.record("↑", &path, true);
@@ -653,12 +903,47 @@ impl Folder {
         self.publish_index().await;
     }
 
-    /// Log a failed transfer and count it for `status`.
+    /// Register a file that this peer kept across a restart, so its entry holds a ticket of this run. The ts, signature and
+    /// size of the entry stay, so a restart is not a new edit and a copy of the creator's entry stays valid.
+    async fn register_kept(&mut self, path: &str, sha: &str, meta: &Meta) -> Result<()> {
+        if self.creator_key.is_some() {
+            self.publish(path, sha, meta.ts).await
+        } else {
+            self.publish_copy(path, sha, meta).await
+        }
+    }
+
+    /// Try the kept files again whose registration failed. A failure keeps the entry, so the path stays given.
+    async fn retry_unregistered(&mut self) {
+        for (path, sha, meta) in self.unregistered.due(&self.known) {
+            match self.register_kept(&path, &sha, &meta).await {
+                Ok(()) => self.unregistered.done(&path),
+                Err(error) => {
+                    tracing::debug!(path = %path, error = %error_text(&error), "kept file not registered yet")
+                }
+            }
+        }
+    }
+
+    /// Sign every own entry again, after a stamp changed a ts.
+    fn resign_own(&mut self) {
+        let Some(key) = &self.creator_key else { return };
+        let mesh = self.mesh.clone();
+        for (path, entry) in &mut self.own {
+            match sign_entry(key, &mesh, path, entry) {
+                Ok(signed) => *entry = signed,
+                Err(error) => eprintln!("entry of {path} failed to sign again: {error:#}"),
+            }
+        }
+    }
+
+    /// The own index changed, so it is written again.
     fn own_changed(&mut self) {
         self.index_dirty = true;
         self.own_version += 1;
     }
 
+    /// Log a failed transfer and count it for `status`.
     fn failed(&mut self, message: &str) {
         eprintln!("{message}");
         self.status.failed += 1;
@@ -680,20 +965,113 @@ impl Folder {
             .map(|meta| meta.len())
             .sum();
         self.status.written_at = status::now();
-        if let Err(error) = self.status.write(path) {
+        let state = Status { failed: self.status.failed + self.downloads.failed_downloads(), ..self.status.clone() };
+        if let Err(error) = state.write(path) {
             eprintln!("{error:#}");
         }
     }
 
+    /// Publish an edit of this peer at `ts`. In a creator share only the creator authors, and it signs the entry.
     async fn publish(&mut self, path: &str, sha: &str, ts: u64) -> Result<()> {
+        if self.read_only() {
+            bail!("a read-only peer does not publish its own edit of {path}");
+        }
+        let size = self.size_of_signed_file(path, sha).await?;
+        let ticket = self.register(path, sha).await?;
+        let mut entry = json!({ "sha256": sha, "ticket": ticket, "ts": ts });
+        if let Some(size) = size {
+            entry["size"] = json!(size);
+        }
+        let entry = self.authored(path, entry)?;
+        self.own.insert(path.to_owned(), entry);
+        self.own_changed();
+        Ok(())
+    }
+
+    /// Serve a copy of the entry that `meta` came from, with a ticket of this peer, so the file outlives its author. The
+    /// copy keeps the ts, signature and size of that entry, so it still verifies.
+    async fn publish_copy(&mut self, path: &str, sha: &str, meta: &Meta) -> Result<()> {
+        if matches!(self.trust, Trust::Creator { .. }) {
+            if meta.sig.is_none() {
+                bail!("the entry of {path} has no signature to copy");
+            }
+            self.size_of_signed_file(path, sha).await?;
+        }
+        let ticket = self.register(path, sha).await?;
+        let mut entry = json!({ "sha256": sha, "ticket": ticket, "ts": meta.ts });
+        if let Some(sig) = &meta.sig {
+            entry["sig"] = json!(sig);
+        }
+        if let Some(size) = meta.size {
+            entry["size"] = json!(size);
+        }
+        self.own.insert(path.to_owned(), entry);
+        self.own_changed();
+        Ok(())
+    }
+
+    async fn register(&self, path: &str, sha: &str) -> Result<String> {
         let ticket = self
             .blobs
             .register(&self.root.join(path), ContentId::new(sha))
             .await
             .map_err(|error| anyhow!("{error}"))?;
-        self.own.insert(path.to_owned(), json!({ "sha256": sha, "ticket": ticket.encode(), "ts": ts }));
-        self.own_changed();
-        Ok(())
+        Ok(ticket.encode())
+    }
+
+    /// In a creator share, the length of the file at `path` when it holds `sha`. A file that holds other bytes gets no
+    /// entry, because its ticket would be dead. `None` in an everybody share, which signs no size.
+    async fn size_of_signed_file(&self, path: &str, sha: &str) -> Result<Option<u64>> {
+        if !matches!(self.trust, Trust::Creator { .. }) {
+            return Ok(None);
+        }
+        let file = self.root.join(path);
+        let (named, bytes) = (path.to_owned(), sha.to_owned());
+        let size = tokio::task::spawn_blocking(move || signed_size(&file, &named, &bytes))
+            .await
+            .context("digest task ended")??;
+        Ok(Some(size))
+    }
+
+    /// The creator signs an entry that it authors. Everybody else in an everybody share leaves it as it is.
+    fn authored(&self, path: &str, entry: Value) -> Result<Value> {
+        match &self.creator_key {
+            Some(key) => sign_entry(key, &self.mesh, path, &entry),
+            None => Ok(entry),
+        }
+    }
+
+    /// The ts of a new entry of this peer at `path`. The creator's ts rises for each path, so an equal ts means an equal
+    /// entry.
+    fn authored_ts(&self, path: &str) -> u64 {
+        let last = self.own.get(path).and_then(|entry| entry.get("ts")).and_then(Value::as_u64);
+        match self.creator_key {
+            Some(_) => creator_ts(now_ms(), last),
+            None => now_ms(),
+        }
+    }
+
+    /// In a creator share every peer but the creator only follows.
+    fn read_only(&self) -> bool {
+        matches!(self.trust, Trust::Creator { .. }) && self.creator_key.is_none()
+    }
+
+    /// A read-only peer keeps a file that the mesh never gave it, and tells once that it does not publish it. It waits for
+    /// the first view, because the mesh may hold that file.
+    fn note_unpublished(&mut self, disk: &BTreeMap<String, String>) {
+        // A path that is gone is told again if it comes back.
+        self.unpublished.retain(|path| disk.contains_key(path));
+        if !self.viewed {
+            return;
+        }
+        for path in disk.keys() {
+            let held = self.known.contains_key(path)
+                || self.downloads.is_given(path)
+                || self.downloads.gate.wanted_sha(path).is_some();
+            if !held && self.unpublished.insert(path.clone()) {
+                eprintln!("read-only share: not published {path}");
+            }
+        }
     }
 
     /// Write the own index as one blob, point the own slice at it, and evict the index it replaces. A failure is logged,
@@ -763,8 +1141,8 @@ impl Folder {
         }
     }
 
-    /// Fetch the index of each author whose pointer is new. Until it lands, the author contributes no entries, so no
-    /// file it lists is dropped.
+    /// Fetch the index of each author whose pointer is new. Until it lands, the last entries of the author stay in the
+    /// view, so no file it lists is dropped.
     fn fetch_indexes(&mut self, document: &Value) {
         self.pointers = document
             .as_object()
@@ -787,8 +1165,11 @@ impl Folder {
             self.index_pending.insert((author.clone(), sha.clone()));
             let (consumer, tx) = (self.consumer.clone(), self.index_tx.clone());
             let (fetch_author, fetch_sha) = (author.clone(), sha.clone());
+            let (trust, lookups) = (self.trust.clone(), self.lookups);
             let task = tokio::spawn(async move {
-                let result = fetch_index(consumer, &ticket, &fetch_sha).await.map_err(|error| format!("{error:#}"));
+                let result = fetch_index(consumer, lookups, &ticket, &fetch_sha, &trust)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
                 let _ = tx.send(IndexDone { author: fetch_author, sha: fetch_sha, result });
             });
             self.index_tasks.insert(author, (sha, task.abort_handle()));
@@ -801,14 +1182,16 @@ impl Folder {
         if self.index_tasks.get(&done.author).is_some_and(|(sha, _)| *sha == done.sha) {
             self.index_tasks.remove(&done.author);
         }
-        match done.result {
-            Ok(entries) if current_pointer(&self.pointers, &done.author, &done.sha) => {
-                self.indexes.0.insert(done.author, (done.sha, entries));
-                self.reconcile().await;
+        let author = short_author(&done.author).to_owned();
+        let end = settle_index(&mut self.indexes, &self.pointers, done);
+        if let IndexEnd::Failed { error, dropped } = &end {
+            if *dropped {
+                eprintln!("the old entries of {author} are dropped: its new index did not load");
             }
-            // The pointer moved on, and the fetch of the newer pointer is the one that lands.
-            Ok(_) => {}
-            Err(error) => self.failed(&format!("index of {} failed: {error}", done.author)),
+            self.failed(&format!("index of {author} failed: {error}"));
+        }
+        if end.changes_view() {
+            self.reconcile().await;
         }
     }
 
@@ -833,7 +1216,9 @@ impl Folder {
 
     /// Make the disk match the document, for every path the document or `known` names.
     fn apply(&mut self, document: &Value) {
-        if stamp_own(&mut self.own, now_ms()) {
+        // A read-only peer holds copies that the creator signed, and a stamped ts would break the signature.
+        if !self.read_only() && stamp_own(&mut self.own, now_ms()) {
+            self.resign_own();
             self.own_changed();
         }
         // The own slice is this peer's own truth. Its fetched index can lag the own publishes, so the own entries
@@ -850,19 +1235,17 @@ impl Folder {
             self.indexes.0.insert(author, (sha, entries));
         }
         let view = view_of(document, &self.indexes);
-        self.winner_ts = view
-            .iter()
-            .map(|(path, entry)| (path.clone(), entry.get("ts").and_then(Value::as_u64).unwrap_or(0)))
-            .collect();
         let tracked: Vec<String> = self
             .known
             .keys()
             .cloned()
             .chain(self.downloads.gate.wanted_paths())
             .chain(self.downloads.gate.landed_paths())
+            .chain(self.read_only().then(|| self.downloads.given.iter().cloned()).into_iter().flatten())
             .collect();
         let removed = removed_by_tombstone(document, &self.indexes, &tracked);
         let winners = winners_of(document, &self.indexes);
+        self.viewed |= !winners.is_empty() || view_complete(document, &self.indexes);
         for path in &removed {
             if let Some(tombstone) = winners.get(path)
                 && self.own.get(path) != Some(tombstone)
@@ -876,19 +1259,40 @@ impl Folder {
         for path in tracked.iter().filter(|path| !removed.contains(path)) {
             named.entry(path.clone()).or_insert(Value::Null);
         }
-        let entries: Vec<Entry> = view
-            .iter()
-            .filter_map(|(path, entry)| {
-                let (Some(sha), Some(ticket)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
-                    return None;
-                };
-                Some((path.clone(), sha.to_owned(), ticket.to_owned()))
-            })
-            .collect();
-        let consumer = self.consumer.clone();
-        self.downloads
-            .reconcile(&entries, &self.known, move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress));
+        let skipped = if self.read_only() && self.case_insensitive {
+            let held = |path: &str| self.downloads.disk.contains_key(path) || self.downloads.is_given(path);
+            case_collisions(view.keys(), held)
+        } else {
+            BTreeMap::new()
+        };
+        let mut entries: Vec<Entry> = Vec::new();
+        for (path, entry) in &view {
+            if let Some(kept) = skipped.get(path) {
+                // Both would be written to one file, and each download would undo the other for ever.
+                if self.collisions_warned.insert(path.clone()) {
+                    eprintln!(
+                        "read-only share: {path} is not downloaded: {kept} has the same name in a folder that ignores case"
+                    );
+                }
+                continue;
+            }
+            let (Some(sha), Some(_)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
+                continue;
+            };
+            self.downloads.gate.set_meta(path, sha, meta_of_entry(entry));
+            // One entry for each peer that holds these bytes, so a holder that is gone does not block the others.
+            for ticket in holders_of(document, &self.indexes, path, entry) {
+                entries.push((path.clone(), sha.to_owned(), ticket));
+            }
+        }
+        let (consumer, lookups) = (self.consumer.clone(), self.lookups);
+        self.downloads.reconcile(&entries, &self.known, move |ticket, progress| {
+            fetch_blob(consumer.clone(), lookups, ticket, progress)
+        });
         self.downloads.prune(&named);
+        for (path, error) in self.downloads.abandoned() {
+            eprintln!("download {path} failed: {error}");
+        }
         for path in self.downloads.remove_dropped(&named, &mut self.known, |local| std::fs::remove_file(local)) {
             self.status.record("↓", &path, true);
         }
@@ -907,17 +1311,30 @@ impl Folder {
             // Serve the file too, so a peer can still get it after its author left.
             // A served copy keeps the ts of the entry it came from, so an older copy never beats a newer edit.
             Ok(()) => {
-                let ts = self.winner_ts.get(&path).copied().unwrap_or_else(now_ms);
-                let published = self.publish(&path, &sha, ts).await;
+                let published = match self.downloads.gate.meta_of(&path, &sha) {
+                    Some(meta) => self.publish_copy(&path, &sha, &meta).await,
+                    None => Err(anyhow!("no entry of {path} names these bytes any more")),
+                };
                 self.save_own();
-                published
+                landed_copy_result(published)
+            }
+            // One holder that failed for good is not a failed download while another ticket can still deliver.
+            Err(Failure::Permanent(error)) if self.downloads.another_ticket_can_deliver(&path, &sha) => {
+                tracing::debug!(path = %path, error = %error_text(&error), "a ticket failed for good; another one is left");
+                return;
             }
             Err(Failure::Transient(error) | Failure::Permanent(error) | Failure::LocalWrite(error)) => Err(error),
         };
         if published.is_ok() {
             self.status.record("↓", &path, false);
+            self.downloads.given.insert(path.clone());
+            if self.downloads.take_revert(&path) {
+                eprintln!("read-only share: reverted {path}");
+            } else {
+                eprintln!("↓ {path}");
+            }
         } else {
-            self.status.failed += 1;
+            self.downloads.mark_reported(&path, &sha);
         }
         mark_landed(&mut self.known, path, sha, published);
     }
@@ -933,7 +1350,6 @@ fn unnamed(tracked: Vec<String>, files: &serde_json::Map<String, Value>) -> Vec<
 fn mark_landed(known: &mut HashMap<String, String>, path: String, sha: String, published: Result<()>) {
     match published {
         Ok(()) => {
-            eprintln!("↓ {path}");
             known.insert(path, sha);
         }
         Err(error) => eprintln!("download {path} failed: {error:#}"),
@@ -959,14 +1375,14 @@ where
     }
     let mut attempt = 0;
     let bytes = loop {
-        let progress = Progress::default();
+        let progress = Progress::capped(gate.meta_of(path, sha).and_then(|meta| meta.size));
         let outcome = match guarded(fetch(ticket.to_owned(), progress.clone()), &progress).await {
             Some(outcome) => outcome,
             None => Err(anyhow!("the transfer went quiet")),
         };
         match outcome {
             Ok(bytes) => break bytes,
-            Err(error) if error.is::<BadTicket>() => return Err(Failure::Permanent(error)),
+            Err(error) if error.is::<BadTicket>() || error.is::<OverSize>() => return Err(Failure::Permanent(error)),
             Err(error) => {
                 let wait = backoff(attempt);
                 tracing::debug!(path = %local.display(), attempt = attempt.saturating_add(1), wait = ?wait, error = %error_text(&error), "retrying a blob fetch");
@@ -992,6 +1408,214 @@ where
 /// A failed fetch, which keeps the cause chain of its blob error.
 fn fetch_error(error: BlobError) -> anyhow::Error {
     anyhow::Error::new(error)
+}
+
+/// The meta of an index entry: its ts, and its signature and size when it has them.
+fn meta_of_entry(entry: &Value) -> Meta {
+    Meta {
+        ts: entry.get("ts").and_then(Value::as_u64).unwrap_or(0),
+        sig: entry.get("sig").and_then(Value::as_str).map(str::to_owned),
+        size: entry.get("size").and_then(Value::as_u64),
+    }
+}
+
+/// Whether the view is whole: at least one slice points at an index, and every such index is fetched. A creator share with
+/// no file has a whole view too.
+fn view_complete(document: &Value, indexes: &Indexes) -> bool {
+    let pointing = document.as_object().into_iter().flatten().any(|(_, slice)| slice.get("index").is_some());
+    pointing && pointers_to_fetch(document, indexes).is_empty()
+}
+
+/// The tickets that hold the winning entry of `path`, the winner's own first. A slice holds the entry when it lists the
+/// same bytes with the same ts and signature: its owner copied it, with a ticket of its own.
+fn holders_of(document: &Value, indexes: &Indexes, path: &str, winner: &Value) -> Vec<String> {
+    let same = |entry: &Value| ["sha256", "ts", "sig"].iter().all(|key| entry.get(key) == winner.get(key));
+    let mut tickets: Vec<String> =
+        winner.get("ticket").and_then(Value::as_str).map(str::to_owned).into_iter().collect();
+    for (_, entries) in live_slices(document, indexes) {
+        let Some(entry) = entries.get(path).filter(|entry| same(entry)) else { continue };
+        if let Some(ticket) = entry.get("ticket").and_then(Value::as_str)
+            && !tickets.iter().any(|known| known == ticket)
+        {
+            tickets.push(ticket.to_owned());
+        }
+    }
+    tickets
+}
+
+/// The ts of the next entry that the creator authors at a path: the clock, and always above the last entry of the path.
+fn creator_ts(now: u64, last: Option<u64>) -> u64 {
+    last.map_or(now, |last| now.max(last.saturating_add(1)))
+}
+
+/// The saved entries that `trust` accepts. In a creator share an entry that the creator did not sign is dropped.
+fn trusted_saved(saved: BTreeMap<String, Value>, trust: &Trust) -> BTreeMap<String, Value> {
+    saved.into_iter().filter(|(path, entry)| writers::verify_entry(trust, path, entry)).collect()
+}
+
+/// The own entries after a restart of a peer in a creator share. A signed entry cannot be made again, so a file entry whose
+/// file is gone or holds other bytes is dropped: the next view gives the file back. A tombstone stays.
+fn own_after_restart_signed(
+    saved: BTreeMap<String, Value>,
+    disk: &BTreeMap<String, String>,
+) -> BTreeMap<String, Value> {
+    saved
+        .into_iter()
+        .filter(|(path, entry)| {
+            is_tombstone(entry) || entry.get("sha256").and_then(Value::as_str) == disk.get(path).map(String::as_str)
+        })
+        .collect()
+}
+
+const DIGEST_BLOCK_BYTES: usize = 64 * 1024;
+
+/// A file that no longer holds the bytes of its entry, because it changed after the bytes landed.
+#[derive(Debug)]
+struct ContentChanged(String);
+
+impl std::fmt::Display for ContentChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} no longer holds the bytes of its entry", self.0)
+    }
+}
+
+impl std::error::Error for ContentChanged {}
+
+/// The length of the file at `file` when it holds `sha`. A file that holds other bytes is [`ContentChanged`].
+fn signed_size(file: &Path, path: &str, sha: &str) -> Result<u64> {
+    let (on_disk, size) = digest_file(file)?;
+    if on_disk != sha {
+        return Err(anyhow::Error::new(ContentChanged(path.to_owned())));
+    }
+    Ok(size)
+}
+
+/// The result of publishing a copy of a landed file. A file that was edited after it landed was still downloaded, and a
+/// read-only peer puts it back, so only another failure is one of the download.
+fn landed_copy_result(published: Result<()>) -> Result<()> {
+    match published {
+        Err(error) if error.is::<ContentChanged>() => Ok(()),
+        other => other,
+    }
+}
+
+/// How the end of one index fetch changed the cached indexes.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexEnd {
+    /// The index of the current pointer is cached.
+    Landed,
+    /// The pointer moved on, and the fetch of the newer pointer is the one that lands.
+    Superseded,
+    /// The fetch of the current pointer failed for good. `dropped`: the old entries of the author left the cache.
+    Failed { error: String, dropped: bool },
+}
+
+impl IndexEnd {
+    /// Whether the view of the document is not the one that the last read saw.
+    fn changes_view(&self) -> bool {
+        matches!(self, Self::Landed | Self::Failed { dropped: true, .. })
+    }
+}
+
+/// Take the end of one index fetch into `indexes`.
+fn settle_index(indexes: &mut Indexes, pointers: &HashMap<String, String>, done: IndexDone) -> IndexEnd {
+    match done.result {
+        Ok(entries) if current_pointer(pointers, &done.author, &done.sha) => {
+            indexes.0.insert(done.author, (done.sha, entries));
+            IndexEnd::Landed
+        }
+        Ok(_) => IndexEnd::Superseded,
+        Err(error) => {
+            let dropped = drop_stale_index(indexes, pointers, &done.author, &done.sha);
+            IndexEnd::Failed { error, dropped }
+        }
+    }
+}
+
+/// The first characters of an author key, which is all a log line needs to tell the authors apart.
+fn short_author(author: &str) -> &str {
+    author.char_indices().nth(SHORT_AUTHOR_CHARS).map_or(author, |(end, _)| &author[..end])
+}
+
+const SHORT_AUTHOR_CHARS: usize = 8;
+
+/// Drop the last entries of `author` when the fetch of its current pointer `sha` failed for good, so a pointer that never
+/// lands does not keep old entries in the view for ever. Returns whether entries were dropped.
+fn drop_stale_index(indexes: &mut Indexes, pointers: &HashMap<String, String>, author: &str, sha: &str) -> bool {
+    current_pointer(pointers, author, sha) && indexes.0.remove(author).is_some()
+}
+
+/// The paths that a folder which ignores case would write to one file, as skipped path -> the path that is kept. The kept
+/// path of a group is the one that `held` names, because its file is already in the folder. If none is held, it is the
+/// first in path order.
+fn case_collisions<'a>(
+    paths: impl Iterator<Item = &'a String>,
+    held: impl Fn(&str) -> bool,
+) -> BTreeMap<String, String> {
+    let mut groups: BTreeMap<String, BTreeSet<&String>> = BTreeMap::new();
+    for path in paths {
+        groups.entry(path.to_lowercase()).or_default().insert(path);
+    }
+    let mut skipped = BTreeMap::new();
+    for group in groups.into_values() {
+        let Some(kept) = group.iter().find(|path| held(path)).or_else(|| group.first()) else { continue };
+        let kept = (*kept).clone();
+        skipped.extend(group.into_iter().filter(|path| **path != kept).map(|path| (path.clone(), kept.clone())));
+    }
+    skipped
+}
+
+/// The probe file of `ignores_case`. Its name has letters of both cases. The scan skips a hidden file.
+const CASE_PROBE: &str = ".agent-knowledge-case-probe";
+
+/// Whether the folder at `root` treats names that differ only in case as one name, as macOS and Windows do by default.
+fn ignores_case(root: &Path) -> bool {
+    let probe = root.join(CASE_PROBE);
+    let upper = root.join(CASE_PROBE.to_uppercase());
+    let _ = std::fs::remove_file(&probe);
+    let same = std::fs::write(&probe, b"").is_ok() && upper.exists();
+    let _ = std::fs::remove_file(&probe);
+    same
+}
+
+/// The kept files that could not be registered at start, by path. A registration can fail for a reason that goes away, so
+/// the entry stays and the registration is tried again. A path whose sha is no longer the one in `known` is not tried:
+/// the file changed or is gone, and the publish of that change replaces the entry.
+#[derive(Debug, Default)]
+struct Unregistered(BTreeMap<String, (String, Meta)>);
+
+impl Unregistered {
+    fn note(&mut self, path: String, sha: String, meta: Meta) {
+        self.0.insert(path, (sha, meta));
+    }
+
+    /// The files to register now. It drops each one that `known` no longer holds at the same sha.
+    fn due(&mut self, known: &HashMap<String, String>) -> Vec<(String, String, Meta)> {
+        self.0.retain(|path, (sha, _)| known.get(path) == Some(sha));
+        self.0.iter().map(|(path, (sha, meta))| (path.clone(), sha.clone(), meta.clone())).collect()
+    }
+
+    fn done(&mut self, path: &str) {
+        self.0.remove(path);
+    }
+}
+
+/// The sha256 and the length of a file. It reads in blocks, so a big file is not held in memory.
+fn digest_file(path: &Path) -> io::Result<(String, u64)> {
+    use io::Read as _;
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut block = [0u8; DIGEST_BLOCK_BYTES];
+    let mut length = 0u64;
+    loop {
+        let read = file.read(&mut block)?;
+        if read == 0 {
+            return Ok((hex::encode(hasher.finalize()), length));
+        }
+        hasher.update(&block[..read]);
+        length += read as u64;
+    }
 }
 
 /// The own entries after a restart: the saved ones, with each file that is gone from disk turned into a tombstone.
@@ -1096,6 +1720,16 @@ fn fetch_plan(
     (starts, cancels)
 }
 
+/// A transfer for an index blob: it stops at the cap before the blob is whole in memory.
+fn index_progress() -> Progress {
+    Progress::capped(Some(INDEX_MAX_BYTES as u64))
+}
+
+/// The entries of a fetched index that `trust` accepts. In a creator share that is each entry that the creator signed.
+fn verified_entries(entries: serde_json::Map<String, Value>, trust: &Trust) -> serde_json::Map<String, Value> {
+    entries.into_iter().filter(|(path, entry)| writers::verify_entry(trust, path, entry)).collect()
+}
+
 /// The entries of an index blob, checked against its sha256 and the cap.
 fn check_index(bytes: &[u8], sha: &str) -> Result<serde_json::Map<String, Value>> {
     if bytes.len() > INDEX_MAX_BYTES {
@@ -1110,16 +1744,17 @@ fn check_index(bytes: &[u8], sha: &str) -> Result<serde_json::Map<String, Value>
     }
 }
 
-/// The entries of each author slice whose index is fetched and matches the pointer. A slice with no fetched index
-/// holds no data.
+/// The entries of each author slice that has an index pointer, as of the last index fetched for it. While the index
+/// for a newer pointer is fetched, the entries before it stay in the view: a slice that dropped out for that time would
+/// let an older copy of a file win over the delete that the slice holds. A slice with no fetched index holds no data.
 fn live_slices<'a>(
     document: &'a Value,
     indexes: &'a Indexes,
 ) -> impl Iterator<Item = (&'a String, &'a serde_json::Map<String, Value>)> + 'a {
     document.as_object().into_iter().flatten().filter_map(move |(author, slice)| {
-        let pointer = slice.get("index")?.get("sha256")?.as_str()?;
-        let (fetched, entries) = indexes.0.get(author)?;
-        (fetched == pointer).then_some((author, entries))
+        slice.get("index")?.get("sha256")?.as_str()?;
+        let (_, entries) = indexes.0.get(author)?;
+        Some((author, entries))
     })
 }
 
@@ -1170,19 +1805,24 @@ struct IndexDone {
 /// Fetch an index blob, and check it. A fetch that fails is retried with the same backoff as a file.
 async fn fetch_index(
     consumer: Arc<Consumer<Endpoint>>,
+    lookups: Lookups,
     ticket: &str,
     sha: &str,
+    trust: &Trust,
 ) -> Result<serde_json::Map<String, Value>> {
     let mut attempt = 0;
     loop {
         let fetched = tokio::time::timeout(
             ATTEMPT_DEADLINE,
-            fetch_blob(consumer.clone(), ticket.to_owned(), Progress::default()),
+            fetch_blob(consumer.clone(), lookups, ticket.to_owned(), index_progress()),
         )
         .await;
         match fetched {
-            Ok(Ok(bytes)) => return check_index(&bytes, sha),
+            Ok(Ok(bytes)) => return check_index(&bytes, sha).map(|entries| verified_entries(entries, trust)),
             Ok(Err(error)) if error.is::<BadTicket>() => return Err(error),
+            Ok(Err(error)) if error.is::<OverSize>() => {
+                bail!("index refused: it is over the {INDEX_MAX_BYTES}-byte cap")
+            }
             _ if attempt >= INDEX_ATTEMPTS => bail!("index fetch gave up after {attempt} retries"),
             _ => {}
         }
@@ -1225,12 +1865,6 @@ impl std::fmt::Display for BadTicket {
 }
 
 impl std::error::Error for BadTicket {}
-
-/// The lookups of every blob endpoint. The server and the consumers must share them, so a ticket that one side
-/// publishes is found by the other side.
-fn blob_lookups() -> LookupOpts {
-    LookupOpts::public_preset()
-}
 
 /// What the consumer needs from an endpoint: whether it has closed, and how to close it.
 trait Closable {
@@ -1428,14 +2062,18 @@ async fn close_when_idle<E: Closable>(endpoint: E, leases: Arc<AtomicUsize>) {
     endpoint.close_now().await;
 }
 
-async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress: Progress) -> Result<Vec<u8>> {
+async fn fetch_blob(
+    consumer: Arc<Consumer<Endpoint>>,
+    lookups: Lookups,
+    ticket: String,
+    progress: Progress,
+) -> Result<Vec<u8>> {
     let ticket = BlobTicket::decode(&ticket).map_err(|error| anyhow::Error::new(BadTicket(error.to_string())))?;
     let lease =
-        consumer.get(|| async { build_peer_endpoint(&blob_lookups()).await.map_err(anyhow::Error::new) }).await?;
-    let mut bytes = Collected { bytes: Vec::new(), progress };
-    let lookups = blob_lookups();
+        consumer.get(|| async { build_peer_endpoint(&lookups.blob()).await.map_err(anyhow::Error::new) }).await?;
+    let mut bytes = Collected { bytes: Vec::new(), progress, over: false };
     let build = || {
-        let lookups = lookups.clone();
+        let lookups = lookups.blob();
         detach_build(async move { build_peer_endpoint(&lookups).await })
     };
     match fetch_hedged(&lease.endpoint, build, &ticket, &mut bytes, None).await {
@@ -1449,6 +2087,7 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress:
             );
             Err(anyhow!("blob handshake stalled"))
         }
+        Err(_) if bytes.over => Err(anyhow::Error::new(OverSize)),
         Err(error) => Err(fetch_error(error)),
     }
 }
@@ -1458,30 +2097,65 @@ async fn fetch_blob(consumer: Arc<Consumer<Endpoint>>, ticket: String, progress:
 #[derive(Clone, Default)]
 struct Gate {
     turn: Arc<Mutex<()>>,
-    wanted: Arc<Mutex<HashMap<String, (String, String)>>>,
+    /// The sha that the document names for each path, and the tickets of the peers that hold it.
+    wanted: Arc<Mutex<HashMap<String, Named>>>,
+    /// The ts, signature and size of the entry that names each wanted sha.
+    meta: Arc<Mutex<HashMap<String, (String, Meta)>>>,
     /// The sha that the last download wrote to each path. It holds only while the disk still has that sha.
     landed: Arc<Mutex<HashMap<String, String>>>,
 }
 
+/// A sha256 that the document names, and the tickets of the peers that hold the bytes.
+type Named = (String, Vec<String>);
+
+/// What the entry that names a wanted file says besides its sha256.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Meta {
+    ts: u64,
+    sig: Option<String>,
+    /// The signed size of the file, in a creator share.
+    size: Option<u64>,
+}
+
 impl Gate {
-    fn set_wanted(&self, path: &str, sha: &str, ticket: &str) {
-        self.wanted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(path.to_owned(), (sha.to_owned(), ticket.to_owned()));
+    /// The document names `sha` for `path`, and each of `tickets` holds it. The list replaces the one before.
+    fn set_wanted_all(&self, path: &str, sha: &str, tickets: Vec<String>) {
+        self.wanted.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), (sha.to_owned(), tickets));
     }
 
-    /// Whether the document still names this entry, and not another ticket for the same content.
+    #[cfg(test)]
+    fn set_wanted(&self, path: &str, sha: &str, ticket: &str) {
+        self.set_wanted_all(path, sha, vec![ticket.to_owned()]);
+    }
+
+    /// Whether the document still names this ticket for this content.
     fn is_latest(&self, path: &str, sha: &str, ticket: &str) -> bool {
         self.wanted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(path)
-            .is_some_and(|(s, t)| s == sha && t == ticket)
+            .is_some_and(|(s, tickets)| s == sha && tickets.iter().any(|t| t == ticket))
     }
 
     fn unwant(&self, path: &str) {
         self.wanted.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
+        self.meta.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
+    }
+
+    /// The tickets of the peers that hold `sha` for `path`, if the document still names that sha.
+    fn tickets_of(&self, path: &str, sha: &str) -> Vec<String> {
+        let wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        wanted.get(path).filter(|(named, _)| named == sha).map(|(_, tickets)| tickets.clone()).unwrap_or_default()
+    }
+
+    fn set_meta(&self, path: &str, sha: &str, meta: Meta) {
+        self.meta.lock().unwrap_or_else(PoisonError::into_inner).insert(path.to_owned(), (sha.to_owned(), meta));
+    }
+
+    /// The meta of the entry that names `sha` for `path`, if the document still names that sha.
+    fn meta_of(&self, path: &str, sha: &str) -> Option<Meta> {
+        let meta = self.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        meta.get(path).filter(|(named, _)| named == sha).map(|(_, meta)| meta.clone())
     }
 
     fn wanted_sha(&self, path: &str) -> Option<String> {
@@ -1850,7 +2524,7 @@ mod tests {
                 &sha,
                 "not a ticket",
                 &gate_wanting("start.md", &sha),
-                move |ticket, progress| fetch_blob(consumer.clone(), ticket, progress),
+                move |ticket, progress| fetch_blob(consumer.clone(), Lookups::Public, ticket, progress),
             ),
         )
         .await;
@@ -1886,7 +2560,7 @@ mod tests {
     fn a_late_result_for_an_old_entry_does_not_clear_a_current_failure() {
         let (done, _finished) = mpsc::unbounded_channel();
         let mut downloads = Downloads::new(PathBuf::from("."), done);
-        downloads.failed.insert("start.md".to_owned(), ("same".to_owned(), "t2".to_owned()));
+        downloads.fail_for_good("start.md", "same", "t2");
 
         downloads.settle(&Finished {
             path: "start.md".to_owned(),
@@ -3219,5 +3893,694 @@ mod tests {
         let minimum = BLOB_RETRY_BASE * 3;
         assert!(started.elapsed() >= minimum, "elapsed {:?}", started.elapsed());
         assert_eq!(std::fs::read(&local).unwrap(), bytes);
+    }
+
+    #[test]
+    fn the_default_lookups_are_public() {
+        assert_eq!(Lookups::default(), Lookups::Public);
+        assert!(!Lookups::Public.blob().is_loopback());
+        assert_eq!(Lookups::Public.join(), vec![Lookup::Mdns, Lookup::Dht, Lookup::Relay]);
+        assert!(Lookups::Public.transports().contains(&Transport::Relay));
+    }
+
+    #[test]
+    fn loopback_lookups_reach_no_other_machine_and_use_no_relay() {
+        assert!(Lookups::Loopback.blob().is_loopback());
+        assert!(Lookups::Loopback.join().is_empty());
+        assert!(!Lookups::Loopback.transports().contains(&Transport::Relay));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_creator_suffix_is_an_error_before_any_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            root: dir.path().to_path_buf(),
+            mesh: Some("mesh.not-a-key".to_owned()),
+            nickname: None,
+            status_file: None,
+            writers: Writers::Everybody,
+            lookups: Lookups::default(),
+        };
+        let run = run(options, |_: &Ready| panic!("a malformed hash must not join"), |_| {}, std::future::pending());
+        let error = tokio::time::timeout(Duration::from_secs(5), run).await.expect("run must fail fast").unwrap_err();
+        assert!(error.to_string().contains("creator key"), "{error}");
+    }
+
+    fn creator_share() -> (CreatorKey, Trust) {
+        let key = CreatorKey::generate().unwrap();
+        let (_, trust) = writers::parse_hash(&writers::encode_hash("mesh", Some(&key))).unwrap();
+        (key, trust)
+    }
+
+    fn signed_file(key: &CreatorKey, path: &str, ts: u64, sha: &str, size: u64) -> Value {
+        let entry = json!({ "sha256": sha, "ticket": "t", "ts": ts, "size": size });
+        sign_entry(key, "mesh", path, &entry).unwrap()
+    }
+
+    #[test]
+    fn the_creator_ts_rises_above_the_last_ts_of_a_path_after_a_clock_set_back() {
+        assert_eq!(creator_ts(1_000, None), 1_000);
+        assert_eq!(creator_ts(1_000, Some(500)), 1_000);
+        assert_eq!(creator_ts(1_000, Some(1_000)), 1_001);
+        assert_eq!(creator_ts(1_000, Some(9_000)), 9_001);
+    }
+
+    #[tokio::test]
+    async fn a_write_past_the_cap_of_a_transfer_fails() {
+        use tokio::io::AsyncWriteExt;
+        let mut sink = Collected { bytes: Vec::new(), progress: Progress::capped(Some(4)), over: false };
+
+        sink.write_all(b"abcd").await.unwrap();
+        let past = sink.write_all(b"e").await;
+
+        assert!(past.is_err() && sink.over, "{past:?}");
+        assert_eq!(sink.bytes, b"abcd");
+    }
+
+    #[test]
+    fn an_index_transfer_is_capped_at_the_index_limit() {
+        let progress = index_progress();
+
+        assert!(progress.allows(INDEX_MAX_BYTES));
+        assert!(!progress.allows(INDEX_MAX_BYTES + 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_fetch_gets_the_signed_size_as_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"from creator";
+        let sha = sha256_bytes(bytes);
+        let gate = gate_wanting("start.md", &sha);
+        gate.set_meta("start.md", &sha, Meta { ts: 1, sig: Some("s".to_owned()), size: Some(bytes.len() as u64) });
+        let fits = Arc::new(Mutex::new(Vec::new()));
+        let seen = fits.clone();
+        let fetch = move |_: String, progress: Progress| {
+            seen.lock().unwrap().push((progress.allows(bytes.len()), progress.allows(bytes.len() + 1)));
+            async move { Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec()) }
+        };
+
+        download_file(&dir.path().join("start.md"), "start.md", &sha, "ticket", &gate, fetch).await.unwrap();
+
+        assert_eq!(*fits.lock().unwrap(), vec![(true, false)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ticket_that_sends_more_than_the_signed_size_fails_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = sha256_bytes(b"from creator");
+
+        let outcome = download_file(
+            &dir.path().join("start.md"),
+            "start.md",
+            &sha,
+            "ticket",
+            &gate_wanting("start.md", &sha),
+            |_, _| async { Err::<Vec<u8>, _>(anyhow::Error::new(OverSize)) },
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(Failure::Permanent(_))), "{outcome:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_ticket_does_not_block_another_ticket_for_the_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from creator";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![
+            ("start.md".to_owned(), sha.clone(), "bad".to_owned()),
+            ("start.md".to_owned(), sha, "good".to_owned()),
+        ];
+        let fetch = move |ticket: String, _: Progress| async move {
+            match ticket.as_str() {
+                "bad" => Ok::<Vec<u8>, anyhow::Error>(b"tampered".to_vec()),
+                _ => Ok(bytes.to_vec()),
+            }
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        while let Some(done) = tokio::time::timeout(Duration::from_secs(1), finished.recv()).await.ok().flatten() {
+            downloads.settle(&done);
+        }
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(bytes.to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ticket_that_failed_for_good_is_not_tried_again_but_a_new_one_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from creator";
+        let sha = sha256_bytes(bytes);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fetch = {
+            let calls = calls.clone();
+            move |ticket: String, _: Progress| {
+                calls.lock().unwrap().push(ticket.clone());
+                async move {
+                    match ticket.as_str() {
+                        "bad" => Ok::<Vec<u8>, anyhow::Error>(b"tampered".to_vec()),
+                        _ => Ok(bytes.to_vec()),
+                    }
+                }
+            }
+        };
+        let bad: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "bad".to_owned())];
+        let both: Vec<Entry> = vec![
+            ("start.md".to_owned(), sha.clone(), "bad".to_owned()),
+            ("start.md".to_owned(), sha, "rehoster".to_owned()),
+        ];
+
+        downloads.reconcile(&bad, &HashMap::new(), fetch.clone());
+        let first = finished.recv().await.unwrap();
+        downloads.settle(&first);
+        downloads.reconcile(&bad, &HashMap::new(), fetch.clone());
+        downloads.reconcile(&both, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(*calls.lock().unwrap(), vec!["bad".to_owned(), "rehoster".to_owned()]);
+    }
+
+    #[test]
+    fn the_holders_of_an_entry_are_the_slices_that_copied_it() {
+        let (key, _) = creator_share();
+        let sha = sha256_bytes(b"x");
+        let entry = |ticket: &str, ts: u64, sha: &str| {
+            let mut entry = signed_file(&key, "p", ts, sha, 1);
+            entry["ticket"] = json!(ticket);
+            entry
+        };
+        let winner = entry("creator", 5, &sha);
+        let mut indexes = Indexes::default();
+        let mut document = serde_json::Map::new();
+        for (author, held) in [
+            ("a", winner.clone()),
+            ("b", entry("rehoster", 5, &sha)),
+            ("c", entry("older", 4, &sha)),
+            ("d", entry("other-bytes", 5, &sha256_bytes(b"y"))),
+        ] {
+            let pointer = format!("sha-{author}");
+            document.insert(author.to_owned(), json!({ "index": { "ticket": "i", "sha256": pointer } }));
+            indexes.0.insert(author.to_owned(), (pointer, serde_json::Map::from_iter([("p".to_owned(), held)])));
+        }
+
+        let tickets = holders_of(&Value::Object(document), &indexes, "p", &winner);
+
+        assert_eq!(tickets.first().map(String::as_str), Some("creator"));
+        let mut rest = tickets[1..].to_vec();
+        rest.sort();
+        assert_eq!(rest, vec!["rehoster".to_owned()]);
+    }
+
+    #[test]
+    fn a_creator_share_keeps_only_the_entries_that_the_creator_signed() {
+        let (key, trust) = creator_share();
+        let forger = CreatorKey::generate().unwrap();
+        let entries = serde_json::Map::from_iter([
+            ("signed".to_owned(), signed_file(&key, "signed", 2, "11", 5)),
+            ("forged".to_owned(), signed_file(&forger, "forged", 2, "11", 5)),
+            ("unsigned".to_owned(), json!({ "sha256": "11", "ticket": "t", "ts": 2, "size": 5 })),
+        ]);
+
+        let kept = verified_entries(entries.clone(), &trust);
+
+        assert_eq!(kept.keys().collect::<Vec<_>>(), vec!["signed"]);
+        assert_eq!(verified_entries(entries, &Trust::Everybody).len(), 3);
+    }
+
+    #[test]
+    fn a_saved_unsigned_entry_is_dropped_in_a_creator_share() {
+        let (key, trust) = creator_share();
+        let saved = BTreeMap::from([
+            ("signed".to_owned(), signed_file(&key, "signed", 2, "11", 5)),
+            ("unsigned".to_owned(), json!({ "sha256": "11", "ticket": "t", "ts": 2 })),
+        ]);
+
+        let kept = trusted_saved(saved, &trust);
+
+        assert_eq!(kept.keys().collect::<Vec<_>>(), vec!["signed"]);
+    }
+
+    #[test]
+    fn a_signed_restart_drops_a_file_entry_that_the_disk_no_longer_matches() {
+        let (key, _) = creator_share();
+        let sha = sha256_bytes(b"x");
+        let saved = BTreeMap::from([
+            ("kept".to_owned(), signed_file(&key, "kept", 2, &sha, 1)),
+            ("gone".to_owned(), signed_file(&key, "gone", 2, &sha, 1)),
+            ("edited".to_owned(), signed_file(&key, "edited", 2, &sha, 1)),
+            ("deleted".to_owned(), sign_entry(&key, "mesh", "deleted", &json!({ "deleted": true, "ts": 3 })).unwrap()),
+        ]);
+        let disk = BTreeMap::from([("kept".to_owned(), sha), ("edited".to_owned(), sha256_bytes(b"y"))]);
+
+        let own = own_after_restart_signed(saved, &disk);
+
+        assert_eq!(own.keys().collect::<Vec<_>>(), vec!["deleted", "kept"]);
+    }
+
+    fn read_only_downloads(dir: &Path, disk: &[(&str, &str)], given: &[&str]) -> Downloads {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.to_path_buf(), done);
+        downloads.read_only = true;
+        downloads.disk = disk.iter().map(|(path, sha)| ((*path).to_owned(), (*sha).to_owned())).collect();
+        downloads.given = given.iter().map(|path| (*path).to_owned()).collect();
+        downloads
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_only_peer_puts_back_a_file_that_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"from creator";
+        let sha = sha256_bytes(bytes);
+        std::fs::write(dir.path().join("start.md"), "edited").unwrap();
+        let mut downloads = read_only_downloads(dir.path(), &[("start.md", &sha256_bytes(b"edited"))], &["start.md"]);
+        let known = HashMap::from([("start.md".to_owned(), sha.clone())]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"from creator".to_vec()) };
+
+        downloads.reconcile(&entries, &known, fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(bytes.to_vec()));
+        assert!(downloads.take_revert("start.md"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_only_peer_puts_back_a_file_that_it_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"from creator";
+        let sha = sha256_bytes(bytes);
+        let mut downloads = read_only_downloads(dir.path(), &[], &["start.md"]);
+        let known = HashMap::from([("start.md".to_owned(), sha.clone())]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"from creator".to_vec()) };
+
+        downloads.reconcile(&entries, &known, fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(bytes.to_vec()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_only_peer_leaves_a_file_alone_when_the_disk_matches_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = sha256_bytes(b"from creator");
+        let mut downloads = read_only_downloads(dir.path(), &[("start.md", &sha)], &["start.md"]);
+        let known = HashMap::from([("start.md".to_owned(), sha.clone())]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let fetch = move |_: String, _: Progress| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<Vec<u8>, anyhow::Error>(Vec::new()) }
+        };
+
+        downloads.reconcile(&entries, &known, fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_read_only_peer_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = read_only_downloads(dir.path(), &[], &[]);
+        let disk = BTreeMap::from([("new.md".to_owned(), sha256_bytes(b"new"))]);
+
+        assert!(downloads.publishable(&disk, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_read_only_peer_does_not_forget_the_download_of_a_file_that_it_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("start.md"), "edited").unwrap();
+        let sha = sha256_bytes(b"from creator");
+        let mut downloads = read_only_downloads(dir.path(), &[], &["start.md"]);
+        downloads.gate.set_wanted("start.md", &sha, "ticket");
+        let known = HashMap::from([("start.md".to_owned(), sha)]);
+
+        downloads.claim_edits(&known).unwrap();
+
+        assert_eq!(downloads.gate.wanted_paths(), vec!["start.md".to_owned()]);
+    }
+
+    #[test]
+    fn a_read_only_peer_removes_an_edited_file_that_the_creator_deleted_and_keeps_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("given.md"), "edited").unwrap();
+        std::fs::write(dir.path().join("mine.md"), "mine").unwrap();
+        let downloads = read_only_downloads(dir.path(), &[], &["given.md"]);
+
+        let dropped = downloads.drop_unnamed(&serde_json::Map::new(), &HashMap::new());
+
+        let paths: Vec<&str> = dropped.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, vec!["given.md"]);
+        assert!(dropped[0].1.is_some(), "the edited copy of a given file is removed");
+    }
+
+    #[test]
+    fn a_path_that_the_mesh_removed_is_not_given_any_more() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("given.md"), "from the mesh").unwrap();
+        let mut downloads = read_only_downloads(dir.path(), &[], &["given.md"]);
+        let mut known = HashMap::from([("given.md".to_owned(), sha256_bytes(b"from the mesh"))]);
+
+        downloads.remove_dropped(&serde_json::Map::new(), &mut known, |local| std::fs::remove_file(local));
+
+        assert!(!downloads.is_given("given.md"));
+        assert!(!dir.path().join("given.md").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_ticket_that_delivers_cancels_the_other_tasks_of_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, mut finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let bytes = b"from rehoster";
+        let sha = sha256_bytes(bytes);
+        let entries: Vec<Entry> = vec![
+            ("start.md".to_owned(), sha.clone(), "creator".to_owned()),
+            ("start.md".to_owned(), sha, "rehoster".to_owned()),
+        ];
+        let fetch = move |ticket: String, _: Progress| async move {
+            if ticket == "creator" {
+                std::future::pending::<()>().await;
+            }
+            Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+        };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        let delivered = finished.recv().await.unwrap();
+        let current = downloads.settle(&delivered);
+
+        assert!(current);
+        assert_eq!(delivered.ticket, "rehoster");
+        assert!(downloads.running.is_empty(), "the task of the dead holder was left running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_ticket_starts_one_new_task_and_does_not_restart_a_running_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(dir.path().to_path_buf(), done);
+        let sha = sha256_bytes(b"from creator");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fetch = {
+            let calls = calls.clone();
+            move |ticket: String, _: Progress| {
+                calls.lock().unwrap().push(ticket);
+                std::future::pending::<Result<Vec<u8>>>()
+            }
+        };
+        let first: Vec<Entry> = vec![("start.md".to_owned(), sha.clone(), "a".to_owned())];
+        let more: Vec<Entry> =
+            vec![("start.md".to_owned(), sha.clone(), "a".to_owned()), ("start.md".to_owned(), sha, "b".to_owned())];
+
+        downloads.reconcile(&first, &HashMap::new(), fetch.clone());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        downloads.reconcile(&more, &HashMap::new(), fetch.clone());
+        downloads.reconcile(&more, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut seen = calls.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(downloads.running.len(), 2);
+    }
+
+    #[test]
+    fn a_slice_whose_new_index_has_not_landed_keeps_its_last_entries_in_the_view() {
+        let (mut document, indexes) = pointed(&[
+            ("a", serde_json::json!({ "p": { "sha256": "x", "ticket": "t", "ts": 1 } })),
+            ("c", serde_json::json!({ "p": { "deleted": true, "ts": 2 } })),
+        ]);
+        // First pass: both indexes match their pointers, and the delete of c wins.
+        assert!(!view_of(&document, &indexes).contains_key("p"));
+
+        // Second pass: c points at a newer index that is still being fetched. Its delete must still win over the older
+        // copy in a, or a peer fetches the file that c deleted.
+        document["c"]["index"]["sha256"] = serde_json::json!("not fetched yet");
+
+        assert!(!view_of(&document, &indexes).contains_key("p"));
+        assert_eq!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]), vec!["p".to_owned()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_of_the_creator_is_not_a_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (sha256_bytes(b"v1"), sha256_bytes(b"v2"));
+        std::fs::write(dir.path().join("start.md"), "v1").unwrap();
+        let mut downloads = read_only_downloads(dir.path(), &[("start.md", &old)], &["start.md"]);
+        let known = HashMap::from([("start.md".to_owned(), old)]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), new, "ticket".to_owned())];
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"v2".to_vec()) };
+
+        downloads.reconcile(&entries, &known, fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(b"v2".to_vec()));
+        assert!(!downloads.take_revert("start.md"), "an ordinary update was reported as a revert");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_deleted_while_stopped_is_a_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = sha256_bytes(b"v1");
+        // The saved entry was dropped with the file, so `known` lacks the path, and `given` still names it.
+        let mut downloads = read_only_downloads(dir.path(), &[], &["start.md"]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"v1".to_vec()) };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(downloads.take_revert("start.md"));
+    }
+
+    #[test]
+    fn a_file_that_changed_after_it_landed_is_a_content_change_and_not_a_failed_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("start.md");
+        std::fs::write(&file, "edited right after the landing").unwrap();
+
+        let error = signed_size(&file, "start.md", &sha256_bytes(b"from creator")).unwrap_err();
+
+        assert!(error.is::<ContentChanged>(), "{error:#}");
+        assert!(landed_copy_result(Err(error)).is_ok());
+        assert!(landed_copy_result(Err(anyhow!("register failed"))).is_err());
+        std::fs::write(&file, "from creator").unwrap();
+        assert_eq!(signed_size(&file, "start.md", &sha256_bytes(b"from creator")).unwrap(), 12);
+    }
+
+    #[test]
+    fn an_index_that_failed_for_good_drops_the_stale_entries_of_its_slice() {
+        let (document, mut indexes) = pointed(&[("c", serde_json::json!({ "p": { "deleted": true, "ts": 2 } }))]);
+        let pointers = HashMap::from([("c".to_owned(), "newer".to_owned())]);
+
+        // The failure of an older pointer says nothing about the current one.
+        assert!(!drop_stale_index(&mut indexes, &pointers, "c", "older"));
+        assert!(
+            view_of(&document, &indexes).is_empty()
+                && removed_by_tombstone(&document, &indexes, &["p".to_owned()]).len() == 1
+        );
+
+        assert!(drop_stale_index(&mut indexes, &pointers, "c", "newer"));
+        assert!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn another_holder_that_has_not_failed_keeps_a_failed_download_quiet() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.gate.set_wanted_all("start.md", "sha", vec!["creator".to_owned(), "rehoster".to_owned()]);
+        downloads.fail_for_good("start.md", "sha", "creator");
+
+        assert!(downloads.another_ticket_can_deliver("start.md", "sha"));
+
+        downloads.fail_for_good("start.md", "sha", "rehoster");
+        assert!(!downloads.another_ticket_can_deliver("start.md", "sha"));
+        assert!(!downloads.another_ticket_can_deliver("start.md", "other sha"));
+    }
+
+    #[test]
+    fn paths_that_differ_only_in_case_collide_and_the_first_is_kept_when_none_is_held() {
+        let paths: Vec<String> = ["Notes.md", "notes.md", "other.md", "NOTES.MD"].map(str::to_owned).to_vec();
+
+        let skipped = case_collisions(paths.iter(), |_| false);
+
+        assert_eq!(
+            skipped,
+            BTreeMap::from([
+                ("Notes.md".to_owned(), "NOTES.MD".to_owned()),
+                ("notes.md".to_owned(), "NOTES.MD".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_path_that_is_held_is_the_one_a_case_collision_keeps() {
+        let paths: Vec<String> = ["Notes.md", "notes.md"].map(str::to_owned).to_vec();
+
+        let skipped = case_collisions(paths.iter(), |path| path == "notes.md");
+
+        assert_eq!(skipped, BTreeMap::from([("Notes.md".to_owned(), "notes.md".to_owned())]));
+    }
+
+    #[test]
+    fn a_failed_index_of_the_current_pointer_drops_the_old_entries_and_asks_for_a_new_view() {
+        let (_, mut indexes) = pointed(&[("c", serde_json::json!({ "p": { "deleted": true, "ts": 2 } }))]);
+        let pointers = HashMap::from([("c".to_owned(), "newer".to_owned())]);
+        let failed =
+            |sha: &str| IndexDone { author: "c".to_owned(), sha: sha.to_owned(), result: Err("gave up".to_owned()) };
+
+        let older = settle_index(&mut indexes, &pointers, failed("older"));
+        assert_eq!(older, IndexEnd::Failed { error: "gave up".to_owned(), dropped: false });
+        assert!(!older.changes_view());
+        assert!(indexes.0.contains_key("c"));
+
+        let newer = settle_index(&mut indexes, &pointers, failed("newer"));
+        assert_eq!(newer, IndexEnd::Failed { error: "gave up".to_owned(), dropped: true });
+        assert!(newer.changes_view());
+        assert!(!indexes.0.contains_key("c"));
+    }
+
+    #[test]
+    fn a_landed_index_asks_for_a_new_view_and_a_superseded_one_does_not() {
+        let mut indexes = Indexes::default();
+        let pointers = HashMap::from([("c".to_owned(), "now".to_owned())]);
+        let landed =
+            |sha: &str| IndexDone { author: "c".to_owned(), sha: sha.to_owned(), result: Ok(serde_json::Map::new()) };
+
+        let superseded = settle_index(&mut indexes, &pointers, landed("before"));
+        assert_eq!(superseded, IndexEnd::Superseded);
+        assert!(!superseded.changes_view() && indexes.0.is_empty());
+
+        let current = settle_index(&mut indexes, &pointers, landed("now"));
+        assert_eq!(current, IndexEnd::Landed);
+        assert!(current.changes_view() && indexes.0.contains_key("c"));
+    }
+
+    #[test]
+    fn an_author_key_is_shortened_on_a_character_boundary() {
+        assert_eq!(short_author("cc5a525e1a31a43e551e"), "cc5a525e");
+        assert_eq!(short_author("abc"), "abc");
+        assert_eq!(short_author("ééééééééé"), "éééééééé");
+    }
+
+    #[test]
+    fn a_kept_file_that_failed_to_register_is_tried_again_while_it_is_unchanged() {
+        let mut pending = Unregistered::default();
+        let meta = Meta { ts: 7, sig: Some("sig".to_owned()), size: Some(3) };
+        pending.note("a.md".to_owned(), "s".to_owned(), meta.clone());
+        let known = HashMap::from([("a.md".to_owned(), "s".to_owned())]);
+
+        assert_eq!(pending.due(&known), vec![("a.md".to_owned(), "s".to_owned(), meta)]);
+        assert_eq!(pending.due(&known).len(), 1, "a failed retry is tried again");
+
+        pending.done("a.md");
+        assert!(pending.due(&known).is_empty());
+    }
+
+    #[test]
+    fn a_kept_file_that_changed_or_is_gone_is_not_registered_again() {
+        let mut pending = Unregistered::default();
+        pending.note("a.md".to_owned(), "s".to_owned(), Meta::default());
+        pending.note("b.md".to_owned(), "t".to_owned(), Meta::default());
+        let known = HashMap::from([("a.md".to_owned(), "other".to_owned())]);
+
+        assert!(pending.due(&known).is_empty());
+    }
+
+    #[test]
+    fn a_path_that_lost_its_last_working_ticket_is_reported_once() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["creator".to_owned(), "rehoster".to_owned()]);
+        downloads.last_error.insert("a.md".to_owned(), "no route".to_owned());
+        downloads.fail_for_good("a.md", "sha", "creator");
+        assert!(downloads.abandoned().is_empty(), "the rehoster can still deliver");
+
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["creator".to_owned()]);
+
+        assert_eq!(downloads.abandoned(), vec![("a.md".to_owned(), "no route".to_owned())]);
+        assert!(downloads.abandoned().is_empty(), "each path is reported once");
+    }
+
+    fn idle_handle() -> AbortHandle {
+        tokio::spawn(std::future::pending::<()>()).abort_handle()
+    }
+
+    fn permanent(path: &str, sha: &str, ticket: &str) -> Finished {
+        let result = Err(Failure::Permanent(anyhow!("content does not match its sha256")));
+        Finished { path: path.to_owned(), sha: sha.to_owned(), ticket: ticket.to_owned(), result }
+    }
+
+    #[tokio::test]
+    async fn a_path_that_lands_after_a_report_no_longer_counts_as_failed() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        // Only the bad holder is in the document when its ticket fails for good, so the failure is reported.
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["bad".to_owned()]);
+        downloads.running.insert(("a.md".to_owned(), "bad".to_owned()), ("sha".to_owned(), idle_handle()));
+        downloads.settle(&permanent("a.md", "sha", "bad"));
+        assert!(!downloads.another_ticket_can_deliver("a.md", "sha"));
+        downloads.mark_reported("a.md", "sha");
+        assert_eq!(downloads.failed_downloads(), 1);
+
+        // The good holder appears later, and its ticket delivers.
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["bad".to_owned(), "good".to_owned()]);
+        downloads.running.insert(("a.md".to_owned(), "good".to_owned()), ("sha".to_owned(), idle_handle()));
+        downloads.settle(&Finished {
+            path: "a.md".to_owned(),
+            sha: "sha".to_owned(),
+            ticket: "good".to_owned(),
+            result: Ok(()),
+        });
+
+        assert_eq!(downloads.failed_downloads(), 0, "a file that landed counts as a failed download");
+    }
+
+    #[test]
+    fn a_failure_that_the_download_reported_is_not_reported_again() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.gate.set_wanted_all("a.md", "sha", vec!["creator".to_owned()]);
+        downloads.fail_for_good("a.md", "sha", "creator");
+        downloads.mark_reported("a.md", "sha");
+
+        assert!(downloads.abandoned().is_empty());
+    }
+
+    #[test]
+    fn the_case_probe_leaves_no_file_and_removes_one_that_a_stop_left() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CASE_PROBE), b"left by a stop").unwrap();
+
+        let _ = ignores_case(dir.path());
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_view_is_whole_when_every_index_that_is_pointed_at_is_fetched() {
+        let (document, indexes) = pointed(&[("c", serde_json::json!({}))]);
+
+        assert!(view_complete(&document, &indexes));
+        assert!(!view_complete(&document, &Indexes::default()));
+        assert!(!view_complete(&serde_json::json!({}), &Indexes::default()));
+    }
+
+    #[test]
+    fn forgetting_a_path_forgets_its_revert() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.reverts.insert("start.md".to_owned());
+
+        downloads.forget("start.md");
+
+        assert!(!downloads.take_revert("start.md"));
     }
 }

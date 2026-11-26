@@ -27,16 +27,19 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 ## Steps
 
 1. **Resolve the folder.** The arguments (see Agent differences) hold
-   `<folder> [--nickname <nick>]`. Take `--nickname <nick>` out first, if it is
-   there; the rest is the folder. If the folder is empty, ask the user which
-   folder to share. Resolve it to an absolute path and confirm it exists and is
-   a directory. Stop with a clear message if not. Do not invent a nickname: with
-   no flag, the mesh picks a random one.
+   `<folder> [--nickname <nick>] [--writers creator]`. Take `--nickname <nick>`
+   and `--writers creator` out first, if they are there; the rest is the
+   folder. If the folder is empty, ask the user which folder to share. Resolve
+   it to an absolute path and confirm it exists and is a directory. Stop with
+   a clear message if not. Do not invent a nickname: with no flag, the mesh
+   picks a random one. Do not add `--writers creator` unless the user gave it.
 
-2. **Warn before sharing.** Sharing is two-way: anyone with the hash can edit,
-   create, and delete files in this folder. Say this in one line. If the folder
-   is the user's home directory, a whole project root, or holds secrets
-   (`.env`, keys), ask for confirmation first.
+2. **Warn before sharing.** By default, sharing is two-way: anyone with the
+   hash can edit, create, and delete files in this folder. With
+   `--writers creator`, only this share can change files, and a peer gets a
+   read-only copy. Say the one that applies in one line. If the folder is the
+   user's home directory, a whole project root, or holds secrets (`.env`,
+   keys), ask for confirmation first.
 
 3. **Check the binary.** Run `command -v agent-knowledge`. If it is not on
    `PATH`, stop and tell the user to install it:
@@ -44,12 +47,13 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 
 4. **Run it in the background.** It runs until stopped, so never wait on it
    in the foreground.
-   Add `--nickname "<nick>"` to the command only if the user gave one.
+   Add `--nickname "<nick>"` to the command only if the user gave one. Add
+   `--writers creator` only if the user gave it.
    - Claude Code: call Bash with `run_in_background: true` and run
-     `agent-knowledge share "<absolute-folder>" [--nickname "<nick>"]`.
+     `agent-knowledge share "<absolute-folder>" [--nickname "<nick>"] [--writers creator]`.
    - Codex and Pi: their shell tool waits for the command to end, so detach
      it and log to a new file:
-     `log=$(mktemp -t agent-knowledge); nohup agent-knowledge share "<absolute-folder>" [--nickname "<nick>"] > "$log" 2>&1 & echo "$! $log"`.
+     `log=$(mktemp -t agent-knowledge); nohup agent-knowledge share "<absolute-folder>" [--nickname "<nick>"] [--writers creator] > "$log" 2>&1 & echo "$! $log"`.
      Note the PID and the log path, and read the log in the next step.
 
 5. **Read the hash and the nickname.** Once the mesh is up, the process
@@ -84,5 +88,9 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 
 - Hidden files and folders (`.git`, `.DS_Store`) and empty folders do not sync.
 - If two sides edit the same file at once, the last write wins.
+- With `--writers creator`, the hash has the form `<mesh-id>.<64 hex
+  characters>`. Report the whole hash. If the share stops, nobody can change
+  the files again. To change files again, run the share again. The new run
+  prints a new hash.
 - Set `RUST_LOG=info` before the command to debug a share that never prints a
   hash.

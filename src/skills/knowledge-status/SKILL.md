@@ -47,6 +47,9 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 
 3. **Point out problems, in one line each, only if there are any:**
    - `0 connected`: no one else is in the mesh. Share the hash with a peer.
+     Give the whole hash that the block shows. In a creator share, it has a
+     `.<64 hex characters>` suffix. Never cut the suffix: a peer that mounts
+     only the part before the `.` does not get the creator mode.
    - A peer marked `quiet`: it has not been heard from for a while, and may
      have left.
    - A `failed` count above 0: some transfers failed. Set `RUST_LOG=info`

@@ -84,4 +84,10 @@ Claude Code, `$knowledge-mount` in Codex, `/skill:knowledge-mount` in Pi.
 
 - Each side keeps a full copy of the folder.
 - A rename syncs as a delete plus a create.
+- If the hash has a `.<64 hex characters>` suffix, the mount is read-only.
+  Only the creator of the share can change files. The mount prints lines that
+  start with `read-only share:` on stderr. They name a file that it put back
+  (`reverted`), a file that it keeps and does not publish (`not published`),
+  or a file that it does not download because another path has the same name
+  in a folder that ignores case (`is not downloaded`).
 - Set `RUST_LOG=info` before the command to debug a mount that never connects.
