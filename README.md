@@ -278,6 +278,9 @@ hash.
 - If 2 sides edit 1 file, the edit with the larger timestamp wins. Each peer
   stamps an edit with its own clock, so if the clocks differ, an earlier
   edit can win.
+- The first sync of a new peer takes about 5 seconds, plus a wait for the
+  first state of the mesh. If many meshes run on 1 host, this wait can pass
+  30 seconds.
 - Each side keeps a full copy of the folder. If you stop a share or a mount,
   the copies that peers already have stay.
 

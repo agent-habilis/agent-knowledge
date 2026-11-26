@@ -76,9 +76,12 @@ bun test scripts/                                                        # scrip
   leaves, that a rehoster keeps the creator signatures after a restart, that a
   mounter puts back an edit or a delete, and that a mounter keeps a file that
   the mesh never gave it. It also runs the binary, to check the 2 `read-only
-  share:` lines and the error for a malformed hash. It takes about 2 minutes.
-  The file runs at most 4 tests at the same time (`MAX_CONCURRENT_TESTS`),
-  because the peers need the CPU to sync in time. Do not raise the limit.
+  share:` lines and the error for a malformed hash. It takes about 30 seconds.
+  Its peers use loopback lookups (`Lookups::Loopback`): they find only peers
+  on this machine, and no test waits for the network. The other test files use
+  the public lookups. The binary always uses the public lookups. The 2 tests
+  that read the `read-only share:` lines run the binary, so they use the public
+  lookups too. Do not run the binary in another test of this file.
 - `scripts/update-license.test.ts` checks the `LICENSE` header rewrite.
 
 ### Releasing
