@@ -12,6 +12,9 @@ use tokio::task::JoinHandle;
 /// How long a test waits for the mesh to deliver something.
 pub const WAIT: Duration = Duration::from_secs(30);
 
+/// How long a peer may take to join its mesh.
+pub const READY_LIMIT: Duration = Duration::from_secs(60);
+
 /// How long [`Peer::stop`] waits for a loop to exit.
 pub const STOP_LIMIT: Duration = Duration::from_secs(30);
 
@@ -81,7 +84,7 @@ impl Peer {
                 let _ = stop_rx.changed().await;
             },
         ));
-        let ready = ready_rx.await.unwrap();
+        let ready = tokio::time::timeout(READY_LIMIT, ready_rx).await.expect("the mesh was not ready in time").unwrap();
         Self { ready, stop, task: Some(task), runtime: Some(runtime) }
     }
 

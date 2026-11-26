@@ -131,6 +131,7 @@ pub async fn run(
         .iter()
         .map(|(path, sha)| (path.clone(), sha.clone(), own.get(path).map(meta_of_entry).unwrap_or_default()))
         .collect();
+    let case_insensitive = read_only && ignores_case(&root);
     let mut downloads = Downloads::new(root.clone(), done);
     downloads.read_only = read_only;
     downloads.given = given;
@@ -148,6 +149,8 @@ pub async fn run(
         creator_key,
         viewed: false,
         unpublished: HashSet::new(),
+        case_insensitive,
+        collisions_warned: HashSet::new(),
         consumer: Arc::new(Consumer::new()),
         status,
         status_file,
@@ -176,6 +179,8 @@ pub async fn run(
             folder.publish_copy(&path, &sha, &meta).await
         };
         if let Err(error) = published {
+            forget_unregistered(&mut folder.own, &mut folder.known, &path);
+            folder.own_changed();
             folder.failed(&format!("kept file {path} failed to register: {error:#}"));
         }
     }
@@ -263,6 +268,10 @@ struct Folder {
     viewed: bool,
     /// The paths that a read-only peer keeps and does not publish, so each is logged once.
     unpublished: HashSet<String>,
+    /// Whether the folder treats names that differ only in case as one name. Only a read-only peer needs it.
+    case_insensitive: bool,
+    /// The paths that a read-only peer does not download because another path has the same name in its folder.
+    collisions_warned: HashSet<String>,
     /// When the own index was last written. A pointer write waits for `INDEX_INTERVAL` after it.
     index_written: Option<tokio::time::Instant>,
     /// The directory that the blob store keeps its spool in, the one the index is written into.
@@ -473,6 +482,12 @@ impl Downloads {
         self.given.contains(path)
     }
 
+    /// Whether a ticket for `sha` at `path` is left that has not failed for good.
+    fn another_ticket_can_deliver(&self, path: &str, sha: &str) -> bool {
+        let bad = self.failed.get(path).filter(|(failed, _)| failed == sha).map(|(_, bad)| bad);
+        self.gate.tickets_of(path, sha).iter().any(|ticket| !bad.is_some_and(|bad| bad.contains(ticket)))
+    }
+
     /// Whether the download of `path` that just ended put back a file that a read-only peer changed.
     fn take_revert(&mut self, path: &str) -> bool {
         self.reverts.remove(path)
@@ -522,7 +537,13 @@ impl Downloads {
                 eprintln!("download {path} failed: unsafe path {path:?}");
                 continue;
             };
-            if self.read_only && self.given.contains(path) && self.disk.get(path) != Some(sha) {
+            // A revert puts back what this peer last synced. A file that the creator changed is not one.
+            let (current, base) = (self.disk.get(path), known.get(path));
+            if self.read_only
+                && self.given.contains(path)
+                && current != Some(sha)
+                && (base.is_none() || base != current)
+            {
                 self.reverts.insert(path.clone());
             }
             // A fetch takes a slot only while it runs, so a download that waits to retry holds none.
@@ -726,6 +747,7 @@ impl Downloads {
 
     /// Stop everything for a path that the document no longer names.
     fn forget(&mut self, path: &str) {
+        self.reverts.remove(path);
         self.gate.unwant(path);
         self.failed.remove(path);
         self.local_retry.remove(path);
@@ -793,7 +815,6 @@ impl Folder {
         self.publish_index().await;
     }
 
-    /// Log a failed transfer and count it for `status`.
     /// Sign every own entry again, after a stamp changed a ts.
     fn resign_own(&mut self) {
         let Some(key) = &self.creator_key else { return };
@@ -806,11 +827,13 @@ impl Folder {
         }
     }
 
+    /// The own index changed, so it is written again.
     fn own_changed(&mut self) {
         self.index_dirty = true;
         self.own_version += 1;
     }
 
+    /// Log a failed transfer and count it for `status`.
     fn failed(&mut self, message: &str) {
         eprintln!("{message}");
         self.status.failed += 1;
@@ -892,11 +915,10 @@ impl Folder {
             return Ok(None);
         }
         let file = self.root.join(path);
-        let (on_disk, size) =
-            tokio::task::spawn_blocking(move || digest_file(&file)).await.context("digest task ended")??;
-        if on_disk != sha {
-            bail!("{path} no longer holds the bytes of its entry");
-        }
+        let (named, bytes) = (path.to_owned(), sha.to_owned());
+        let size = tokio::task::spawn_blocking(move || signed_size(&file, &named, &bytes))
+            .await
+            .context("digest task ended")??;
         Ok(Some(size))
     }
 
@@ -926,6 +948,8 @@ impl Folder {
     /// A read-only peer keeps a file that the mesh never gave it, and tells once that it does not publish it. It waits for
     /// the first view, because the mesh may hold that file.
     fn note_unpublished(&mut self, disk: &BTreeMap<String, String>) {
+        // A path that is gone is told again if it comes back.
+        self.unpublished.retain(|path| disk.contains_key(path));
         if !self.viewed {
             return;
         }
@@ -1053,7 +1077,12 @@ impl Folder {
             }
             // The pointer moved on, and the fetch of the newer pointer is the one that lands.
             Ok(_) => {}
-            Err(error) => self.failed(&format!("index of {} failed: {error}", done.author)),
+            Err(error) => {
+                if drop_stale_index(&mut self.indexes, &self.pointers, &done.author, &done.sha) {
+                    eprintln!("the old entries of {} are dropped: its new index did not load", done.author);
+                }
+                self.failed(&format!("index of {} failed: {error}", done.author));
+            }
         }
     }
 
@@ -1107,7 +1136,7 @@ impl Folder {
             .collect();
         let removed = removed_by_tombstone(document, &self.indexes, &tracked);
         let winners = winners_of(document, &self.indexes);
-        self.viewed |= !winners.is_empty();
+        self.viewed |= !winners.is_empty() || view_complete(document, &self.indexes);
         for path in &removed {
             if let Some(tombstone) = winners.get(path)
                 && self.own.get(path) != Some(tombstone)
@@ -1121,8 +1150,19 @@ impl Folder {
         for path in tracked.iter().filter(|path| !removed.contains(path)) {
             named.entry(path.clone()).or_insert(Value::Null);
         }
+        let skipped =
+            if self.read_only() && self.case_insensitive { case_collisions(view.keys()) } else { BTreeMap::new() };
         let mut entries: Vec<Entry> = Vec::new();
         for (path, entry) in &view {
+            if let Some(kept) = skipped.get(path) {
+                // Both would be written to one file, and each download would undo the other for ever.
+                if self.collisions_warned.insert(path.clone()) {
+                    eprintln!(
+                        "read-only share: {path} is not downloaded: {kept} has the same name in a folder that ignores case"
+                    );
+                }
+                continue;
+            }
             let (Some(sha), Some(_)) = (entry["sha256"].as_str(), entry["ticket"].as_str()) else {
                 continue;
             };
@@ -1159,7 +1199,12 @@ impl Folder {
                     None => Err(anyhow!("no entry of {path} names these bytes any more")),
                 };
                 self.save_own();
-                published
+                landed_copy_result(published)
+            }
+            // One holder that failed for good is not a failed download while another ticket can still deliver.
+            Err(Failure::Permanent(error)) if self.downloads.another_ticket_can_deliver(&path, &sha) => {
+                tracing::debug!(path = %path, error = %error_text(&error), "a ticket failed for good; another one is left");
+                return;
             }
             Err(Failure::Transient(error) | Failure::Permanent(error) | Failure::LocalWrite(error)) => Err(error),
         };
@@ -1257,6 +1302,13 @@ fn meta_of_entry(entry: &Value) -> Meta {
     }
 }
 
+/// Whether the view is whole: at least one slice points at an index, and every such index is fetched. A creator share with
+/// no file has a whole view too.
+fn view_complete(document: &Value, indexes: &Indexes) -> bool {
+    let pointing = document.as_object().into_iter().flatten().any(|(_, slice)| slice.get("index").is_some());
+    pointing && pointers_to_fetch(document, indexes).is_empty()
+}
+
 /// The tickets that hold the winning entry of `path`, the winner's own first. A slice holds the entry when it lists the
 /// same bytes with the same ts and signature: its owner copied it, with a ticket of its own.
 fn holders_of(document: &Value, indexes: &Indexes, path: &str, winner: &Value) -> Vec<String> {
@@ -1299,6 +1351,73 @@ fn own_after_restart_signed(
 }
 
 const DIGEST_BLOCK_BYTES: usize = 64 * 1024;
+
+/// A file that no longer holds the bytes of its entry, because it changed after the bytes landed.
+#[derive(Debug)]
+struct ContentChanged(String);
+
+impl std::fmt::Display for ContentChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} no longer holds the bytes of its entry", self.0)
+    }
+}
+
+impl std::error::Error for ContentChanged {}
+
+/// The length of the file at `file` when it holds `sha`. A file that holds other bytes is [`ContentChanged`].
+fn signed_size(file: &Path, path: &str, sha: &str) -> Result<u64> {
+    let (on_disk, size) = digest_file(file)?;
+    if on_disk != sha {
+        return Err(anyhow::Error::new(ContentChanged(path.to_owned())));
+    }
+    Ok(size)
+}
+
+/// The result of publishing a copy of a landed file. A file that was edited after it landed was still downloaded, and a
+/// read-only peer puts it back, so only another failure is one of the download.
+fn landed_copy_result(published: Result<()>) -> Result<()> {
+    match published {
+        Err(error) if error.is::<ContentChanged>() => Ok(()),
+        other => other,
+    }
+}
+
+/// Drop the last entries of `author` when the fetch of its current pointer `sha` failed for good, so a pointer that never
+/// lands does not keep old entries in the view for ever. Returns whether entries were dropped.
+fn drop_stale_index(indexes: &mut Indexes, pointers: &HashMap<String, String>, author: &str, sha: &str) -> bool {
+    current_pointer(pointers, author, sha) && indexes.0.remove(author).is_some()
+}
+
+/// The paths that a folder which ignores case would write to one file, as skipped path -> the path that is kept: the
+/// first of each group in path order.
+fn case_collisions<'a>(paths: impl Iterator<Item = &'a String>) -> BTreeMap<String, String> {
+    let mut groups: BTreeMap<String, BTreeSet<&String>> = BTreeMap::new();
+    for path in paths {
+        groups.entry(path.to_lowercase()).or_default().insert(path);
+    }
+    let mut skipped = BTreeMap::new();
+    for group in groups.into_values() {
+        let mut group = group.into_iter();
+        let Some(kept) = group.next() else { continue };
+        skipped.extend(group.map(|path| (path.clone(), kept.clone())));
+    }
+    skipped
+}
+
+/// Whether the folder at `root` treats names that differ only in case as one name, as macOS and Windows do by default.
+fn ignores_case(root: &Path) -> bool {
+    let probe = root.join(format!(".agent-knowledge-case-probe-{}", std::process::id()));
+    let upper = root.join(format!(".AGENT-KNOWLEDGE-CASE-PROBE-{}", std::process::id()));
+    let same = std::fs::write(&probe, b"").is_ok() && upper.exists();
+    let _ = std::fs::remove_file(&probe);
+    same
+}
+
+/// Forget an own entry whose copy could not be registered, so no entry has a dead ticket, and the path is handled again.
+fn forget_unregistered(own: &mut BTreeMap<String, Value>, known: &mut HashMap<String, String>, path: &str) {
+    own.remove(path);
+    known.remove(path);
+}
 
 /// The sha256 and the length of a file. It reads in blocks, so a big file is not held in memory.
 fn digest_file(path: &Path) -> io::Result<(String, u64)> {
@@ -1839,6 +1958,12 @@ impl Gate {
     fn unwant(&self, path: &str) {
         self.wanted.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
         self.meta.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
+    }
+
+    /// The tickets of the peers that hold `sha` for `path`, if the document still names that sha.
+    fn tickets_of(&self, path: &str, sha: &str) -> Vec<String> {
+        let wanted = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        wanted.get(path).filter(|(named, _)| named == sha).map(|(_, tickets)| tickets.clone()).unwrap_or_default()
     }
 
     fn set_meta(&self, path: &str, sha: &str, meta: Meta) {
@@ -4003,5 +4128,128 @@ mod tests {
 
         assert!(!view_of(&document, &indexes).contains_key("p"));
         assert_eq!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]), vec!["p".to_owned()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_of_the_creator_is_not_a_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (sha256_bytes(b"v1"), sha256_bytes(b"v2"));
+        std::fs::write(dir.path().join("start.md"), "v1").unwrap();
+        let mut downloads = read_only_downloads(dir.path(), &[("start.md", &old)], &["start.md"]);
+        let known = HashMap::from([("start.md".to_owned(), old)]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), new, "ticket".to_owned())];
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"v2".to_vec()) };
+
+        downloads.reconcile(&entries, &known, fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(std::fs::read(dir.path().join("start.md")).ok(), Some(b"v2".to_vec()));
+        assert!(!downloads.take_revert("start.md"), "an ordinary update was reported as a revert");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_deleted_while_stopped_is_a_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = sha256_bytes(b"v1");
+        // The saved entry was dropped with the file, so `known` lacks the path, and `given` still names it.
+        let mut downloads = read_only_downloads(dir.path(), &[], &["start.md"]);
+        let entries: Vec<Entry> = vec![("start.md".to_owned(), sha, "ticket".to_owned())];
+        let fetch = |_: String, _: Progress| async { Ok::<Vec<u8>, anyhow::Error>(b"v1".to_vec()) };
+
+        downloads.reconcile(&entries, &HashMap::new(), fetch);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert!(downloads.take_revert("start.md"));
+    }
+
+    #[test]
+    fn a_file_that_changed_after_it_landed_is_a_content_change_and_not_a_failed_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("start.md");
+        std::fs::write(&file, "edited right after the landing").unwrap();
+
+        let error = signed_size(&file, "start.md", &sha256_bytes(b"from creator")).unwrap_err();
+
+        assert!(error.is::<ContentChanged>(), "{error:#}");
+        assert!(landed_copy_result(Err(error)).is_ok());
+        assert!(landed_copy_result(Err(anyhow!("register failed"))).is_err());
+        std::fs::write(&file, "from creator").unwrap();
+        assert_eq!(signed_size(&file, "start.md", &sha256_bytes(b"from creator")).unwrap(), 12);
+    }
+
+    #[test]
+    fn an_index_that_failed_for_good_drops_the_stale_entries_of_its_slice() {
+        let (document, mut indexes) = pointed(&[("c", serde_json::json!({ "p": { "deleted": true, "ts": 2 } }))]);
+        let pointers = HashMap::from([("c".to_owned(), "newer".to_owned())]);
+
+        // The failure of an older pointer says nothing about the current one.
+        assert!(!drop_stale_index(&mut indexes, &pointers, "c", "older"));
+        assert!(
+            view_of(&document, &indexes).is_empty()
+                && removed_by_tombstone(&document, &indexes, &["p".to_owned()]).len() == 1
+        );
+
+        assert!(drop_stale_index(&mut indexes, &pointers, "c", "newer"));
+        assert!(removed_by_tombstone(&document, &indexes, &["p".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn another_holder_that_has_not_failed_keeps_a_failed_download_quiet() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.gate.set_wanted_all("start.md", "sha", vec!["creator".to_owned(), "rehoster".to_owned()]);
+        downloads.fail_for_good("start.md", "sha", "creator");
+
+        assert!(downloads.another_ticket_can_deliver("start.md", "sha"));
+
+        downloads.fail_for_good("start.md", "sha", "rehoster");
+        assert!(!downloads.another_ticket_can_deliver("start.md", "sha"));
+        assert!(!downloads.another_ticket_can_deliver("start.md", "other sha"));
+    }
+
+    #[test]
+    fn an_entry_that_could_not_be_registered_is_forgotten_with_its_record() {
+        let mut own = BTreeMap::from([("a.md".to_owned(), json!({ "sha256": "s", "ticket": "dead", "ts": 1 }))]);
+        let mut known = HashMap::from([("a.md".to_owned(), "s".to_owned()), ("b.md".to_owned(), "t".to_owned())]);
+
+        forget_unregistered(&mut own, &mut known, "a.md");
+
+        assert!(own.is_empty());
+        assert_eq!(known.keys().collect::<Vec<_>>(), vec!["b.md"]);
+    }
+
+    #[test]
+    fn paths_that_differ_only_in_case_collide_and_the_first_is_kept() {
+        let paths: Vec<String> = ["Notes.md", "notes.md", "other.md", "NOTES.MD"].map(str::to_owned).to_vec();
+
+        let skipped = case_collisions(paths.iter());
+
+        assert_eq!(
+            skipped,
+            BTreeMap::from([
+                ("Notes.md".to_owned(), "NOTES.MD".to_owned()),
+                ("notes.md".to_owned(), "NOTES.MD".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_view_is_whole_when_every_index_that_is_pointed_at_is_fetched() {
+        let (document, indexes) = pointed(&[("c", serde_json::json!({}))]);
+
+        assert!(view_complete(&document, &indexes));
+        assert!(!view_complete(&document, &Indexes::default()));
+        assert!(!view_complete(&serde_json::json!({}), &Indexes::default()));
+    }
+
+    #[test]
+    fn forgetting_a_path_forgets_its_revert() {
+        let (done, _finished) = mpsc::unbounded_channel();
+        let mut downloads = Downloads::new(PathBuf::from("."), done);
+        downloads.reverts.insert("start.md".to_owned());
+
+        downloads.forget("start.md");
+
+        assert!(!downloads.take_revert("start.md"));
     }
 }
