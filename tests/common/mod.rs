@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use agent_knowledge::sync::{self, Presence, Ready};
 use agent_knowledge::writers::Writers;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -38,11 +39,17 @@ pub fn options(root: &Path, mesh: Option<String>, nickname: Option<&str>) -> syn
     }
 }
 
-/// One running `sync::run` loop.
+/// How long a peer's runtime waits for its blocking threads when the peer is dropped.
+const RUNTIME_GRACE: Duration = Duration::from_secs(5);
+
+/// One running `sync::run` loop. It runs on a runtime of its own. A test that panics drops its runtime, and that drop
+/// waits for every blocking thread of the runtime, so a stuck lookup of a peer would keep a failed test alive. A peer
+/// that is dropped gives up its blocking threads after [`RUNTIME_GRACE`].
 pub struct Peer {
     pub ready: Ready,
     stop: watch::Sender<()>,
-    task: JoinHandle<anyhow::Result<()>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
+    runtime: Option<Runtime>,
 }
 
 impl Peer {
@@ -65,7 +72,8 @@ impl Peer {
     pub async fn start_with(options: sync::Options, on_presence: impl FnMut(Presence) + Send + 'static) -> Self {
         let (stop, mut stop_rx) = watch::channel(());
         let (ready_tx, ready_rx) = oneshot::channel();
-        let task = tokio::spawn(sync::run(
+        let runtime = Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let task = runtime.spawn(sync::run(
             options,
             move |ready: &Ready| ready_tx.send(ready.clone()).unwrap(),
             on_presence,
@@ -74,14 +82,28 @@ impl Peer {
             },
         ));
         let ready = ready_rx.await.unwrap();
-        Self { ready, stop, task }
+        Self { ready, stop, task: Some(task), runtime: Some(runtime) }
     }
 
     /// Signal the loop to stop and wait until it exits cleanly. Fails after [`STOP_LIMIT`].
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.stop.send(()).unwrap();
-        let exited = tokio::time::timeout(STOP_LIMIT, self.task).await;
+        let task = self.task.take().expect("a peer stops once");
+        let exited = tokio::time::timeout(STOP_LIMIT, task).await;
         exited.expect("the peer did not stop within the limit").unwrap().unwrap();
+    }
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        // On a thread of its own: a runtime must not be shut down from async code, and a stuck blocking thread must
+        // not hold up the test that dropped the peer.
+        if let Some(runtime) = self.runtime.take() {
+            std::thread::spawn(move || runtime.shutdown_timeout(RUNTIME_GRACE));
+        }
     }
 }
 
